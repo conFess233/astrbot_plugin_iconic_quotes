@@ -1,0 +1,207 @@
+{
+  "storage_subdir": {
+    "description": "存储相对目录",
+    "type": "string",
+    "default": "iconic_quotes",
+    "hint": "相对于 AstrBot data/plugin_data；已有数据请在群典管理页面执行迁移。"
+  },
+  "add_keyword_enabled": {
+    "description": "启用添加关键词",
+    "type": "bool",
+    "default": true
+  },
+  "add_keywords": {
+    "description": "添加关键词",
+    "type": "list",
+    "default": ["添加群典"],
+    "hint": "去除首尾空白后完整匹配。"
+  },
+  "query_keyword_enabled": {
+    "description": "启用查询关键词",
+    "type": "bool",
+    "default": true
+  },
+  "query_keywords": {
+    "description": "查询关键词",
+    "type": "list",
+    "default": ["群典"],
+    "hint": "去除首尾空白后完整匹配。"
+  },
+  "send_count": {
+    "description": "每次发送条数",
+    "type": "int",
+    "default": 1,
+    "hint": "范围 1 到 10。"
+  },
+  "send_mode": {
+    "description": "普通群典发送方式",
+    "type": "string",
+    "default": "text",
+    "options": ["text", "card"],
+    "labels": ["文字", "图片卡片"]
+  },
+  "aggregate_multiple": {
+    "description": "多条群典聚合为合并转发",
+    "type": "bool",
+    "default": true
+  },
+  "allow_bot_authors": {
+    "description": "允许手动引用并收录机器人消息",
+    "type": "bool",
+    "default": false,
+    "hint": "机器人自身及其他机器人发送的触发词始终不会触发插件；此项只控制手动引用或合并转发中的机器人作者。"
+  },
+  "max_records_per_group": {
+    "description": "每群最大记录数",
+    "type": "int",
+    "default": 5000
+  },
+  "max_media_mb": {
+    "description": "全局媒体容量 MB",
+    "type": "int",
+    "default": 2048
+  },
+  "max_image_mb": {
+    "description": "单张图片上限 MB",
+    "type": "int",
+    "default": 10
+  },
+  "max_images_per_record": {
+    "description": "单条记录最多图片数",
+    "type": "int",
+    "default": 9
+  },
+  "max_forward_nodes": {
+    "description": "合并转发最大节点数",
+    "type": "int",
+    "default": 100
+  },
+  "max_text_chars": {
+    "description": "单条或单节点最大字符数",
+    "type": "int",
+    "default": 5000
+  },
+  "max_forward_text_chars": {
+    "description": "合并转发累计最大字符数",
+    "type": "int",
+    "default": 50000
+  },
+  "add_roles": {
+    "description": "添加权限",
+    "type": "list",
+    "default": ["everyone"],
+    "options": ["bot_admin", "owner", "admin", "member", "everyone"],
+    "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
+  },
+  "query_roles": {
+    "description": "查询权限",
+    "type": "list",
+    "default": ["everyone"],
+    "options": ["bot_admin", "owner", "admin", "member", "everyone"],
+    "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
+  },
+  "info_roles": {
+    "description": "统计权限",
+    "type": "list",
+    "default": ["everyone"],
+    "options": ["bot_admin", "owner", "admin", "member", "everyone"],
+    "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
+  },
+  "delete_roles": {
+    "description": "删除权限",
+    "type": "list",
+    "default": ["bot_admin"],
+    "options": ["bot_admin", "owner", "admin", "member", "everyone"],
+    "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
+  },
+  "group_blacklist": {
+    "description": "群黑名单",
+    "type": "list",
+    "default": []
+  },
+  "group_whitelist": {
+    "description": "群白名单",
+    "type": "list",
+    "default": []
+  },
+  "user_blacklist": {
+    "description": "操作者黑名单",
+    "type": "list",
+    "default": []
+  },
+  "user_whitelist": {
+    "description": "操作者白名单",
+    "type": "list",
+    "default": []
+  },
+  "excluded_author_ids": {
+    "description": "禁止收录用户",
+    "type": "list",
+    "default": []
+  },
+  "group_overrides": {
+    "description": "群级配置覆盖",
+    "type": "dict",
+    "default": {},
+    "hint": "建议通过群典管理页面编辑。"
+  },
+  "global_cooldown_ms": {
+    "description": "全局冷却毫秒",
+    "type": "int",
+    "default": 1000
+  },
+  "cooldown_message": {
+    "description": "冷却提示",
+    "type": "string",
+    "default": "群典功能冷却中..."
+  },
+  "delete_preview_limit": {
+    "description": "命令删除预览上限",
+    "type": "int",
+    "default": 20
+  },
+  "send_retry_count": {
+    "description": "发送失败额外重试次数",
+    "type": "int",
+    "default": 2
+  },
+  "send_retry_delay_ms": {
+    "description": "发送重试固定延迟毫秒",
+    "type": "int",
+    "default": 500
+  },
+  "retry_on_ambiguous_failure": {
+    "description": "超时等不确定失败也重试",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后可能产生重复消息。"
+  },
+  "audit_limit": {
+    "description": "删除审计最大条数",
+    "type": "int",
+    "default": 10000
+  },
+  "card_width": {
+    "description": "卡片宽度",
+    "type": "int",
+    "default": 1200
+  },
+  "card_min_height": {
+    "description": "卡片最小高度",
+    "type": "int",
+    "default": 480
+  },
+  "card_max_height": {
+    "description": "卡片最大高度",
+    "type": "int",
+    "default": 2000
+  },
+  "card_custom_css": {
+    "description": "卡片自定义 CSS",
+    "type": "text",
+    "default": "",
+    "editor_mode": true,
+    "editor_language": "css",
+    "hint": "不允许 @import、url() 或其他外部资源。渲染内容会发送给 AstrBot 配置的文转图端点。"
+  }
+}
