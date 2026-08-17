@@ -33,6 +33,12 @@
     "default": 1,
     "hint": "范围 1 到 10。"
   },
+  "random_send_count": {
+    "description": "随机发送条数",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，每次在 1 到“每次发送条数”之间随机选择；支持群级覆盖。"
+  },
   "send_mode": {
     "description": "普通群典发送方式",
     "type": "string",
@@ -203,5 +209,11 @@
     "editor_mode": true,
     "editor_language": "css",
     "hint": "不允许 @import、url() 或其他外部资源。渲染内容会发送给 AstrBot 配置的文转图端点。"
+  },
+  "card_auto_height": {
+    "description": "卡片自动高度",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后卡片按内容收缩，并安全裁去文转图画布底部留白；关闭后使用配置的最小高度。"
   }
 }

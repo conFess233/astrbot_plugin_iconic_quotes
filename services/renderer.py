@@ -13,6 +13,7 @@ import aiohttp
 import astrbot.api.message_components as Comp
 
 from ..models import QuoteRecord, QuoteSegment
+from ..utils.image_processing import trim_card_canvas
 from .storage import QuoteStorage
 
 CARD_TEMPLATE = """
@@ -29,8 +30,8 @@ html, body { margin: 0; padding: 0; background: transparent; }
 }
 .avatar { width: 220px; height: 220px; border-radius: 50%; object-fit: cover; background: rgba(255,255,255,.55); }
 .avatar.empty { border: 2px dashed rgba(91,70,42,.25); }
-.content { min-width: 0; display: flex; flex-direction: column; }
-.quote { flex: 1; font-size: 42px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.content { min-width: 0; display: flex; flex-direction: column; align-self: start; }
+.quote { font-size: 42px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .quote::before { content: "“"; font-size: 72px; color: #9a6d38; vertical-align: -.2em; }
 .quote::after { content: "”"; font-size: 72px; color: #9a6d38; vertical-align: -.2em; }
 .images { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 24px; }
@@ -143,7 +144,9 @@ class QuoteRenderer:
         for index in range(page_count):
             data = {
                 "width": settings["card_width"],
-                "min_height": settings["card_min_height"],
+                "min_height": (
+                    0 if settings["card_auto_height"] else settings["card_min_height"]
+                ),
                 "max_height": settings["card_max_height"],
                 "custom_css": settings["card_custom_css"],
                 "avatar": avatar,
@@ -164,6 +167,7 @@ class QuoteRenderer:
                 return_url=False,
                 options={"full_page": True, "type": "png"},
             )
+            await asyncio.to_thread(trim_card_canvas, path)
             paths.append(path)
         return paths
 
@@ -212,13 +216,19 @@ class QuoteRenderer:
             nickname = record.author.nickname or record.author.user_id or "未知用户"
             content: list[Any] = []
             if text:
-                content.append(Comp.Plain(f"“{text}”——{nickname}"))
+                content.append(Comp.Plain(f"“{text}”"))
             content.extend(
                 Comp.Image.fromFileSystem(self.storage.resolve_media_path(segment.path))
                 for segment in record.segments
                 if segment.type == "image" and segment.path
             )
-            nodes.append(Comp.Node(uin="0", name="群典", content=content))
+            nodes.append(
+                Comp.Node(
+                    uin=record.author.user_id or "0",
+                    name=nickname,
+                    content=content,
+                )
+            )
         return nodes
 
     def _segments_to_components(self, segments: list[QuoteSegment]) -> list[Any]:

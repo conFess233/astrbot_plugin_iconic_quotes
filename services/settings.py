@@ -14,6 +14,7 @@ GROUP_OVERRIDE_KEYS = {
     "query_keyword_enabled",
     "query_keywords",
     "send_count",
+    "random_send_count",
     "send_mode",
     "aggregate_multiple",
     "allow_bot_authors",
@@ -42,6 +43,7 @@ DEFAULTS: dict[str, Any] = {
     "max_text_chars": 5000,
     "max_forward_text_chars": 50000,
     "send_count": 1,
+    "random_send_count": False,
     "send_mode": "text",
     "aggregate_multiple": True,
     "allow_bot_authors": False,
@@ -66,6 +68,7 @@ DEFAULTS: dict[str, Any] = {
     "card_min_height": 480,
     "card_max_height": 2000,
     "card_custom_css": "",
+    "card_auto_height": True,
 }
 
 
@@ -162,8 +165,10 @@ class SettingsService:
             "add_keyword_enabled",
             "query_keyword_enabled",
             "aggregate_multiple",
+            "random_send_count",
             "allow_bot_authors",
             "retry_on_ambiguous_failure",
+            "card_auto_height",
         ):
             if not isinstance(result.get(key), bool):
                 raise TypeError(f"{key} 必须是布尔值")

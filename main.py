@@ -25,8 +25,10 @@ from .services.renderer import QuoteRenderer
 from .services.settings import SettingsService
 from .services.storage import DuplicateQuoteError, QuoteStorage, StorageError
 from .services.web_manager import WebManager
+from .utils.randomization import resolve_send_count
 
 PLUGIN_NAME = "astrbot_plugin_iconic_quotes"
+COMMAND_EVENT_KEY = "iconic_quotes_command_event"
 
 
 @dataclass(slots=True)
@@ -115,11 +117,13 @@ class IconicQuotesPlugin(Star):
     @filter.command("添加群典")
     async def add_quote(self, event: AstrMessageEvent):
         """收录当前消息引用的一条消息或合并转发。"""
+        event.set_extra(COMMAND_EVENT_KEY, True)
         await self._dispatch(event, "add", self._add_quote)
 
     @filter.command("群典")
     async def query_quote(self, event: AstrMessageEvent, argument: str = ""):
         """随机发送群典；参数 info 用于查看当前群统计。"""
+        event.set_extra(COMMAND_EVENT_KEY, True)
         if (
             argument.strip().casefold() == "info"
             or self._command_tail(
@@ -135,6 +139,7 @@ class IconicQuotesPlugin(Star):
     @filter.command("删除群典")
     async def delete_quote(self, event: AstrMessageEvent, keyword: str = ""):
         """预览正文包含指定字符串的记录，并创建删除确认。"""
+        event.set_extra(COMMAND_EVENT_KEY, True)
         search = self._command_tail(event.message_str, "删除群典") or keyword
         await self._dispatch(
             event,
@@ -145,12 +150,13 @@ class IconicQuotesPlugin(Star):
     @filter.command("确认删除")
     async def confirm_delete(self, event: AstrMessageEvent):
         """在 60 秒内确认当前用户最近一次删除预览。"""
+        event.set_extra(COMMAND_EVENT_KEY, True)
         await self._dispatch(event, "delete", self._confirm_delete)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def keyword_listener(self, event: AstrMessageEvent):
         """处理无需命令前缀的精确关键词和 @用户 群典。"""
-        if getattr(event, "is_at_or_wake_command", False):
+        if self._is_command_event(event):
             return
         if self._is_bot_message(event):
             return
@@ -283,9 +289,13 @@ class IconicQuotesPlugin(Star):
             await self._send_text(event, "一次只能指定一名用户。", values)
             return
         target_id = targets[0] if targets else None
+        requested_count = resolve_send_count(
+            values["send_count"],
+            values["random_send_count"],
+        )
         records, broken = await self.storage.select_random(
             str(event.get_group_id()),
-            values["send_count"],
+            requested_count,
             target_id,
         )
         if not records:
@@ -515,6 +525,37 @@ class IconicQuotesPlugin(Star):
         return any(
             isinstance(item, (Comp.Reply, Comp.Forward, Comp.Node, Comp.Nodes))
             for item in event.get_messages()
+        )
+
+    def _is_command_event(self, event: AstrMessageEvent) -> bool:
+        """识别命令事件，避免去前缀后的正文再次命中关键词监听器。"""
+        if getattr(event, "is_at_or_wake_command", False) or event.get_extra(
+            COMMAND_EVENT_KEY,
+            False,
+        ):
+            return True
+        candidates = [str(getattr(event.message_obj, "message_str", "") or "")]
+        raw = getattr(event.message_obj, "raw_message", None)
+        if isinstance(raw, dict) and isinstance(raw.get("raw_message"), str):
+            candidates.append(raw["raw_message"])
+        try:
+            astrbot_config = self.context.get_config(
+                getattr(event, "unified_msg_origin", None)
+            )
+            configured = astrbot_config.get("wake_prefix", ["/"])
+        except Exception:  # noqa: BLE001 - 兼容不同 AstrBot 配置代理实现。
+            configured = ["/"]
+        if isinstance(configured, str):
+            prefixes = [configured]
+        elif isinstance(configured, (list, tuple, set)):
+            prefixes = configured
+        else:
+            prefixes = ["/"]
+        return any(
+            prefix
+            and candidate.strip().startswith(str(prefix))
+            for prefix in prefixes
+            for candidate in candidates
         )
 
     @staticmethod
