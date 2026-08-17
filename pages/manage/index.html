@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>群典管理</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">ICONIC QUOTES ARCHIVE</p>
+          <h1>群典管理</h1>
+          <p class="subtitle">把群聊里值得留下的一刻，整理成可追溯的私人档案。</p>
+        </div>
+        <button id="refresh" class="button ghost">刷新数据</button>
+      </header>
+
+      <div id="notice" class="notice" hidden></div>
+
+      <section id="summary" class="summary-grid"></section>
+
+      <nav class="tabs" aria-label="管理模块">
+        <button class="tab active" data-tab="records">记录</button>
+        <button class="tab" data-tab="config">配置与样式</button>
+        <button class="tab" data-tab="backup">备份与迁移</button>
+        <button class="tab" data-tab="audit">删除审计</button>
+      </nav>
+
+      <section id="records-panel" class="panel active">
+        <div class="toolbar">
+          <label>群聊<select id="group"></select></label>
+          <label>搜索<input id="search" type="search" placeholder="正文、昵称、QQ 或记录 ID" /></label>
+          <label>类型<select id="type"><option value="">全部</option><option value="message">普通消息</option><option value="forward">合并转发</option></select></label>
+          <label>图片<select id="has-image"><option value="">不限</option><option value="true">包含图片</option><option value="false">不含图片</option></select></label>
+          <label>状态<select id="health"><option value="">不限</option><option value="healthy">正常</option><option value="broken">异常</option></select></label>
+          <button id="search-button" class="button">查询</button>
+        </div>
+        <div class="batch-bar">
+          <span id="record-total">0 条记录</span>
+          <button id="delete-selected" class="button danger" disabled>删除所选</button>
+        </div>
+        <div id="records" class="records"></div>
+        <div class="pagination">
+          <button id="previous" class="button ghost">上一页</button>
+          <span id="page-label">第 1 页</span>
+          <button id="next" class="button ghost">下一页</button>
+        </div>
+      </section>
+
+      <section id="config-panel" class="panel">
+        <div class="warning">
+          图片卡片内容会发送给 AstrBot 当前配置的文转图端点。如需内容完全留在服务器，请使用自建文转图服务。
+        </div>
+        <label class="editor-label">完整插件配置
+          <textarea id="config-editor" class="code-editor" spellcheck="false"></textarea>
+        </label>
+        <div class="actions">
+          <button id="save-config" class="button">校验并保存</button>
+          <button id="reload-config" class="button ghost">放弃修改</button>
+          <button id="reset-card-style" class="button ghost">恢复默认卡片样式</button>
+        </div>
+        <div id="preview-area" class="preview-area" hidden></div>
+      </section>
+
+      <section id="backup-panel" class="panel">
+        <div class="two-column">
+          <article class="card">
+            <h2>备份</h2>
+            <p>导出全部群 JSON、图片、校验清单和可移植配置。</p>
+            <button id="export" class="button">导出 ZIP</button>
+          </article>
+          <article class="card">
+            <h2>合并导入</h2>
+            <p>只接受本插件导出的 ZIP；重复哈希会自动跳过。</p>
+            <input id="import-file" type="file" accept=".zip,application/zip" />
+            <label class="checkbox"><input id="restore-settings" type="checkbox" /> 同时恢复可移植配置</label>
+            <button id="import" class="button">上传并预检</button>
+          </article>
+          <article class="card wide">
+            <h2>迁移存储目录</h2>
+            <p>请输入相对于 AstrBot <code>data/plugin_data</code> 的新目录。成功后保留旧目录时间戳备份。</p>
+            <div class="inline">
+              <input id="migration-path" placeholder="例如 iconic_quotes_v2" />
+              <button id="migrate" class="button danger">确认迁移</button>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section id="audit-panel" class="panel">
+        <div id="audit" class="audit-list"></div>
+      </section>
+    </main>
+
+    <dialog id="confirm-dialog">
+      <form method="dialog">
+        <h2 id="dialog-title">确认操作</h2>
+        <p id="dialog-message"></p>
+        <div class="actions right">
+          <button value="cancel" class="button ghost">取消</button>
+          <button value="confirm" class="button danger">确认</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
