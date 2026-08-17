@@ -5,7 +5,7 @@ const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const state = {
   groups: [], records: [], audit: [], page: 1,
-  pageSize: Number(sessionStorage.getItem("iconic-quotes-page-size") || 20),
+  pageSize: 20,
   total: 0, selected: new Set(), config: null, draft: null,
   dirty: false, activeRecord: null, overrideGroup: "",
   media: new Map(), lightboxItems: [], lightboxIndex: 0, loading: 0,
@@ -400,7 +400,7 @@ $("#search-button").addEventListener("click", () => { state.page = 1; task(loadR
 $("#search").addEventListener("keydown", (event) => { if (event.key === "Enter") $("#search-button").click(); });
 $("#group").addEventListener("change", () => { state.page = 1; state.selected.clear(); task(loadRecords).catch((error) => notify(error.message, true)); });
 $("#previous").addEventListener("click", () => { state.page -= 1; task(loadRecords).catch((error) => notify(error.message, true)); }); $("#next").addEventListener("click", () => { state.page += 1; task(loadRecords).catch((error) => notify(error.message, true)); });
-$("#page-size").addEventListener("change", () => { state.pageSize = Number($("#page-size").value); sessionStorage.setItem("iconic-quotes-page-size", String(state.pageSize)); state.page = 1; task(loadRecords).catch((error) => notify(error.message, true)); });
+$("#page-size").addEventListener("change", () => { state.pageSize = Number($("#page-size").value); state.page = 1; task(loadRecords).catch((error) => notify(error.message, true)); });
 $("#select-page").addEventListener("change", () => { let skipped = false; state.records.forEach((record) => { if (!$("#select-page").checked) state.selected.delete(record.id); else if (state.selected.size < 100) state.selected.add(record.id); else skipped = true; }); if (skipped) notify("已达到每次 100 条的批量删除上限。", true); selectionChanged(); });
 $("#delete-selected").addEventListener("click", () => deleteRecords([...state.selected])); $("#filter-toggle").addEventListener("click", () => $("#record-filters").classList.toggle("open"));
 $("#close-drawer").addEventListener("click", closeDrawer); $("#drawer-backdrop").addEventListener("click", closeDrawer); $("#drawer-delete").addEventListener("click", () => state.activeRecord && deleteRecords([state.activeRecord.id])); $("#drawer-preview").addEventListener("click", () => state.activeRecord && previewCard(state.activeRecord));
