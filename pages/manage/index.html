@@ -7,104 +7,70 @@
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
-    <main class="shell">
-      <header class="hero">
-        <div>
-          <p class="eyebrow">ICONIC QUOTES ARCHIVE</p>
-          <h1>群典管理</h1>
-          <p class="subtitle">把群聊里值得留下的一刻，整理成可追溯的私人档案。</p>
-        </div>
-        <button id="refresh" class="button ghost">刷新数据</button>
+    <div id="progress" class="progress" hidden><span></span></div>
+    <main class="app-shell">
+      <header class="page-header">
+        <div class="page-heading"><span class="brand-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 3h9l3 3v15H6z"/><path d="M15 3v4h4M9 11h6M9 15h6"/></svg></span><div><h1>群典管理</h1><p id="header-status">正在连接插件数据…</p></div></div>
+        <button id="refresh" class="btn btn-tonal" type="button" data-icon="refresh">刷新数据</button>
       </header>
-
-      <div id="notice" class="notice" hidden></div>
-
-      <section id="summary" class="summary-grid"></section>
-
+      <section id="summary" class="summary-grid" aria-label="群典统计"></section>
       <nav class="tabs" aria-label="管理模块">
-        <button class="tab active" data-tab="records">记录</button>
-        <button class="tab" data-tab="config">配置与样式</button>
-        <button class="tab" data-tab="backup">备份与迁移</button>
-        <button class="tab" data-tab="audit">删除审计</button>
+        <button class="tab active" type="button" data-tab="records" data-icon="archive">记录管理</button>
+        <button class="tab" type="button" data-tab="config" data-icon="settings">插件配置</button>
+        <button class="tab" type="button" data-tab="backup" data-icon="backup">备份与迁移</button>
+        <button class="tab" type="button" data-tab="audit" data-icon="history">删除审计</button>
       </nav>
 
       <section id="records-panel" class="panel active">
-        <div class="toolbar">
-          <label>群聊<select id="group"></select></label>
-          <label>搜索<input id="search" type="search" placeholder="正文、昵称、QQ 或记录 ID" /></label>
-          <label>类型<select id="type"><option value="">全部</option><option value="message">普通消息</option><option value="forward">合并转发</option></select></label>
-          <label>图片<select id="has-image"><option value="">不限</option><option value="true">包含图片</option><option value="false">不含图片</option></select></label>
-          <label>状态<select id="health"><option value="">不限</option><option value="healthy">正常</option><option value="broken">异常</option></select></label>
-          <button id="search-button" class="button">查询</button>
+        <div class="section-card filter-card">
+          <div class="section-title-row"><div><h2>记录列表</h2><p id="group-summary">选择群聊以查看记录</p></div><button id="filter-toggle" class="btn btn-text mobile-only" type="button" data-icon="filter">筛选</button></div>
+          <div id="record-filters" class="filter-grid">
+            <label class="field"><span>群聊</span><select id="group"></select></label>
+            <label class="field search-field"><span>搜索</span><input id="search" type="search" placeholder="正文、昵称、QQ 或记录 ID" /></label>
+            <label class="field"><span>类型</span><select id="type"><option value="">全部</option><option value="message">普通消息</option><option value="forward">合并转发</option></select></label>
+            <label class="field"><span>图片</span><select id="has-image"><option value="">不限</option><option value="true">包含图片</option><option value="false">不含图片</option></select></label>
+            <label class="field"><span>状态</span><select id="health"><option value="">不限</option><option value="healthy">正常</option><option value="broken">异常</option></select></label>
+            <button id="search-button" class="btn btn-primary" type="button" data-icon="search">查询</button>
+          </div>
         </div>
-        <div class="batch-bar">
-          <span id="record-total">0 条记录</span>
-          <button id="delete-selected" class="button danger" disabled>删除所选</button>
-        </div>
-        <div id="records" class="records"></div>
-        <div class="pagination">
-          <button id="previous" class="button ghost">上一页</button>
-          <span id="page-label">第 1 页</span>
-          <button id="next" class="button ghost">下一页</button>
+        <div class="section-card table-card">
+          <div class="table-toolbar"><div><strong id="record-total">0 条记录</strong><span id="selection-label">未选择记录</span></div><button id="delete-selected" class="btn btn-danger-tonal" type="button" data-icon="delete" disabled>删除所选</button></div>
+          <div class="table-scroll"><table class="data-table records-table"><thead><tr><th class="check-cell"><input id="select-page" type="checkbox" aria-label="选择本页记录" /></th><th>类型</th><th>发送者</th><th class="content-column">内容摘要</th><th>图片</th><th>记录时间</th><th>状态</th><th class="menu-cell"></th></tr></thead><tbody id="record-rows"></tbody></table></div>
+          <div id="record-cards" class="record-cards"></div>
+          <div class="table-footer"><label class="page-size">每页<select id="page-size"><option>20</option><option>50</option><option>100</option></select>条</label><span id="page-range">0–0 / 0</span><div class="pager"><button id="previous" class="icon-btn" type="button" data-icon="chevron-left" aria-label="上一页"></button><span id="page-label">第 1 页</span><button id="next" class="icon-btn" type="button" data-icon="chevron-right" aria-label="下一页"></button></div></div>
         </div>
       </section>
 
       <section id="config-panel" class="panel">
-        <div class="warning">
-          图片卡片内容会发送给 AstrBot 当前配置的文转图端点。如需内容完全留在服务器，请使用自建文转图服务。
-        </div>
-        <label class="editor-label">完整插件配置
-          <textarea id="config-editor" class="code-editor" spellcheck="false"></textarea>
-        </label>
-        <div class="actions">
-          <button id="save-config" class="button">校验并保存</button>
-          <button id="reload-config" class="button ghost">放弃修改</button>
-          <button id="reset-card-style" class="button ghost">恢复默认卡片样式</button>
-        </div>
-        <div id="preview-area" class="preview-area" hidden></div>
-      </section>
-
-      <section id="backup-panel" class="panel">
-        <div class="two-column">
-          <article class="card">
-            <h2>备份</h2>
-            <p>导出全部群 JSON、图片、校验清单和可移植配置。</p>
-            <button id="export" class="button">导出 ZIP</button>
-          </article>
-          <article class="card">
-            <h2>合并导入</h2>
-            <p>只接受本插件导出的 ZIP；重复哈希会自动跳过。</p>
-            <input id="import-file" type="file" accept=".zip,application/zip" />
-            <label class="checkbox"><input id="restore-settings" type="checkbox" /> 同时恢复可移植配置</label>
-            <button id="import" class="button">上传并预检</button>
-          </article>
-          <article class="card wide">
-            <h2>迁移存储目录</h2>
-            <p>请输入相对于 AstrBot <code>data/plugin_data</code> 的新目录。成功后保留旧目录时间戳备份。</p>
-            <div class="inline">
-              <input id="migration-path" placeholder="例如 iconic_quotes_v2" />
-              <button id="migrate" class="button danger">确认迁移</button>
-            </div>
-          </article>
+        <div class="config-layout">
+          <aside id="config-nav" class="config-nav"></aside>
+          <div class="config-main">
+            <div class="notice-card"><span data-icon-host="info"></span><div><strong>配置以草稿形式编辑</strong><p>切换标签不会丢失修改。完成后使用页面底部的统一保存按钮。</p></div></div>
+            <div id="config-sections"></div>
+            <section id="config-group" class="section-card config-section">
+              <div class="section-title-row"><div><h2>群聊覆盖配置</h2><p>只覆盖明确启用的字段，其他字段继续继承全局设置。</p></div><button id="clear-group-override" class="btn btn-danger-tonal" type="button" data-icon="delete">清空当前覆盖</button></div>
+              <div class="group-picker"><label class="field"><span>已有群聊</span><select id="override-group-select"></select></label><span>或</span><label class="field"><span>输入群号</span><input id="override-group-input" inputmode="numeric" placeholder="仅支持数字" /></label><button id="open-group-override" class="btn btn-tonal" type="button">打开</button></div>
+              <p id="override-status" class="helper-text">请选择或输入群号。</p><div id="override-fields" class="override-grid"></div>
+            </section>
+            <details id="advanced-config" class="section-card advanced-card"><summary><span><strong>高级 JSON</strong><small>查看或批量粘贴完整配置</small></span><span data-icon-host="chevron-down"></span></summary><div class="advanced-body"><div id="json-error" class="inline-error" hidden></div><textarea id="config-editor" class="code-editor" spellcheck="false"></textarea><div class="inline-actions"><button id="apply-json" class="btn btn-tonal" type="button">应用到表单</button><button id="format-json" class="btn btn-text" type="button">格式化</button></div></div></details>
+            <section id="preview-area" class="section-card preview-area" hidden></section>
+          </div>
         </div>
       </section>
 
-      <section id="audit-panel" class="panel">
-        <div id="audit" class="audit-list"></div>
+      <section id="backup-panel" class="panel task-stack">
+        <article class="section-card task-card"><div class="task-icon" data-icon-host="download"></div><div class="task-content"><h2>导出备份</h2><p>导出全部群聊记录、图片、校验清单和可迁移配置。</p><dl><div><dt>范围</dt><dd>全部群聊</dd></div><div><dt>内容</dt><dd>JSON、图片与配置</dd></div></dl></div><button id="export" class="btn btn-primary" type="button" data-icon="download">导出 ZIP</button></article>
+        <article class="section-card task-card import-task"><div class="task-icon" data-icon-host="upload"></div><div class="task-content"><h2>合并导入</h2><p>上传本插件导出的 ZIP。预检通过后才会执行，重复哈希自动跳过。</p><label id="drop-zone" class="drop-zone"><input id="import-file" type="file" accept=".zip,application/zip" /><span data-icon-host="upload"></span><strong>拖放备份到这里，或点击选择文件</strong><small id="file-name">最大 1 GB，仅支持 ZIP</small></label><label class="switch-row"><input id="restore-settings" type="checkbox" /><span class="switch"></span><span><strong>恢复可迁移配置</strong><small>导入记录时同时覆盖插件配置</small></span></label><div id="import-inspection" class="inspection-grid" hidden></div></div><button id="import" class="btn btn-primary" type="button">上传并预检</button></article>
+        <article class="section-card task-card danger-task"><div class="task-icon" data-icon-host="folder"></div><div class="task-content"><h2>迁移存储目录</h2><p>移动全部记录与媒体文件，成功后保留带时间戳的旧目录备份。</p><div class="path-grid"><label class="field"><span>当前目录</span><input id="current-path" readonly /></label><label class="field"><span>目标相对目录</span><input id="migration-path" placeholder="例如 iconic_quotes_v2" /></label></div><small>目录相对于 AstrBot 的 data/plugin_data。</small></div><button id="migrate" class="btn btn-danger" type="button" data-icon="folder">确认迁移</button></article>
       </section>
+
+      <section id="audit-panel" class="panel"><div class="section-card"><div class="section-title-row"><div><h2>删除审计</h2><p>只读记录，按删除时间从新到旧排列。</p></div><button id="refresh-audit" class="btn btn-tonal" type="button" data-icon="refresh">刷新</button></div><div class="audit-filters"><label class="field"><span>群号</span><input id="audit-group" placeholder="筛选群号" /></label><label class="field"><span>操作者</span><input id="audit-operator" placeholder="筛选操作者" /></label><label class="field"><span>来源</span><select id="audit-source"><option value="">全部来源</option><option value="page">后台页面</option><option value="command">群聊命令</option></select></label></div><div class="table-scroll"><table class="data-table audit-table"><thead><tr><th>删除时间</th><th>群号</th><th>记录 ID</th><th>操作者</th><th>来源</th></tr></thead><tbody id="audit-rows"></tbody></table></div><div id="audit-cards" class="record-cards"></div></div></section>
     </main>
 
-    <dialog id="confirm-dialog">
-      <form method="dialog">
-        <h2 id="dialog-title">确认操作</h2>
-        <p id="dialog-message"></p>
-        <div class="actions right">
-          <button value="cancel" class="button ghost">取消</button>
-          <button value="confirm" class="button danger">确认</button>
-        </div>
-      </form>
-    </dialog>
-
+    <div id="drawer-backdrop" class="drawer-backdrop" hidden></div><aside id="record-drawer" class="drawer" aria-label="记录详情" aria-hidden="true"><header><div><span class="overline">记录详情</span><h2 id="drawer-title">群典记录</h2></div><button id="close-drawer" class="icon-btn" type="button" data-icon="close" aria-label="关闭"></button></header><div id="drawer-content" class="drawer-content"></div><footer><button id="drawer-preview" class="btn btn-tonal" type="button" data-icon="image">预览卡片</button><button id="drawer-delete" class="btn btn-danger-tonal" type="button" data-icon="delete">删除记录</button></footer></aside>
+    <div id="lightbox" class="lightbox" hidden><button id="lightbox-close" class="icon-btn" type="button" data-icon="close" aria-label="关闭图片预览"></button><button id="lightbox-prev" class="lightbox-nav" type="button" data-icon="chevron-left" aria-label="上一张"></button><figure><img id="lightbox-image" alt="群典图片预览" /><figcaption id="lightbox-caption"></figcaption></figure><button id="lightbox-next" class="lightbox-nav" type="button" data-icon="chevron-right" aria-label="下一张"></button></div>
+    <dialog id="confirm-dialog"><form method="dialog"><div class="dialog-icon" data-icon-host="alert"></div><h2 id="dialog-title">确认操作</h2><p id="dialog-message"></p><div class="dialog-actions"><button value="cancel" class="btn btn-text">取消</button><button value="confirm" class="btn btn-danger">确认</button></div></form></dialog>
+    <div id="toast-stack" class="toast-stack" aria-live="polite"></div><div id="dirty-bar" class="dirty-bar" hidden><div><span class="dirty-dot"></span><strong>配置有未保存的修改</strong></div><div><button id="discard-config" class="btn btn-text" type="button">放弃修改</button><button id="save-config" class="btn btn-primary" type="button" data-icon="save">保存配置</button></div></div>
     <script type="module" src="./app.js"></script>
   </body>
 </html>
