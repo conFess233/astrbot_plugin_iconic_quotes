@@ -48,9 +48,12 @@ class IconicQuotesPlugin(Star):
         self.settings = SettingsService(config)
         global_settings = self.settings.global_settings()
         plugin_data_root = Path(get_astrbot_plugin_data_path())
+        data_root = plugin_data_root / PLUGIN_NAME
+        storage_subdir = global_settings["storage_subdir"]
         self.storage = QuoteStorage(
-            plugin_data_root,
-            global_settings["storage_subdir"],
+            data_root,
+            storage_subdir,
+            legacy_root=plugin_data_root / storage_subdir,
         )
         self.extractor = OneBotQuoteExtractor(self.storage)
         self.permissions = PermissionService()
@@ -103,8 +106,23 @@ class IconicQuotesPlugin(Star):
 
     async def initialize(self) -> None:
         """初始化数据目录和可复用头像 HTTP Client。"""
-        await self.storage.initialize()
+        legacy_backup = await self.storage.initialize()
         await self.renderer.initialize()
+        if legacy_backup:
+            logger.info(
+                "已将旧版群典数据迁移至插件专属数据目录，旧目录备份: %s",
+                legacy_backup,
+            )
+        elif (
+            self.storage.legacy_root
+            and self.storage.legacy_root.is_dir()
+            and any(self.storage.legacy_root.iterdir())
+            and self.storage.legacy_root != self.storage.root
+        ):
+            logger.warning(
+                "检测到新旧群典目录均有数据，已继续使用新目录并保留旧目录: %s",
+                self.storage.legacy_root,
+            )
         logger.info("群典插件初始化完成，存储目录: %s", self.storage.root)
 
     async def terminate(self) -> None:

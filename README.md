@@ -53,7 +53,7 @@
 默认数据目录：
 
 ```text
-data/plugin_data/iconic_quotes/
+data/plugin_data/astrbot_plugin_iconic_quotes/iconic_quotes/
 ├── groups/<群号>.json
 ├── images/<群号>/<内容哈希>.<扩展名>
 ├── backups/
@@ -61,6 +61,8 @@ data/plugin_data/iconic_quotes/
 ```
 
 JSON 使用版本化 Schema、临时文件原子替换和 `.bak` 恢复。达到记录或媒体容量上限时拒绝新增，不会静默淘汰旧记录。数据为明文，请保护 AstrBot 数据目录和导出的 ZIP。
+
+从旧版本升级时，如果新目录为空，插件会自动将 `data/plugin_data/<存储相对目录>` 迁移到 `data/plugin_data/astrbot_plugin_iconic_quotes/<存储相对目录>`，并保留带时间戳的旧目录备份。存储路径配置只能指向插件专属目录内部，不能越界写入其他插件的数据目录。
 
 修改已有数据的存储路径必须通过管理页迁移。迁移完成后旧目录会保留为带时间戳的备份，需由管理员确认后自行清理。
 

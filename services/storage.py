@@ -38,9 +38,16 @@ class DuplicateQuoteError(StorageError):
 class QuoteStorage:
     """管理群 JSON、内容寻址图片、审计和备份。"""
 
-    def __init__(self, plugin_data_root: Path, storage_subdir: str):
-        self.plugin_data_root = plugin_data_root.resolve()
-        self.root = safe_storage_path(self.plugin_data_root, storage_subdir)
+    def __init__(
+        self,
+        data_root: Path,
+        storage_subdir: str,
+        *,
+        legacy_root: Path | None = None,
+    ):
+        self.data_root = data_root.resolve()
+        self.root = safe_storage_path(self.data_root, storage_subdir)
+        self.legacy_root = legacy_root.resolve() if legacy_root else None
         self.groups_dir = self.root / "groups"
         self.images_dir = self.root / "images"
         self.backups_dir = self.root / "backups"
@@ -49,9 +56,27 @@ class QuoteStorage:
         self._maintenance_lock = asyncio.Lock()
         self._broken_groups: set[str] = set()
 
-    async def initialize(self) -> None:
-        """创建所需目录，不在插件源码目录写入用户数据。"""
-        await asyncio.to_thread(self._ensure_directories)
+    async def initialize(self) -> Path | None:
+        """迁移旧版插件数据并创建所需目录，返回旧目录备份路径。"""
+        return await asyncio.to_thread(self._initialize_sync)
+
+    def _initialize_sync(self) -> Path | None:
+        backup_root = None
+        legacy_root = self.legacy_root
+        if (
+            legacy_root
+            and legacy_root != self.root
+            and legacy_root.is_dir()
+            and any(legacy_root.iterdir())
+            and (not self.root.exists() or not any(self.root.iterdir()))
+        ):
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            backup_root = legacy_root.with_name(
+                f"{legacy_root.name}.backup-{stamp}-{uuid.uuid4().hex[:6]}"
+            )
+            self._migrate_sync(legacy_root, self.root, backup_root)
+        self._ensure_directories()
+        return backup_root
 
     def _ensure_directories(self) -> None:
         for directory in (
@@ -727,7 +752,7 @@ class QuoteStorage:
 
     async def migrate_to(self, new_subdir: str) -> tuple[Path, Path, Path]:
         """复制校验数据后切换根目录，并保留带时间戳旧目录。"""
-        new_root = safe_storage_path(self.plugin_data_root, new_subdir)
+        new_root = safe_storage_path(self.data_root, new_subdir)
         if new_root == self.root:
             raise StorageError("新旧存储路径相同")
         if new_root in self.root.parents or self.root in new_root.parents:

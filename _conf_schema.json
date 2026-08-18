@@ -3,7 +3,7 @@
     "description": "存储相对目录",
     "type": "string",
     "default": "iconic_quotes",
-    "hint": "相对于 AstrBot data/plugin_data；已有数据请在群典管理页面执行迁移。"
+    "hint": "相对于 AstrBot data/plugin_data/astrbot_plugin_iconic_quotes；旧版数据会自动迁移。"
   },
   "add_keyword_enabled": {
     "description": "启用添加关键词",
