@@ -3,7 +3,7 @@
 <p align="center">让群友的抽象发言变成经典罢！😋</p>
 
 <p align="center">
-  <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.1.2-blue" alt="Version 1.1.2"></a>
+  <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.1.3-blue" alt="Version 1.1.3"></a>
   <a href="https://github.com/AstrBotDevs/AstrBot"><img src="https://img.shields.io/badge/AstrBot-%3E%3D4.24.2%20%3C5-blue" alt="AstrBot >=4.24.2 <5"></a>
   <img src="https://img.shields.io/badge/platform-OneBot%2011%20%7C%20QQ-blue" alt="OneBot 11 / QQ">
   <a href="./LICENSE.txt"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="AGPL-3.0"></a>
@@ -132,7 +132,7 @@ python -m pip install -r requirements.txt
 
 ### 查询与发送
 
-`/群典` 对普通记录和合并转发记录等概率抽取，单次抽取不会重复。`/群典 @某人` 使用 QQ ID 精确匹配普通记录；合并转发只有在能够安全归属于该成员时才会进入其随机池。追加关键词后，会对该成员本人发送的正文、递归转发节点正文和由其发送的回复快照执行 Unicode 规范化、不区分大小写的子串匹配；不会搜索其他成员的正文、昵称、ID、时间、文件名或图片 OCR。
+`/群典` 对普通记录和合并转发记录等概率抽取，单次抽取不会重复。`/群典 @某人` 使用 QQ ID 匹配普通作者或任意层级转发节点作者；追加关键词后，只对该成员本人发送的正文、递归转发节点正文和由其发送的回复快照执行 Unicode 规范化、不区分大小写的子串匹配，不会搜索其他成员的正文、昵称、ID、时间、文件名或图片 OCR。
 
 `/爆典 @某人` 则会收集该成员作为普通消息作者或任一转发节点作者参与的记录，按收录时间从旧到新排列。多作者合并转发整体计为一条，不拆分、不重复计数。
 
@@ -236,6 +236,7 @@ python -m pip install -r requirements.txt
 - `max_query_keyword_chars`：指定成员查询的关键词长度上限，默认 100，可按群覆盖。
 - `audit_limit`：删除审计最多保留的条数，默认 10000。
 - `group_overrides`：按群号覆盖关键词、发送、爆典、权限和部分容量配置，建议通过管理页编辑。
+- `author_aliases`：按“群号 → QQ → 别名列表”纠正旧合并转发节点和回复快照的作者；保存前会显示受影响记录与节点数量。
 
 存储路径迁移必须通过管理页执行。卡片 CSS 会经过安全过滤，不允许 `@import`、`url()` 或其他外部资源。
 
@@ -248,7 +249,7 @@ python -m pip install -r requirements.txt
 - 按群分页、搜索和筛选记录
 - 查看文字、图片、表情、回复快照、转发节点和记录元数据
 - 单条或批量删除；合并转发详情中可删除任意层级的单个节点，并查看删除审计
-- 编辑全局配置和群级覆盖，预览 CSS 卡片
+- 编辑全局配置、群级覆盖和作者别名，预览 CSS 卡片
 - 导出 ZIP 备份
 - 预检并确认导入备份，查看新增、重复、冲突和缺失资源统计
 - 显式迁移存储目录，并保留迁移前备份
@@ -285,7 +286,7 @@ AstrBot/data/plugin_data/astrbot_plugin_iconic_quotes/iconic_quotes/
 - 仅支持 OneBot 11 / QQ 群聊。
 - 嵌套合并转发默认最多收录 3 层，可配置为 1～10 层；超限时整条添加失败。
 - 纯图片记录不能通过字符串删除命令命中，请在管理页删除。
-- OneBot 无法返回作者 QQ ID 时，记录会标记为身份不完整，只能进入群级随机池。
+- 插件优先读取节点 `sender` 身份，并保留 OneBot 原始 ID 与解析来源。查询旧记录时只在内存副本中按管理员别名、有效 QQ 和群内唯一完整昵称纠正，不会自动改写 JSON；无法确认的节点会显示一次提示。
 - OneBot 11 自定义转发节点不支持本地头像字段，因此头像本地化只用于 CSS 卡片和后台展示，不能替换爆典或合并转发气泡旁的原生头像。
 - 图片或 JSON 被外部修改后，异常记录不会参与随机群典；爆典会保留可读内容并标记缺失媒体。
 
