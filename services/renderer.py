@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import html
+import inspect
 from datetime import datetime
 from typing import Any
 
@@ -277,6 +278,360 @@ class QuoteRenderer:
             )
         return nodes
 
+    async def raw_forward_nodes(
+        self,
+        records: list[QuoteRecord],
+        *,
+        replay: bool = False,
+        native_stickers: bool = True,
+        native_replies: bool = True,
+    ) -> list[dict[str, Any]]:
+        """递归构造 NapCat 可识别的 OneBot 原始合并转发节点。"""
+        result: list[dict[str, Any]] = []
+        if replay:
+            result.append(
+                self._raw_node(
+                    uin="0",
+                    name="群典",
+                    content=[{"type": "text", "data": {"text": "群典存档回放"}}],
+                )
+            )
+        for record in records:
+            if record.type == "forward":
+                result.extend(
+                    await self._raw_forward_level_nodes(
+                        record.nodes,
+                        native_stickers=native_stickers,
+                        native_replies=native_replies,
+                    )
+                )
+                continue
+            assert record.author is not None
+            content = self._reply_to_components(
+                record.reply,
+                native_stickers=native_stickers,
+                native_replies=native_replies,
+            )
+            content.extend(
+                self._segments_to_components(
+                    record.segments,
+                    native_stickers=native_stickers,
+                )
+            )
+            result.append(
+                self._raw_node(
+                    uin=record.author.user_id or "0",
+                    name=record.author.nickname or record.author.user_id or "未知用户",
+                    content=await self._components_to_payload(content),
+                )
+            )
+        return result
+
+    async def raw_burst_nodes(
+        self,
+        records: list[QuoteRecord],
+        *,
+        target_name: str,
+        total: int,
+        page: int,
+        pages: int,
+        skipped: int,
+        native_stickers: bool,
+        native_replies: bool,
+        time_mode: str,
+        identity_incomplete: bool = False,
+    ) -> list[dict[str, Any]]:
+        """把整页爆典构造成一次原子发送的原始节点树。"""
+        title = f"聊天记录：{target_name}\n"
+        title += (
+            f"共 {total} 条｜第 {page} / {pages} 页" if pages > 1 else f"共 {total} 条"
+        )
+        if skipped:
+            title += f"\n另有 {skipped} 条记录完全损坏，无法展示"
+        if identity_incomplete:
+            title += "\n部分历史节点的作者身份尚未确认"
+        missing_media = sum(
+            self.storage.missing_media_count(record) for record in records
+        )
+        if missing_media:
+            title += f"\n本页有 {missing_media} 处媒体资源缺失"
+        result = [
+            self._raw_node(
+                uin="0",
+                name="群典",
+                content=[{"type": "text", "data": {"text": title}}],
+            )
+        ]
+        for record in records:
+            native_time = self._native_time(record.recorded_at)
+            if time_mode == "text":
+                result.append(
+                    self._raw_node(
+                        uin="0",
+                        name="记录时间",
+                        content=[
+                            {
+                                "type": "text",
+                                "data": {"text": self._record_time(record.recorded_at)},
+                            }
+                        ],
+                    )
+                )
+            if record.type == "forward":
+                children = await self._raw_forward_level_nodes(
+                    record.nodes,
+                    native_stickers=native_stickers,
+                    native_replies=native_replies,
+                )
+                result.append(
+                    self._raw_node(
+                        uin="0",
+                        name="聊天记录存档",
+                        content=children,
+                        timestamp=native_time if time_mode == "native" else 0,
+                        shell_count=len(children),
+                    )
+                )
+                continue
+            assert record.author is not None
+            components = self._reply_to_components(
+                record.reply,
+                native_stickers=native_stickers,
+                native_replies=native_replies,
+            )
+            components.extend(
+                self._segments_to_components(
+                    record.segments,
+                    native_stickers=native_stickers,
+                )
+            )
+            result.append(
+                self._raw_node(
+                    uin=record.author.user_id or "0",
+                    name=record.author.nickname or record.author.user_id or "未知用户",
+                    content=await self._components_to_payload(components),
+                    timestamp=native_time if time_mode == "native" else 0,
+                )
+            )
+        return result
+
+    async def _raw_forward_level_nodes(
+        self,
+        nodes: list[ForwardNode],
+        *,
+        native_stickers: bool,
+        native_replies: bool,
+    ) -> list[dict[str, Any]]:
+        """按存档位置递归展开；普通内容与子 node 不混放，避免 NapCat 丢段。"""
+        result: list[dict[str, Any]] = []
+        for node in nodes:
+            if node.reply and not native_replies:
+                result.extend(
+                    await self._components_to_payload(
+                        self._reply_fallback_nodes(
+                            node.reply,
+                            native_stickers=native_stickers,
+                        )
+                    )
+                )
+            if not node.nested_forwards:
+                components = self._reply_to_components(
+                    node.reply,
+                    native_stickers=native_stickers,
+                    native_replies=native_replies,
+                )
+                components.extend(
+                    self._segments_to_components(
+                        node.segments,
+                        native_stickers=native_stickers,
+                    )
+                )
+                result.append(
+                    self._raw_author_node(
+                        node,
+                        await self._components_to_payload(components),
+                    )
+                )
+                continue
+
+            by_position: dict[int, list[NestedForward]] = {}
+            for nested in node.nested_forwards:
+                by_position.setdefault(nested.position, []).append(nested)
+            chunk: list[QuoteSegment] = []
+            reply_pending = bool(node.reply and native_replies)
+
+            async def flush(
+                current_node: ForwardNode = node,
+                current_chunk: list[QuoteSegment] = chunk,
+            ) -> None:
+                nonlocal reply_pending
+                components: list[Any] = []
+                if reply_pending:
+                    components.extend(
+                        self._reply_to_components(
+                            current_node.reply,
+                            native_stickers=native_stickers,
+                            native_replies=True,
+                        )
+                    )
+                    reply_pending = False
+                components.extend(
+                    self._segments_to_components(
+                        current_chunk,
+                        native_stickers=native_stickers,
+                    )
+                )
+                if components:
+                    result.append(
+                        self._raw_author_node(
+                            current_node,
+                            await self._components_to_payload(components),
+                        )
+                    )
+                current_chunk.clear()
+
+            for index in range(len(node.segments) + 1):
+                if by_position.get(index):
+                    await flush()
+                for nested in by_position.get(index, []):
+                    children = await self._raw_forward_level_nodes(
+                        nested.nodes,
+                        native_stickers=native_stickers,
+                        native_replies=native_replies,
+                    )
+                    result.append(
+                        self._raw_author_node(
+                            node,
+                            children,
+                            shell_count=len(children),
+                        )
+                    )
+                if index < len(node.segments):
+                    chunk.append(node.segments[index])
+            await flush()
+        return result
+
+    async def _components_to_payload(
+        self, components: list[Any]
+    ) -> list[dict[str, Any]]:
+        """兼容 AstrBot 组件的同步 toDict 与异步 to_dict 两套协议。"""
+        result: list[dict[str, Any]] = []
+        for component in components:
+            if isinstance(component, Comp.Image):
+                converter = getattr(component, "convert_to_base64", None)
+                if callable(converter):
+                    encoded = converter()
+                    if inspect.isawaitable(encoded):
+                        encoded = await encoded
+                    result.append(
+                        {
+                            "type": "image",
+                            "data": {"file": f"base64://{encoded}"},
+                        }
+                    )
+                    continue
+            converter = getattr(component, "to_dict", None)
+            if callable(converter):
+                payload = converter()
+                if inspect.isawaitable(payload):
+                    payload = await payload
+            else:
+                converter = getattr(component, "toDict", None)
+                if not callable(converter):
+                    raise TypeError("消息组件不支持 OneBot 序列化")
+                payload = converter()
+            if isinstance(payload, dict):
+                result.append(payload)
+        return result
+
+    @classmethod
+    def _raw_author_node(
+        cls,
+        node: ForwardNode,
+        content: list[dict[str, Any]],
+        *,
+        shell_count: int | None = None,
+    ) -> dict[str, Any]:
+        return cls._raw_node(
+            uin=node.author.user_id or "0",
+            name=node.author.nickname or node.author.user_id or "未知用户",
+            content=content,
+            timestamp=cls._native_time(node.source_sent_at or ""),
+            shell_count=shell_count,
+        )
+
+    @classmethod
+    def _raw_node(
+        cls,
+        *,
+        uin: str,
+        name: str,
+        content: list[dict[str, Any]],
+        timestamp: int = 0,
+        shell_count: int | None = None,
+    ) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "user_id": str(uin),
+            "nickname": name,
+            "content": content,
+        }
+        if timestamp:
+            data["time"] = timestamp
+        if shell_count is not None:
+            # NapCat 会把只含 node 的 content 识别为下一层聊天记录。
+            data.update(
+                {
+                    "source": "聊天记录",
+                    "summary": f"查看 {shell_count} 条转发消息",
+                    "prompt": "[聊天记录]",
+                    "news": cls.raw_forward_news(content),
+                }
+            )
+        return {"type": "node", "data": data}
+
+    @classmethod
+    def raw_forward_meta(cls, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        """生成与嵌套层一致的 NapCat 合并转发卡片元数据。"""
+        return {
+            "source": "聊天记录",
+            "summary": f"查看 {len(messages)} 条转发消息",
+            "prompt": "[聊天记录]",
+            "news": cls.raw_forward_news(messages),
+        }
+
+    @staticmethod
+    def raw_forward_news(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        """从前四个节点提取不含路径的安全文字预览。"""
+        result: list[dict[str, str]] = []
+        for message in messages[:4]:
+            data = message.get("data") if isinstance(message, dict) else None
+            if not isinstance(data, dict):
+                continue
+            nickname = str(data.get("nickname") or "未知用户")
+            content = data.get("content")
+            parts: list[str] = []
+            if isinstance(content, list):
+                for segment in content:
+                    if not isinstance(segment, dict):
+                        continue
+                    segment_type = str(segment.get("type") or "")
+                    segment_data = segment.get("data")
+                    if segment_type == "text" and isinstance(segment_data, dict):
+                        text = str(segment_data.get("text") or "").strip()
+                        if text:
+                            parts.append(text)
+                    elif segment_type == "node":
+                        parts.append("[聊天记录]")
+                    elif segment_type in {"image", "mface"}:
+                        parts.append("[图片]")
+                    elif segment_type == "face":
+                        parts.append("[表情]")
+            summary = " ".join(parts).replace("\n", " ").strip() or "[消息]"
+            result.append({"text": f"{nickname}：{summary[:60]}"})
+        return result or [{"text": "聊天记录"}]
+
     def burst_nodes(
         self,
         records: list[QuoteRecord],
@@ -489,26 +844,12 @@ class QuoteRenderer:
             if by_position.get(index):
                 flush()
             for nested in by_position.get(index, []):
-                result.append(
-                    Comp.Node(
-                        uin="0",
-                        name="嵌套聊天记录",
-                        content=[Comp.Plain("嵌套聊天记录开始")],
-                    )
-                )
                 result.extend(
                     self._forward_level_nodes(
                         nested.nodes,
                         native_stickers=native_stickers,
                         native_replies=native_replies,
                         native_nested=False,
-                    )
-                )
-                result.append(
-                    Comp.Node(
-                        uin="0",
-                        name="嵌套聊天记录",
-                        content=[Comp.Plain("嵌套聊天记录结束")],
                     )
                 )
             if index < len(node.segments):

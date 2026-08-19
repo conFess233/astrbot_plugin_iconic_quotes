@@ -33,6 +33,8 @@ GROUP_OVERRIDE_KEYS = {
     "user_blacklist",
     "user_whitelist",
     "excluded_author_ids",
+    "nested_forward_fallback_message",
+    "nested_forward_unknown_message",
 }
 
 
@@ -80,6 +82,8 @@ DEFAULTS: dict[str, Any] = {
     "send_retry_count": 2,
     "send_retry_delay_ms": 500,
     "retry_on_ambiguous_failure": False,
+    "nested_forward_fallback_message": "原生多层嵌套发送失败，以下内容已降级展开。",
+    "nested_forward_unknown_message": "多层群典发送结果未知，为避免重复发送，本次未执行降级，请检查群消息。",
     "audit_limit": 10000,
     "card_width": 1200,
     "card_min_height": 480,
@@ -288,4 +292,11 @@ class SettingsService:
         result["cooldown_message"] = str(result.get("cooldown_message") or "").strip()
         if not result["cooldown_message"]:
             raise ValueError("冷却提示不能为空")
+        for key, label in (
+            ("nested_forward_fallback_message", "多层嵌套降级提示"),
+            ("nested_forward_unknown_message", "多层嵌套结果未知提示"),
+        ):
+            result[key] = str(result.get(key) or "").strip()
+            if not result[key] or len(result[key]) > 500:
+                raise ValueError(f"{label}不能为空且不能超过 500 个字符")
         return result

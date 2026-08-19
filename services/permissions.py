@@ -98,3 +98,15 @@ async def call_onebot_action(event: Any, action: str, **params: Any) -> Any:
     if last_error:
         raise last_error
     raise RuntimeError("当前 OneBot 适配器未提供 call_action")
+
+
+async def call_onebot_action_once(event: Any, action: str, **params: Any) -> Any:
+    """只调用一个 OneBot 入口，避免发送结果未知时换入口造成重复消息。"""
+    bot = getattr(event, "bot", None)
+    for caller in (
+        getattr(bot, "call_action", None),
+        getattr(getattr(bot, "api", None), "call_action", None),
+    ):
+        if callable(caller):
+            return _unwrap_onebot(await caller(action, **params))
+    raise RuntimeError("当前 OneBot 适配器未提供 call_action")

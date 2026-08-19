@@ -239,6 +239,16 @@
     "default": false,
     "hint": "开启后可能产生重复消息。"
   },
+  "nested_forward_fallback_message": {
+    "description": "多层嵌套原生发送明确失败后的降级提示",
+    "type": "string",
+    "default": "原生多层嵌套发送失败，以下内容已降级展开。"
+  },
+  "nested_forward_unknown_message": {
+    "description": "多层嵌套发送结果未知且不执行降级时的提示",
+    "type": "string",
+    "default": "多层群典发送结果未知，为避免重复发送，本次未执行降级，请检查群消息。"
+  },
   "audit_limit": {
     "description": "删除审计最大条数",
     "type": "int",

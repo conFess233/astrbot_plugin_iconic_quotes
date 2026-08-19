@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
@@ -23,7 +23,12 @@ from .services.avatar_cache import AvatarCacheService
 from .services.cooldown import GlobalCooldown
 from .services.identity import AuthorIdentityService
 from .services.onebot import CaptureError, OneBotQuoteExtractor
-from .services.permissions import PermissionService, RoleLookupError, call_onebot_action
+from .services.permissions import (
+    PermissionService,
+    RoleLookupError,
+    call_onebot_action,
+    call_onebot_action_once,
+)
 from .services.renderer import QuoteRenderer
 from .services.settings import SettingsService
 from .services.storage import DuplicateQuoteError, QuoteStorage, StorageError
@@ -562,15 +567,65 @@ class IconicQuotesPlugin(Star):
         await self._refresh_record_author_names(event, selected)
         target_name = await self._burst_target_name(event, target_id, records)
         configured_time_mode = values["burst_time_mode"]
+        force_flatten = False
+        multilevel = any(record.forward_depth() >= 2 for record in selected)
+        if multilevel:
+            # 爆典会额外包一层“聊天记录存档”，因此按最终 OneBot 树深度预检。
+            payload_depth = max(
+                record.forward_depth() + 1
+                for record in selected
+                if record.type == "forward"
+            )
+            if payload_depth <= 3 and await self._is_napcat(event):
+                raw_time_modes = [configured_time_mode]
+                if configured_time_mode == "native":
+                    raw_time_modes.append("none")
+                last_error: Exception | None = None
+                for raw_time_mode in raw_time_modes:
+                    outcome, last_error = await self._try_raw_forward(
+                        event,
+                        values,
+                        lambda native_replies, native_stickers, mode=raw_time_mode: (
+                            self.renderer.raw_burst_nodes(
+                                selected,
+                                target_name=target_name,
+                                total=len(records),
+                                page=page,
+                                pages=pages,
+                                skipped=broken,
+                                identity_incomplete=any(
+                                    record.identity_incomplete for record in selected
+                                ),
+                                native_stickers=native_stickers,
+                                native_replies=native_replies,
+                                time_mode=mode,
+                            )
+                        ),
+                        has_replies=any(record.has_replies() for record in selected),
+                        has_stickers=any(record.has_stickers() for record in selected),
+                    )
+                    if outcome == "success":
+                        self._operation_log_override = "原生多层嵌套"
+                        return
+                    if outcome == "ambiguous":
+                        await self._send_text(
+                            event, values["nested_forward_unknown_message"], values
+                        )
+                        self._operation_log_override = "多层嵌套结果未知"
+                        return
+            await self._send_text(
+                event, values["nested_forward_fallback_message"], values
+            )
+            force_flatten = True
         time_modes = [configured_time_mode]
         if configured_time_mode == "native":
             time_modes.append("none")
         variants: list[tuple[bool, bool, bool, str]] = []
         for time_mode in time_modes:
-            variants.append((True, True, True, time_mode))
+            variants.append((not force_flatten, True, True, time_mode))
         if any(record.has_replies() for record in selected):
             for time_mode in time_modes:
-                variants.append((True, True, False, time_mode))
+                variants.append((not force_flatten, True, False, time_mode))
         if any(record.type == "forward" for record in selected):
             for time_mode in time_modes:
                 variants.append((False, True, True, time_mode))
@@ -607,7 +662,9 @@ class IconicQuotesPlugin(Star):
                     or not native_replies
                     or time_mode != configured_time_mode
                 ):
-                    self._operation_log_override = "已降级发送"
+                    self._operation_log_override = (
+                        "多层嵌套失败，已降级" if force_flatten else "已降级发送"
+                    )
                 return
             except Exception as exc:  # noqa: BLE001 - OneBot 错误类型不统一。
                 last_error = exc
@@ -683,6 +740,7 @@ class IconicQuotesPlugin(Star):
                         [record],
                         values,
                         replay=True,
+                        allow_native_multilevel=False,
                     ):
                         return False
                 else:
@@ -792,7 +850,46 @@ class IconicQuotesPlugin(Star):
         values: dict[str, Any],
         *,
         replay: bool,
+        allow_native_multilevel: bool = True,
     ) -> bool:
+        multilevel = any(record.forward_depth() >= 2 for record in records)
+        if allow_native_multilevel and multilevel:
+            payload_depth = max(record.forward_depth() for record in records)
+            if payload_depth <= 3 and await self._is_napcat(event):
+                outcome, _ = await self._try_raw_forward(
+                    event,
+                    values,
+                    lambda native_replies, native_stickers: (
+                        self.renderer.raw_forward_nodes(
+                            records,
+                            replay=replay,
+                            native_stickers=native_stickers,
+                            native_replies=native_replies,
+                        )
+                    ),
+                    has_replies=any(record.has_replies() for record in records),
+                    has_stickers=any(record.has_stickers() for record in records),
+                )
+                if outcome == "success":
+                    self._operation_log_override = "原生多层嵌套"
+                    return True
+                if outcome == "ambiguous":
+                    await self._send_text(
+                        event, values["nested_forward_unknown_message"], values
+                    )
+                    self._operation_log_override = "多层嵌套结果未知"
+                    return False
+            await self._send_text(
+                event, values["nested_forward_fallback_message"], values
+            )
+            sent = await self._send_forward_flattened(
+                event, records, values, replay=replay
+            )
+            if sent:
+                self._operation_log_override = "多层嵌套失败，已降级"
+                return True
+            return False
+
         variants: list[tuple[bool, bool, bool]] = [(True, True, True)]
         if any(record.has_replies() for record in records):
             variants.append((True, False, True))
@@ -828,6 +925,146 @@ class IconicQuotesPlugin(Star):
             )
         await self._send_text(event, "合并转发发送失败，请稍后重试。", values)
         return False
+
+    async def _send_forward_flattened(
+        self,
+        event: AstrMessageEvent,
+        records: list[QuoteRecord],
+        values: dict[str, Any],
+        *,
+        replay: bool,
+    ) -> bool:
+        """完整展开层级；这里只在原生多层明确不可用时调用。"""
+        variants = [(True, True)]
+        if any(record.has_replies() for record in records):
+            variants.append((False, True))
+        if any(record.has_stickers() for record in records):
+            variants.extend(
+                (native_replies, False) for native_replies, _ in list(variants)
+            )
+        last_error: Exception | None = None
+        for native_replies, native_stickers in dict.fromkeys(variants):
+            try:
+                nodes = self.renderer.forward_nodes(
+                    records,
+                    replay=replay,
+                    native_stickers=native_stickers,
+                    native_replies=native_replies,
+                    native_nested=False,
+                )
+                await self._send_chain(event, [Comp.Nodes(nodes)], values)
+                return True
+            except Exception as exc:  # noqa: BLE001 - OneBot 错误类型不统一。
+                last_error = exc
+                logger.debug("群典：多层嵌套降级发送尝试失败")
+        if last_error is not None:
+            self._operation_error_logged = True
+            logger.error(
+                "群典：多层嵌套降级发送失败",
+                exc_info=(type(last_error), last_error, last_error.__traceback__),
+            )
+        return False
+
+    async def _is_napcat(self, event: AstrMessageEvent) -> bool:
+        """通过 OneBot 版本信息识别 NapCat；查询失败视为不支持增强路径。"""
+        try:
+            payload = await call_onebot_action(event, "get_version_info")
+        except Exception:  # noqa: BLE001 - 版本查询失败不能阻塞普通降级路径。
+            logger.debug("群典：无法识别 OneBot 实现")
+            return False
+        return "napcat" in str(payload).casefold()
+
+    async def _try_raw_forward(
+        self,
+        event: AstrMessageEvent,
+        values: dict[str, Any],
+        builder: Callable[[bool, bool], Awaitable[list[dict[str, Any]]]],
+        *,
+        has_replies: bool,
+        has_stickers: bool,
+    ) -> tuple[Literal["success", "explicit", "ambiguous"], Exception | None]:
+        """按回复、贴纸回退顺序尝试原生树；结果未知时立即停止。"""
+        variants = [(True, True)]
+        if has_replies:
+            variants.append((False, True))
+        if has_stickers:
+            variants.extend(
+                (native_replies, False) for native_replies, _ in list(variants)
+            )
+        last_error: Exception | None = None
+        for native_replies, native_stickers in dict.fromkeys(variants):
+            try:
+                messages = await builder(native_replies, native_stickers)
+            except Exception as exc:  # noqa: BLE001 - 本地序列化失败属于明确失败。
+                last_error = exc
+                logger.debug("群典：构造原生多层嵌套失败")
+                continue
+            outcome, error = await self._send_raw_forward_action(
+                event,
+                messages,
+                values,
+            )
+            if outcome == "success":
+                return outcome, None
+            last_error = error
+            if outcome == "ambiguous":
+                return outcome, error
+            logger.debug("群典：原生多层嵌套发送尝试失败")
+        return "explicit", last_error
+
+    async def _send_raw_forward_action(
+        self,
+        event: AstrMessageEvent,
+        messages: list[dict[str, Any]],
+        values: dict[str, Any],
+    ) -> tuple[Literal["success", "explicit", "ambiguous"], Exception | None]:
+        """直接发送 NapCat 节点树，并区分明确失败与结果未知。"""
+        attempts = values["send_retry_count"] + 1
+        delay = values["send_retry_delay_ms"] / 1000
+        last_error: Exception | None = None
+        last_outcome: Literal["explicit", "ambiguous"] = "explicit"
+        saw_ambiguous = False
+        for attempt in range(attempts):
+            try:
+                params: dict[str, Any] = {
+                    "group_id": int(event.get_group_id()),
+                    "messages": messages,
+                    **self.renderer.raw_forward_meta(messages),
+                }
+                self_id = str(event.get_self_id() or "")
+                if self_id.isdigit():
+                    params["self_id"] = int(self_id)
+                await call_onebot_action_once(
+                    event,
+                    "send_group_forward_msg",
+                    **params,
+                )
+                self._sent_in_operation = True
+                return "success", None
+            except Exception as exc:  # noqa: BLE001 - OneBot 错误类型不统一。
+                last_error = exc
+                last_outcome = (
+                    "ambiguous" if self._is_ambiguous_send_error(exc) else "explicit"
+                )
+                saw_ambiguous = saw_ambiguous or last_outcome == "ambiguous"
+                if (
+                    last_outcome == "ambiguous"
+                    and not values["retry_on_ambiguous_failure"]
+                ):
+                    break
+            if attempt + 1 < attempts:
+                logger.debug("群典：原生多层嵌套发送重试")
+                await asyncio.sleep(delay)
+        # 任一次结果未知都意味着消息可能已经送达，后续明确失败不能消除重复风险。
+        return ("ambiguous" if saw_ambiguous else last_outcome), last_error
+
+    @staticmethod
+    def _is_ambiguous_send_error(error: Exception) -> bool:
+        """网络中断和超时可能发生在服务端已受理之后，不能安全降级。"""
+        return isinstance(
+            error,
+            (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError),
+        )
 
     async def _send_record_chain(
         self,

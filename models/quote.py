@@ -382,6 +382,24 @@ class QuoteRecord:
         """判断记录是否包含任意层级的子合并转发。"""
         return any(self._node_has_nested(node) for node in self.nodes)
 
+    def forward_depth(self) -> int:
+        """返回聊天记录原始层数；最外层聊天记录计为第一层。"""
+        if self.type != "forward":
+            return 0
+        return max((self._node_forward_depth(node) for node in self.nodes), default=1)
+
+    @classmethod
+    def _node_forward_depth(cls, node: ForwardNode) -> int:
+        child_depth = max(
+            (
+                cls._node_forward_depth(child)
+                for nested in node.nested_forwards
+                for child in nested.nodes
+            ),
+            default=0,
+        )
+        return 1 + child_depth if node.nested_forwards else 1
+
     @classmethod
     def _node_has_nested(cls, node: ForwardNode) -> bool:
         return bool(node.nested_forwards) or any(
