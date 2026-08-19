@@ -7,6 +7,7 @@ import contextlib
 import math
 import re
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,6 +21,7 @@ from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .models import QuoteRecord
+from .services.avatar_cache import AvatarCacheService
 from .services.cooldown import GlobalCooldown
 from .services.onebot import CaptureError, OneBotQuoteExtractor
 from .services.permissions import PermissionService, RoleLookupError, call_onebot_action
@@ -60,11 +62,13 @@ class IconicQuotesPlugin(Star):
         self.extractor = OneBotQuoteExtractor(self.storage)
         self.permissions = PermissionService()
         self.cooldown = GlobalCooldown()
-        self.renderer = QuoteRenderer(self, self.storage)
+        self.avatars = AvatarCacheService(self.storage)
+        self.renderer = QuoteRenderer(self, self.storage, self.avatars)
         self.web = WebManager(
             self.storage,
             self.settings,
             self.renderer,
+            self.avatars,
             self.config,
         )
         self._pending_deletions: dict[tuple[str, str], PendingDeletion] = {}
@@ -91,6 +95,15 @@ class IconicQuotesPlugin(Star):
             ("storage/migrate", self.web.migrate, ["POST"], "迁移存储"),
             ("preview", self.web.preview, ["POST"], "预览卡片"),
             ("media-data", self.web.media_data, ["GET"], "预览群典图片"),
+            ("avatar-data", self.web.avatar_data, ["GET"], "预览本地头像"),
+            ("avatars/stats", self.web.avatar_stats, ["GET"], "头像缓存统计"),
+            (
+                "avatars/cleanup",
+                self.web.cleanup_avatars,
+                ["POST"],
+                "清理无引用头像",
+            ),
+            ("avatars/clear", self.web.clear_avatars, ["POST"], "清空头像缓存"),
         )
         for route, handler, methods, description in routes:
             self.context.register_web_api(
@@ -109,6 +122,7 @@ class IconicQuotesPlugin(Star):
     async def initialize(self) -> None:
         """初始化数据目录和可复用头像 HTTP Client。"""
         legacy_backup = await self.storage.initialize()
+        await self.avatars.initialize()
         await self.renderer.initialize()
         if legacy_backup:
             logger.info(
@@ -132,13 +146,14 @@ class IconicQuotesPlugin(Star):
         self._pending_deletions.clear()
         await self.web.close()
         await self.renderer.close()
+        await self.avatars.close()
         logger.info("群典插件已停止")
 
     @filter.command("添加群典")
     async def add_quote(self, event: AstrMessageEvent):
         """收录当前消息引用的一条消息或合并转发。"""
         event.set_extra(COMMAND_EVENT_KEY, True)
-        await self._dispatch(event, "add", self._add_quote)
+        await self._dispatch(event, "add", self._add_quote, trigger_source="command")
 
     @filter.command("群典")
     async def query_quote(self, event: AstrMessageEvent, argument: str = ""):
@@ -152,9 +167,13 @@ class IconicQuotesPlugin(Star):
             ).casefold()
             == "info"
         ):
-            await self._dispatch(event, "info", self._show_info)
+            await self._dispatch(
+                event, "info", self._show_info, trigger_source="command"
+            )
             return
-        await self._dispatch(event, "query", self._send_random_quote)
+        await self._dispatch(
+            event, "query", self._send_random_quote, trigger_source="command"
+        )
 
     @filter.command("爆典")
     async def burst_quote(self, event: AstrMessageEvent, argument: str = ""):
@@ -167,6 +186,7 @@ class IconicQuotesPlugin(Star):
             event,
             "burst",
             lambda current, values: self._send_burst(current, values, page_value),
+            trigger_source="command",
         )
 
     @filter.command("删除群典")
@@ -178,13 +198,16 @@ class IconicQuotesPlugin(Star):
             event,
             "delete",
             lambda current, values: self._prepare_delete(current, values, search),
+            trigger_source="command",
         )
 
     @filter.command("确认删除")
     async def confirm_delete(self, event: AstrMessageEvent):
         """在 60 秒内确认当前用户最近一次删除预览。"""
         event.set_extra(COMMAND_EVENT_KEY, True)
-        await self._dispatch(event, "delete", self._confirm_delete)
+        await self._dispatch(
+            event, "delete", self._confirm_delete, trigger_source="command"
+        )
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def keyword_listener(self, event: AstrMessageEvent):
@@ -227,32 +250,72 @@ class IconicQuotesPlugin(Star):
                     current_values,
                     burst_page,
                 ),
+                trigger_source="keyword",
             )
         elif add_match and has_source:
-            await self._dispatch(event, "add", self._add_quote)
+            await self._dispatch(
+                event, "add", self._add_quote, trigger_source="keyword"
+            )
         elif query_match:
-            await self._dispatch(event, "query", self._send_random_quote)
+            await self._dispatch(
+                event, "query", self._send_random_quote, trigger_source="keyword"
+            )
         elif add_match:
-            await self._dispatch(event, "add", self._add_quote)
+            await self._dispatch(
+                event, "add", self._add_quote, trigger_source="keyword"
+            )
 
     async def _dispatch(
         self,
         event: AstrMessageEvent,
         operation: str,
         action: Callable[[AstrMessageEvent, dict[str, Any]], Awaitable[None]],
+        *,
+        trigger_source: str,
     ) -> None:
         """统一执行平台、名单、冷却、角色权限和异常反馈。"""
         event.should_call_llm(False)
         platform = event.get_platform_name()
         group_id = str(event.get_group_id() or "")
         user_id = str(event.get_sender_id() or "")
+        trace_id = uuid.uuid4().hex[:8]
+        target_present = bool(self._mentioned_users(event))
+        logger.info(
+            "群典触发: trace=%s operation=%s source=%s group=%s caller=%s target=%s",
+            trace_id,
+            operation,
+            trigger_source,
+            group_id or "-",
+            user_id or "-",
+            target_present,
+        )
+
+        def log_result(result: str) -> None:
+            logger.info(
+                "群典结果: trace=%s operation=%s group=%s caller=%s result=%s",
+                trace_id,
+                operation,
+                group_id or "-",
+                user_id or "-",
+                result,
+            )
+
         if platform != "aiocqhttp" or not group_id:
-            values = self.settings.global_settings()
+            try:
+                values = self.settings.global_settings()
+            except Exception:  # noqa: BLE001 - 无有效配置时只能使用无重试提示。
+                logger.exception("群典配置读取失败: trace=%s", trace_id)
+                await self._send_without_retry(
+                    event, "群典插件配置无效，请联系管理员。"
+                )
+                log_result("config_error")
+                return
             notice_key = group_id or f"private:{platform}:{user_id}"
             decision = await self.cooldown.try_enter(notice_key)
             if not decision.accepted:
                 if decision.should_notify:
                     await self._send_without_retry(event, values["cooldown_message"])
+                log_result("cooldown")
                 return
             sent = await self._send_without_retry(
                 event,
@@ -262,39 +325,60 @@ class IconicQuotesPlugin(Star):
                 values["global_cooldown_ms"],
                 sent_message=sent,
             )
+            log_result("unsupported_platform_or_session")
             return
-        values = self.settings.for_group(group_id)
+        try:
+            values = self.settings.for_group(group_id)
+        except Exception:  # noqa: BLE001 - 配置错误必须隔离在 Handler 边界。
+            logger.exception("群典配置读取失败: trace=%s group=%s", trace_id, group_id)
+            await self._send_without_retry(event, "群典插件配置无效，请联系管理员。")
+            log_result("config_error")
+            return
         if not self.permissions.list_allows(values, group_id, user_id):
+            log_result("list_blocked")
             return
         decision = await self.cooldown.try_enter(group_id)
         if not decision.accepted:
             if decision.should_notify:
                 await self._send_without_retry(event, values["cooldown_message"])
+            log_result("cooldown")
             return
         self._sent_in_operation = False
+        result = "success"
         try:
             try:
                 allowed = await self.permissions.allows(event, values, operation)
             except RoleLookupError:
+                result = "permission_lookup_failed"
                 await self._send_text(event, "暂时无法验证群权限。", values)
                 return
             if not allowed:
+                result = "permission_denied"
                 await self._send_text(event, "你没有执行此操作的权限。", values)
                 return
             await action(event, values)
         except DuplicateQuoteError as exc:
+            result = "duplicate"
             await self._send_text(
                 event,
                 (f"该群典已存在。\n记录 ID：{exc.record.id[:8]}"),
                 values,
             )
         except (CaptureError, StorageError, ValueError) as exc:
+            result = "operation_failed"
             await self._send_text(event, f"操作失败：{exc}", values)
         except Exception:  # noqa: BLE001 - Handler 边界必须隔离未知插件/适配器异常。
-            logger.exception("群典操作失败: operation=%s group=%s", operation, group_id)
+            result = "unexpected_error"
+            logger.exception(
+                "群典操作失败: trace=%s operation=%s group=%s",
+                trace_id,
+                operation,
+                group_id,
+            )
             with contextlib.suppress(Exception):
                 await self._send_text(event, "操作失败，请稍后重试。", values)
         finally:
+            log_result(result)
             await self.cooldown.leave(
                 values["global_cooldown_ms"],
                 sent_message=self._sent_in_operation,
@@ -307,6 +391,8 @@ class IconicQuotesPlugin(Star):
     ) -> None:
         record = await self.extractor.extract(event, values)
         await self.storage.add(record, values["max_records_per_group"])
+        if record.type == "message" and record.author:
+            await self.avatars.prefetch(record.author.user_id, values)
         info = await self.storage.info(record.group_id, values["max_records_per_group"])
         author = self._record_author_name(record)
         warning = (
@@ -393,13 +479,21 @@ class IconicQuotesPlugin(Star):
         start = (page - 1) * page_size
         selected = records[start : start + page_size]
         target_name = await self._burst_target_name(event, target_id, records)
-        variants = [(True, True)]
+        configured_time_mode = values["burst_time_mode"]
+        time_modes = [configured_time_mode]
+        if configured_time_mode == "native":
+            time_modes.append("none")
+        variants: list[tuple[bool, bool, str]] = []
+        for time_mode in time_modes:
+            variants.append((True, True, time_mode))
         if any(record.type == "forward" for record in selected):
-            variants.append((False, True))
+            for time_mode in time_modes:
+                variants.append((False, True, time_mode))
         if any(record.has_stickers() for record in selected):
-            variants.append((False, False))
+            for time_mode in time_modes:
+                variants.append((False, False, time_mode))
         last_error: Exception | None = None
-        for nested, native_stickers in variants:
+        for nested, native_stickers, time_mode in dict.fromkeys(variants):
             try:
                 nodes = self.renderer.burst_nodes(
                     selected,
@@ -410,11 +504,36 @@ class IconicQuotesPlugin(Star):
                     skipped=broken,
                     nested=nested,
                     native_stickers=native_stickers,
+                    time_mode=time_mode,
                 )
                 await self._send_chain(event, [Comp.Nodes(nodes)], values)
+                if (
+                    not nested
+                    or not native_stickers
+                    or time_mode != configured_time_mode
+                ):
+                    logger.info(
+                        "爆典合集已降级发送: group=%s target=%s nested=%s "
+                        "native_stickers=%s time_mode=%s",
+                        event.get_group_id(),
+                        target_id,
+                        nested,
+                        native_stickers,
+                        time_mode,
+                    )
                 return
             except Exception as exc:  # noqa: BLE001 - OneBot 错误类型不统一。
                 last_error = exc
+                logger.warning(
+                    "爆典合集发送尝试失败，准备降级: group=%s target=%s "
+                    "nested=%s native_stickers=%s time_mode=%s error=%s",
+                    event.get_group_id(),
+                    target_id,
+                    nested,
+                    native_stickers,
+                    time_mode,
+                    exc,
+                )
         logger.error(
             "爆典合集发送失败: group=%s target=%s error=%s",
             event.get_group_id(),

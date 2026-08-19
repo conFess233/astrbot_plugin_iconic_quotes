@@ -5,15 +5,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import html
-import time
 from datetime import datetime
 from typing import Any
 
-import aiohttp
 import astrbot.api.message_components as Comp
 
 from ..models import QuoteRecord, QuoteSegment, ReplySnapshot
 from ..utils.image_processing import trim_card_canvas
+from .avatar_cache import AvatarCacheService
 from .storage import QuoteStorage
 
 CARD_TEMPLATE = """
@@ -72,50 +71,39 @@ class MarketFaceComponent(Comp.BaseMessageComponent):
         }
 
 
+class NativeTimeNode(Comp.Node):
+    """尽力向 OneBot 自定义节点附加非标准 time 字段。"""
+
+    async def to_dict(self) -> dict[str, Any]:
+        payload = await super().to_dict()
+        payload["data"]["time"] = int(self.time or 0)
+        return payload
+
+
 class QuoteRenderer:
     """创建跨 Handler 可复用的消息链和卡片。"""
 
-    def __init__(self, plugin: Any, storage: QuoteStorage):
+    def __init__(
+        self,
+        plugin: Any,
+        storage: QuoteStorage,
+        avatars: AvatarCacheService,
+    ):
         self.plugin = plugin
         self.storage = storage
-        self.http: aiohttp.ClientSession | None = None
-        self._avatar_cache: dict[str, tuple[float, bytes | None]] = {}
+        self.avatars = avatars
 
     async def initialize(self) -> None:
-        """在插件异步生命周期内创建 HTTP Client。"""
-        if self.http is None or self.http.closed:
-            self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6))
+        """保留旧生命周期入口，由头像服务统一管理网络资源。"""
 
     async def close(self) -> None:
-        """释放头像 HTTP Client。"""
-        if self.http and not self.http.closed:
-            await self.http.close()
+        """保留旧生命周期入口。"""
 
-    async def avatar_data_url(self, user_id: str | None) -> str:
-        """实时取得 QQ 头像；失败时返回空白且不落盘。"""
-        if not user_id:
-            return ""
-        cached = self._avatar_cache.get(user_id)
-        if not cached or cached[0] <= time.monotonic():
-            try:
-                if self.http is None or self.http.closed:
-                    await self.initialize()
-                url = f"https://q1.qlogo.cn/g?b=qq&nk={int(user_id)}&s=640"
-                assert self.http is not None
-                async with self.http.get(
-                    url, allow_redirects=True, max_redirects=3
-                ) as response:
-                    response.raise_for_status()
-                    data = await response.read()
-                    if len(data) > 2 * 1024 * 1024:
-                        raise ValueError("头像文件过大")
-                    self._avatar_cache[user_id] = (time.monotonic() + 300, data)
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
-                self._avatar_cache[user_id] = (time.monotonic() + 60, None)
-        data = self._avatar_cache[user_id][1]
-        return (
-            f"data:image/jpeg;base64,{base64.b64encode(data).decode()}" if data else ""
-        )
+    async def avatar_data_url(
+        self, user_id: str | None, settings: dict[str, Any]
+    ) -> str:
+        """按配置取得实时或本地化 QQ 头像。"""
+        return await self.avatars.data_url(user_id, settings)
 
     def text_chain(
         self,
@@ -167,7 +155,7 @@ class QuoteRenderer:
             image_urls[index : index + 4] for index in range(0, len(image_urls), 4)
         ] or [[]]
         page_count = max(len(text_chunks), len(image_chunks))
-        avatar = await self.avatar_data_url(record.author.user_id)
+        avatar = await self.avatar_data_url(record.author.user_id, settings)
         paths: list[str] = []
         for index in range(page_count):
             data = {
@@ -278,13 +266,12 @@ class QuoteRenderer:
         skipped: int,
         nested: bool,
         native_stickers: bool,
+        time_mode: str,
     ) -> list[Any]:
         """构造按时间排列的个人完整群典合集。"""
         title = f"聊天记录：{target_name}\n"
         title += (
-            f"--------共 {total} 条｜第 {page} / {pages} 页--------"
-            if pages > 1
-            else f"-------------共 {total} 条-------------"
+            f"共 {total} 条｜第 {page} / {pages} 页" if pages > 1 else f"共 {total} 条"
         )
         if skipped:
             title += f"\n另有 {skipped} 条记录因资源不完整已跳过"
@@ -293,9 +280,18 @@ class QuoteRenderer:
         ]
         for record in records:
             timestamp = self._record_time(record.recorded_at)
+            native_time = self._native_time(record.recorded_at)
+            if time_mode == "text":
+                result.append(
+                    Comp.Node(
+                        uin="0",
+                        name="记录时间",
+                        content=[Comp.Plain(timestamp)],
+                    )
+                )
             if record.type == "message":
                 assert record.author is not None
-                content = [Comp.Plain(f"---------{timestamp}---------\n")]
+                content: list[Any] = []
                 content.extend(
                     self._reply_to_components(
                         record.reply,
@@ -308,14 +304,15 @@ class QuoteRenderer:
                         native_stickers=native_stickers,
                     )
                 )
-                content.append(Comp.Plain("\n-------------------------------------"))
                 result.append(
-                    Comp.Node(
+                    self._burst_node(
                         uin=record.author.user_id or "0",
                         name=record.author.nickname
                         or record.author.user_id
                         or "未知用户",
                         content=content,
+                        native_time=native_time,
+                        time_mode=time_mode,
                     )
                 )
                 continue
@@ -336,33 +333,51 @@ class QuoteRenderer:
             ]
             if nested:
                 result.append(
-                    Comp.Node(
+                    self._burst_node(
                         uin="0",
                         name="聊天记录存档",
-                        content=[
-                            Comp.Plain(f"---------{timestamp}---------"),
-                            Comp.Nodes(inner),
-                            Comp.Plain("-------------------------------------"),
-                        ],
+                        content=inner,
+                        native_time=native_time,
+                        time_mode=time_mode,
                     )
                 )
             else:
                 result.append(
-                    Comp.Node(
+                    self._burst_node(
                         uin="0",
                         name="聊天记录存档",
-                        content=[Comp.Plain(f"---------{timestamp}---------")],
+                        content=[Comp.Plain("以下为本地存档的聊天记录")],
+                        native_time=native_time,
+                        time_mode=time_mode,
                     )
                 )
                 result.extend(inner)
-                result.append(
-                    Comp.Node(
-                        uin="0",
-                        name="聊天记录存档",
-                        content=[Comp.Plain("-------------------------------------")],
-                    )
-                )
         return result
+
+    @staticmethod
+    def _burst_node(
+        *,
+        uin: str,
+        name: str,
+        content: list[Any],
+        native_time: int,
+        time_mode: str,
+    ) -> Any:
+        if time_mode == "native":
+            return NativeTimeNode(
+                uin=uin,
+                name=name,
+                content=content,
+                time=native_time,
+            )
+        return Comp.Node(uin=uin, name=name, content=content)
+
+    @staticmethod
+    def _native_time(value: str) -> int:
+        try:
+            return int(datetime.fromisoformat(value).timestamp())
+        except (TypeError, ValueError):
+            return 0
 
     def _segments_to_components(
         self,

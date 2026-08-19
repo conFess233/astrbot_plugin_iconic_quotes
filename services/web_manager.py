@@ -24,6 +24,7 @@ from astrbot.api.web import (
 from ..models import QuoteRecord
 from ..utils.hashing import normalize_search
 from ..utils.validation import validate_numeric_id
+from .avatar_cache import AvatarCacheService
 from .settings import DEFAULTS, SettingsService
 from .storage import QuoteStorage, StorageError
 
@@ -36,11 +37,13 @@ class WebManager:
         storage: QuoteStorage,
         settings: SettingsService,
         renderer: Any,
+        avatars: AvatarCacheService,
         config: Any,
     ):
         self.storage = storage
         self.settings = settings
         self.renderer = renderer
+        self.avatars = avatars
         self.config = config
         self._pending_imports: dict[str, dict[str, Any]] = {}
 
@@ -58,13 +61,49 @@ class WebManager:
             values = self.settings.for_group(group_id)
             info = await self.storage.info(group_id, values["max_records_per_group"])
             rows.append({"group_id": group_id, **info})
+        avatar_stats = await self.avatars.stats()
         return json_response(
             {
                 "groups": rows,
                 "media_bytes": await self.storage.media_usage_bytes(),
+                "avatar_count": avatar_stats["count"],
+                "avatar_bytes": avatar_stats["bytes"],
                 "storage_root": str(self.storage.root),
             }
         )
+
+    async def avatar_stats(self):
+        """返回头像缓存数量与占用，不触发头像下载。"""
+        if not self._authenticated():
+            return error_response("未登录 Dashboard", status_code=401)
+        return json_response(await self.avatars.stats())
+
+    async def avatar_data(self):
+        """返回后台展示用的本地头像 data URL，不触发网络下载。"""
+        if not self._authenticated():
+            return error_response("未登录 Dashboard", status_code=401)
+        try:
+            user_id = validate_numeric_id(request.query.get("user_id"), "QQ 号")
+            path = await self.avatars.cached_path(user_id)
+            data = await asyncio.to_thread(path.read_bytes)
+            mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            return json_response(
+                {"data_url": f"data:{mime};base64,{base64.b64encode(data).decode()}"}
+            )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+
+    async def cleanup_avatars(self):
+        """清理已无任何记录引用的头像。"""
+        if not self._authenticated():
+            return error_response("未登录 Dashboard", status_code=401)
+        return json_response(await self.avatars.cleanup_unreferenced())
+
+    async def clear_avatars(self):
+        """清空全部可再生头像缓存。"""
+        if not self._authenticated():
+            return error_response("未登录 Dashboard", status_code=401)
+        return json_response(await self.avatars.clear())
 
     async def records(self):
         """分页查询完整记录元数据。"""
@@ -315,6 +354,7 @@ class WebManager:
                 raise TypeError("请求格式无效")
             new_subdir = str(payload.get("storage_subdir") or "").strip()
             new_root, backup_root, old_root = await self.storage.migrate_to(new_subdir)
+            await self.avatars.rebind_storage_root()
             old_value = self.config.get("storage_subdir")
             try:
                 self.config["storage_subdir"] = new_subdir
@@ -326,6 +366,7 @@ class WebManager:
                     new_root,
                     backup_root,
                 )
+                await self.avatars.rebind_storage_root()
                 raise
             return json_response(
                 {"storage_root": str(new_root), "backup_root": str(backup_root)}

@@ -51,6 +51,7 @@ class QuoteStorage:
         self.legacy_root = legacy_root.resolve() if legacy_root else None
         self.groups_dir = self.root / "groups"
         self.images_dir = self.root / "images"
+        self.avatars_dir = self.root / "avatars"
         self.backups_dir = self.root / "backups"
         self.audit_path = self.root / "audit.json"
         self._locks: dict[str, asyncio.Lock] = {}
@@ -84,6 +85,7 @@ class QuoteStorage:
             self.root,
             self.groups_dir,
             self.images_dir,
+            self.avatars_dir,
             self.backups_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -236,7 +238,14 @@ class QuoteStorage:
             if not destination.exists():
                 usage = await self.media_usage_bytes()
                 if usage + len(data) > max_media_bytes:
-                    raise StorageError("全局媒体存储容量已满")
+                    await asyncio.to_thread(
+                        self._prune_avatar_cache_for_space_sync,
+                        len(data),
+                        max_media_bytes,
+                    )
+                    usage = await self.media_usage_bytes()
+                    if usage + len(data) > max_media_bytes:
+                        raise StorageError("全局媒体存储容量已满")
                 await asyncio.to_thread(self._write_bytes_once, destination, data)
         return {
             "type": "image",
@@ -436,14 +445,102 @@ class QuoteStorage:
         }
 
     async def media_usage_bytes(self) -> int:
-        """计算当前有效媒体目录占用。"""
-        return await asyncio.to_thread(
-            lambda: sum(
-                path.stat().st_size
-                for path in self.images_dir.rglob("*")
-                if path.is_file()
-            )
+        """计算群典图片与本地头像缓存的合计占用。"""
+        return await asyncio.to_thread(self._media_usage_bytes_sync)
+
+    def _media_usage_bytes_sync(self) -> int:
+        return sum(
+            path.stat().st_size
+            for directory in (self.images_dir, self.avatars_dir)
+            for path in directory.rglob("*")
+            if path.is_file()
         )
+
+    def _prune_avatar_cache_for_space_sync(self, incoming: int, limit: int) -> None:
+        """为不可再生的群典图片腾出空间，头像按无引用和 LRU 顺序淘汰。"""
+        if self._media_usage_bytes_sync() + incoming <= limit:
+            return
+        index_path = self.avatars_dir / "index.json"
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            if not isinstance(index, dict):
+                index = {}
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            index = {}
+        referenced = self._referenced_author_ids_sync()
+        candidates = sorted(
+            (path for path in self.avatars_dir.glob("*.jpg") if path.is_file()),
+            key=lambda path: (
+                path.stem in referenced,
+                self._avatar_last_used(index.get(path.stem)),
+            ),
+        )
+        changed = False
+        for path in candidates:
+            path.unlink(missing_ok=True)
+            index.pop(path.stem, None)
+            changed = True
+            if self._media_usage_bytes_sync() + incoming <= limit:
+                break
+        if changed:
+            self._atomic_json_write(index_path, index, keep_backup=False)
+
+    def _referenced_author_ids_sync(self) -> set[str]:
+        result: set[str] = set()
+        for path in self.groups_dir.glob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                records = [
+                    QuoteRecord.from_dict(raw) for raw in payload.get("records", [])
+                ]
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ):
+                continue
+            for record in records:
+                if record.author and record.author.user_id:
+                    result.add(record.author.user_id)
+                self._collect_reply_author_ids(record.reply, result)
+                for node in record.nodes:
+                    if node.author.user_id:
+                        result.add(node.author.user_id)
+                    self._collect_reply_author_ids(node.reply, result)
+        return result
+
+    @staticmethod
+    def _avatar_last_used(value: Any) -> float:
+        if not isinstance(value, dict):
+            return 0
+        try:
+            return float(value.get("last_used", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    async def referenced_author_ids(self) -> set[str]:
+        """汇总全部记录及回复快照中仍被引用的 QQ 号。"""
+        result: set[str] = set()
+        for group_id in await self.list_groups():
+            for record in await self.records(group_id):
+                if record.author and record.author.user_id:
+                    result.add(record.author.user_id)
+                self._collect_reply_author_ids(record.reply, result)
+                for node in record.nodes:
+                    if node.author.user_id:
+                        result.add(node.author.user_id)
+                    self._collect_reply_author_ids(node.reply, result)
+        return result
+
+    @classmethod
+    def _collect_reply_author_ids(cls, reply: Any, result: set[str]) -> None:
+        if reply is None:
+            return
+        if reply.author.user_id:
+            result.add(reply.author.user_id)
+        cls._collect_reply_author_ids(reply.reply, result)
 
     async def cleanup_group_orphans(self, group_id: str) -> None:
         """清理一次失败收录可能留下的未引用图片。"""
@@ -825,6 +922,7 @@ class QuoteStorage:
             self.root = new_root
             self.groups_dir = new_root / "groups"
             self.images_dir = new_root / "images"
+            self.avatars_dir = new_root / "avatars"
             self.backups_dir = new_root / "backups"
             self.audit_path = new_root / "audit.json"
             self._broken_groups.clear()
@@ -847,6 +945,7 @@ class QuoteStorage:
             self.root = old_root
             self.groups_dir = old_root / "groups"
             self.images_dir = old_root / "images"
+            self.avatars_dir = old_root / "avatars"
             self.backups_dir = old_root / "backups"
             self.audit_path = old_root / "audit.json"
             self._broken_groups.clear()

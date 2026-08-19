@@ -8,7 +8,7 @@ const state = {
   pageSize: 20,
   total: 0, selected: new Set(), config: null, draft: null,
   dirty: false, activeRecord: null, overrideGroup: "",
-  media: new Map(), lightboxItems: [], lightboxIndex: 0, loading: 0,
+  media: new Map(), avatars: new Map(), lightboxItems: [], lightboxIndex: 0, loading: 0,
 };
 
 const ICONS = {
@@ -126,6 +126,18 @@ function textOf(record) {
 
 function imageSegments(record) { return segmentsOf(record).filter((x) => ["image", "sticker"].includes(x.type) && x.path); }
 
+async function avatarData(userId) {
+  const key = String(userId || "");
+  if (!state.avatars.has(key)) state.avatars.set(key, bridge.apiGet("avatar-data", { user_id: key }).then((result) => result.data_url));
+  return state.avatars.get(key);
+}
+
+function avatarElement(userId) {
+  const image = document.createElement("img"); image.className = "author-avatar"; image.alt = "发送者头像";
+  if (userId) avatarData(userId).then((source) => { image.src = source; }).catch(() => image.classList.add("empty")); else image.classList.add("empty");
+  return image;
+}
+
 const ROLE_OPTIONS = [["bot_admin", "Bot 管理员"], ["owner", "群主"], ["admin", "群管理员"], ["member", "群成员"], ["everyone", "所有人"]];
 const CONFIG_SECTIONS = [
   { id: "trigger-send", title: "触发与发送", description: "设置关键词、发送条数和输出形式。", icon: "quotes", fields: [
@@ -136,6 +148,7 @@ const CONFIG_SECTIONS = [
     { key: "burst_keyword_enabled", label: "启用爆典关键词", type: "boolean", hint: "关闭后仍可使用 /爆典 命令。" },
     { key: "burst_keywords", label: "爆典关键词", type: "list", hint: "每行一个关键词；用法：爆典 @某人 [页码]。" },
     { key: "burst_page_size", label: "爆典每页条数", type: "number", min: 1, max: 100 },
+    { key: "burst_time_mode", label: "爆典时间显示", type: "select", options: [["text", "独立文字节点"], ["native", "原生时间（实验）"], ["none", "不显示"]] },
     { key: "send_count", label: "最大发送条数", type: "number", min: 1, max: 10 },
     { key: "random_send_count", label: "随机发送条数", type: "boolean", hint: "开启后每次从 1 到最大发送条数中随机。" },
     { key: "send_mode", label: "单条发送方式", type: "select", options: [["text", "文字"], ["card", "图片卡片"]] },
@@ -165,6 +178,8 @@ const CONFIG_SECTIONS = [
     { key: "excluded_author_ids", label: "不记录的发送者 ID", type: "list", full: true },
   ]},
   { id: "card", title: "卡片样式", description: "控制图片卡片尺寸与自定义 CSS。", icon: "image", fields: [
+    { key: "localize_avatars", label: "本地化卡片头像", type: "boolean", hint: "仅用于卡片与后台，合并转发头像仍由 QQ 解析。" },
+    { key: "avatar_cache_ttl_days", label: "头像缓存有效天数", type: "number", min: 0, max: 3650, hint: "设为 0 时不自动刷新。" },
     { key: "card_auto_height", label: "自动裁切卡片高度", type: "boolean", hint: "根据内容缩短画布，减少底部留白。" },
     { key: "card_width", label: "卡片宽度（px）", type: "number", min: 480, max: 3000 },
     { key: "card_min_height", label: "最小高度（px）", type: "number", min: 240, max: 3000 },
@@ -181,7 +196,7 @@ const CONFIG_SECTIONS = [
 ];
 
 const ALL_FIELDS = CONFIG_SECTIONS.flatMap((section) => section.fields);
-const OVERRIDE_KEYS = new Set(["add_keyword_enabled", "add_keywords", "query_keyword_enabled", "query_keywords", "burst_keyword_enabled", "burst_keywords", "burst_page_size", "send_count", "random_send_count", "send_mode", "aggregate_multiple", "allow_bot_authors", "max_records_per_group", "add_roles", "query_roles", "burst_roles", "info_roles", "delete_roles", "user_blacklist", "user_whitelist", "excluded_author_ids"]);
+const OVERRIDE_KEYS = new Set(["add_keyword_enabled", "add_keywords", "query_keyword_enabled", "query_keywords", "burst_keyword_enabled", "burst_keywords", "burst_page_size", "burst_time_mode", "send_count", "random_send_count", "send_mode", "aggregate_multiple", "allow_bot_authors", "max_records_per_group", "add_roles", "query_roles", "burst_roles", "info_roles", "delete_roles", "user_blacklist", "user_whitelist", "excluded_author_ids"]);
 const OVERRIDE_FIELDS = ALL_FIELDS.filter((field) => OVERRIDE_KEYS.has(field.key));
 
 function normalizeList(value) { return Array.isArray(value) ? value : []; }
@@ -271,7 +286,7 @@ async function clearOverride() {
 
 function renderStats(data) {
   const total = data.groups.reduce((sum, group) => sum + Number(group.total || 0), 0); const broken = data.groups.reduce((sum, group) => sum + Number(group.broken || 0), 0);
-  const metrics = [["群典总数", total, "quotes"], ["群聊数量", data.groups.length, "groups"], ["异常记录", broken, "alert"], ["媒体占用", formatBytes(data.media_bytes), "image"]];
+  const metrics = [["群典总数", total, "quotes"], ["群聊数量", data.groups.length, "groups"], ["异常记录", broken, "alert"], ["媒体占用", formatBytes(data.media_bytes), "image"], ["头像缓存", `${Number(data.avatar_count || 0)} 个 · ${formatBytes(data.avatar_bytes)}`, "groups"]];
   $("#summary").replaceChildren(...metrics.map(([label, value, iconName]) => { const card = element("article", "metric"); const iconBox = element("span", "metric-icon"); iconBox.append(icon(iconName)); const body = element("div"); body.append(element("span", "metric-label", label), element("strong", "metric-value", String(value))); card.append(iconBox, body); return card; }));
   $("#header-status").textContent = `已连接 · ${data.groups.length} 个群聊 · ${total} 条记录`;
 }
@@ -326,7 +341,7 @@ function rowMenu(record) {
 function renderRecordRow(record) {
   const tr = document.createElement("tr"); tr.dataset.recordId = record.id; tr.addEventListener("click", () => openDrawer(record));
   const check = element("td", "check-cell"); check.append(recordCheckbox(record)); const type = document.createElement("td"); type.append(makeChip(record));
-  const author = authorOf(record); const authorTd = element("td", "author-cell"); authorTd.append(element("strong", "", author.nickname || "未知发送者"), element("small", "", author.user_id || "身份不完整"));
+  const author = authorOf(record); const authorTd = element("td", "author-cell"); const authorText = element("span"); authorText.append(element("strong", "", author.nickname || "未知发送者"), element("small", "", author.user_id || "身份不完整")); authorTd.append(avatarElement(record.type === "message" ? author.user_id : ""), authorText);
   const content = document.createElement("td"); content.append(element("div", "summary-text", textOf(record)));
   const images = element("td", "", String(imageSegments(record).length)); const [date, time] = dateParts(record.recorded_at); const timeTd = element("td", "time-cell"); timeTd.append(document.createTextNode(date), element("small", "", time)); const status = document.createElement("td"); status.append(makeStatus(record)); const menu = element("td", "menu-cell"); menu.append(rowMenu(record));
   tr.append(check, type, authorTd, content, images, timeTd, status, menu); return tr;
@@ -367,7 +382,7 @@ function appendReplyContent(parent, reply, depth = 1) {
 function openDrawer(record) {
   state.activeRecord = record; const author = authorOf(record); $("#drawer-title").textContent = author.nickname || (record.type === "forward" ? "合并转发" : "未知发送者"); const content = $("#drawer-content"); content.replaceChildren();
   const meta = element("div", "detail-meta"); [["群号", record.group_id], ["记录时间", dateParts(record.recorded_at).join(" ")], ["记录 ID", record.id], ["状态", record.broken ? "异常" : "正常"]].forEach(([label, value]) => { const item = element("div"); item.append(element("span", "", label), element("strong", "", String(value || "—"))); meta.append(item); }); content.append(meta);
-  if (record.type === "message") { appendReplyContent(content, record.reply); appendSegmentContent(content, record.segments || []); } else (record.nodes || []).forEach((node, index) => { const nodeBox = element("section", "forward-node"); const heading = element("h3"); heading.append(document.createTextNode(node.author?.nickname || "未知发送者"), element("small", "", node.author?.user_id || `节点 ${index + 1}`)); nodeBox.append(heading); appendReplyContent(nodeBox, node.reply); appendSegmentContent(nodeBox, node.segments || []); content.append(nodeBox); });
+  if (record.type === "message") { const identity = element("div", "drawer-author"); identity.append(avatarElement(author.user_id), element("strong", "", author.nickname || author.user_id || "未知发送者")); content.append(identity); appendReplyContent(content, record.reply); appendSegmentContent(content, record.segments || []); } else (record.nodes || []).forEach((node, index) => { const nodeBox = element("section", "forward-node"); const heading = element("h3"); heading.append(document.createTextNode(node.author?.nickname || "未知发送者"), element("small", "", node.author?.user_id || `节点 ${index + 1}`)); nodeBox.append(heading); appendReplyContent(nodeBox, node.reply); appendSegmentContent(nodeBox, node.segments || []); content.append(nodeBox); });
   $("#drawer-preview").hidden = record.type !== "message" || segmentsOf(record).some((segment) => ["face", "sticker"].includes(segment.type)) || Boolean(record.reply); $("#drawer-backdrop").hidden = false; $("#record-drawer").classList.add("open"); $("#record-drawer").setAttribute("aria-hidden", "false");
 }
 
@@ -429,6 +444,9 @@ async function inspectAndImport() {
 
 async function migrateStorage() { const target = $("#migration-path").value.trim(); if (!target) return notify("请输入目标相对目录。", true); if (!await confirmAction("迁移存储目录", `确定将全部数据迁移到 ${target} 吗？迁移期间请勿操作群典。`)) return; try { const result = await task(() => bridge.apiPost("storage/migrate", { storage_subdir: target })); notify(`迁移完成，旧目录备份位于：${result.backup_root}`); await task(loadConfig); } catch (error) { notify(error.message, true); } }
 
+async function cleanupAvatars() { try { const result = await task(() => bridge.apiPost("avatars/cleanup", {})); state.avatars.clear(); notify(`已清理 ${result.deleted} 个无引用头像，释放 ${formatBytes(result.freed_bytes)}。`); await task(loadStats); } catch (error) { notify(error.message, true); } }
+async function clearAvatars() { if (!await confirmAction("清空头像缓存", "确定清空全部本地头像吗？金句记录和图片不会被删除，头像会在后续使用时重新缓存。")) return; try { const result = await task(() => bridge.apiPost("avatars/clear", {})); state.avatars.clear(); notify(`已清空 ${result.deleted} 个头像，释放 ${formatBytes(result.freed_bytes)}。`); await task(loadStats); } catch (error) { notify(error.message, true); } }
+
 hydrateIcons(); $("#page-size").value = String(state.pageSize);
 $$('.tab').forEach((tab) => tab.addEventListener("click", () => activateTab(tab.dataset.tab)));
 $("#refresh").addEventListener("click", () => task(() => Promise.all([loadStats(), loadConfig()])).then(() => notify("数据已刷新。")).catch((error) => notify(error.message, true)));
@@ -445,6 +463,7 @@ $("#open-group-override").addEventListener("click", openOverrideGroup); $("#over
 $("#apply-json").addEventListener("click", applyAdvancedJson); $("#format-json").addEventListener("click", () => { try { $("#config-editor").value = JSON.stringify(JSON.parse($("#config-editor").value), null, 2); $("#json-error").hidden = true; } catch (error) { $("#json-error").textContent = `JSON 无效：${error.message}`; $("#json-error").hidden = false; } });
 $("#save-config").addEventListener("click", saveConfig); $("#discard-config").addEventListener("click", () => { state.draft = structuredClone(state.config); setDirty(false); renderConfig(); notify("已放弃未保存的配置修改。"); });
 $("#export").addEventListener("click", () => task(() => bridge.download("backup/export", {}, "iconic-quotes-backup.zip")).catch((error) => notify(error.message, true))); $("#import").addEventListener("click", inspectAndImport); $("#migrate").addEventListener("click", migrateStorage);
+$("#cleanup-avatars").addEventListener("click", cleanupAvatars); $("#clear-avatars").addEventListener("click", clearAvatars);
 function updateImportFileLabel() { const file = $("#import-file").files[0]; $("#file-name").textContent = file ? `${file.name} · ${formatBytes(file.size)}` : "最大 1 GB，仅支持 ZIP"; }
 $("#import-file").addEventListener("change", updateImportFileLabel);
 ["dragenter", "dragover"].forEach((name) => $("#drop-zone").addEventListener(name, (event) => { event.preventDefault(); $("#drop-zone").classList.add("dragging"); })); ["dragleave", "drop"].forEach((name) => $("#drop-zone").addEventListener(name, () => $("#drop-zone").classList.remove("dragging")));

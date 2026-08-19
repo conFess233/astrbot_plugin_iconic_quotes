@@ -16,6 +16,7 @@ GROUP_OVERRIDE_KEYS = {
     "burst_keyword_enabled",
     "burst_keywords",
     "burst_page_size",
+    "burst_time_mode",
     "send_count",
     "random_send_count",
     "send_mode",
@@ -42,6 +43,7 @@ DEFAULTS: dict[str, Any] = {
     "burst_keyword_enabled": True,
     "burst_keywords": ["爆典"],
     "burst_page_size": 50,
+    "burst_time_mode": "text",
     "max_reply_depth": 3,
     "max_records_per_group": 5000,
     "max_media_mb": 2048,
@@ -78,6 +80,8 @@ DEFAULTS: dict[str, Any] = {
     "card_max_height": 2000,
     "card_custom_css": "",
     "card_auto_height": True,
+    "localize_avatars": False,
+    "avatar_cache_ttl_days": 7,
 }
 
 
@@ -159,6 +163,7 @@ class SettingsService:
             "card_width": (480, 3000),
             "card_min_height": (240, 3000),
             "card_max_height": (480, 6000),
+            "avatar_cache_ttl_days": (0, 3650),
         }
         for key, (minimum, maximum) in integer_ranges.items():
             try:
@@ -172,6 +177,8 @@ class SettingsService:
             raise ValueError("卡片最小高度不能大于最大高度")
         if result.get("send_mode") not in {"text", "card"}:
             raise ValueError("send_mode 只能是 text 或 card")
+        if result.get("burst_time_mode") not in {"text", "native", "none"}:
+            raise ValueError("burst_time_mode 只能是 text、native 或 none")
         for key in (
             "add_keyword_enabled",
             "query_keyword_enabled",
@@ -181,6 +188,7 @@ class SettingsService:
             "allow_bot_authors",
             "retry_on_ambiguous_failure",
             "card_auto_height",
+            "localize_avatars",
         ):
             if not isinstance(result.get(key), bool):
                 raise TypeError(f"{key} 必须是布尔值")

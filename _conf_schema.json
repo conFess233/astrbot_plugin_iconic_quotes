@@ -45,6 +45,14 @@
     "default": 50,
     "hint": "范围 1 到 100；超过此数量时先提示页数。"
   },
+  "burst_time_mode": {
+    "description": "爆典记录时间显示",
+    "type": "string",
+    "default": "text",
+    "options": ["text", "native", "none"],
+    "labels": ["独立文字节点", "原生时间（实验）", "不显示"],
+    "hint": "原生时间依赖 OneBot 实现，平台忽略时不会显示。"
+  },
   "send_count": {
     "description": "每次发送条数",
     "type": "int",
@@ -246,5 +254,17 @@
     "type": "bool",
     "default": true,
     "hint": "开启后卡片按内容收缩，并安全裁去文转图画布底部留白；关闭后使用配置的最小高度。"
+  },
+  "localize_avatars": {
+    "description": "本地化卡片头像",
+    "type": "bool",
+    "default": false,
+    "hint": "仅用于图片卡片与后台展示，不改变合并转发的原生头像。"
+  },
+  "avatar_cache_ttl_days": {
+    "description": "头像缓存有效天数",
+    "type": "int",
+    "default": 7,
+    "hint": "范围 0 到 3650；设为 0 表示永久有效。"
   }
 }
