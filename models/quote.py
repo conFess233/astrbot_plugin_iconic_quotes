@@ -84,6 +84,9 @@ class ReplySnapshot:
     segments: list[QuoteSegment]
     reply: ReplySnapshot | None = None
     truncated: bool = False
+    source_message_id: str | None = None
+    source_message_seq: str | None = None
+    incomplete: bool = False
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> ReplySnapshot:
@@ -97,6 +100,42 @@ class ReplySnapshot:
             ],
             reply=cls.from_dict(nested) if isinstance(nested, dict) else None,
             truncated=bool(value.get("truncated", False)),
+            source_message_id=(
+                str(value["source_message_id"])
+                if value.get("source_message_id") not in (None, "")
+                else None
+            ),
+            source_message_seq=(
+                str(value["source_message_seq"])
+                if value.get("source_message_seq") not in (None, "", 0, "0")
+                else None
+            ),
+            incomplete=bool(value.get("incomplete", False)),
+        )
+
+
+@dataclass(slots=True)
+class NestedForward:
+    """节点正文中按原位置保存的子合并转发。"""
+
+    position: int
+    nodes: list[ForwardNode]
+    source_forward_id: str | None = None
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> NestedForward:
+        return cls(
+            position=max(0, int(value.get("position", 0))),
+            nodes=[
+                ForwardNode.from_dict(item)
+                for item in value.get("nodes", [])
+                if isinstance(item, dict)
+            ],
+            source_forward_id=(
+                str(value["source_forward_id"])
+                if value.get("source_forward_id") not in (None, "")
+                else None
+            ),
         )
 
 
@@ -108,6 +147,7 @@ class ForwardNode:
     segments: list[QuoteSegment]
     source_sent_at: str | None = None
     reply: ReplySnapshot | None = None
+    nested_forwards: list[NestedForward] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> ForwardNode:
@@ -124,6 +164,11 @@ class ForwardNode:
                 if isinstance(value.get("reply"), dict)
                 else None
             ),
+            nested_forwards=[
+                NestedForward.from_dict(item)
+                for item in value.get("nested_forwards", [])
+                if isinstance(item, dict)
+            ],
         )
 
 
@@ -144,6 +189,7 @@ class QuoteRecord:
     recorded_by: AuthorSnapshot = field(default_factory=AuthorSnapshot)
     identity_incomplete: bool = False
     reply: ReplySnapshot | None = None
+    source_forward_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """转换为可直接写入 JSON 的字典。"""
@@ -185,6 +231,11 @@ class QuoteRecord:
                 if isinstance(value.get("reply"), dict)
                 else None
             ),
+            source_forward_id=(
+                str(value["source_forward_id"])
+                if value.get("source_forward_id") not in (None, "")
+                else None
+            ),
         )
 
     def image_segments(self) -> list[QuoteSegment]:
@@ -194,12 +245,18 @@ class QuoteRecord:
         ]
         result.extend(self._reply_media(self.reply))
         for node in self.nodes:
-            result.extend(
-                segment
-                for segment in node.segments
-                if segment.type in {"image", "sticker"}
-            )
-            result.extend(self._reply_media(node.reply))
+            result.extend(self._node_media(node))
+        return result
+
+    @classmethod
+    def _node_media(cls, node: ForwardNode) -> list[QuoteSegment]:
+        result = [
+            segment for segment in node.segments if segment.type in {"image", "sticker"}
+        ]
+        result.extend(cls._reply_media(node.reply))
+        for nested in node.nested_forwards:
+            for child in nested.nodes:
+                result.extend(cls._node_media(child))
         return result
 
     @classmethod
@@ -219,13 +276,67 @@ class QuoteRecord:
         ]
         parts.extend(self._reply_text(self.reply))
         for node in self.nodes:
-            parts.extend(
-                segment.text or ""
-                for segment in node.segments
-                if segment.type == "text"
-            )
-            parts.extend(self._reply_text(node.reply))
+            parts.extend(self._node_text(node))
         return "\n".join(part for part in parts if part)
+
+    def authored_text(self, user_id: str) -> str:
+        """返回指定 QQ 用户本人在记录中发送的全部文字。"""
+        parts: list[str] = []
+        if self.type == "message":
+            if not self.author or self.author.user_id != user_id:
+                return ""
+            parts.extend(self._segment_text(self.segments))
+            self._collect_authored_reply_text(self.reply, user_id, parts)
+        else:
+            for node in self.nodes:
+                self._collect_authored_node_text(node, user_id, parts)
+        return "\n".join(part for part in parts if part)
+
+    @staticmethod
+    def _segment_text(segments: list[QuoteSegment]) -> list[str]:
+        return [
+            segment.text or ""
+            for segment in segments
+            if segment.type == "text" and segment.text
+        ]
+
+    @classmethod
+    def _collect_authored_reply_text(
+        cls,
+        reply: ReplySnapshot | None,
+        user_id: str,
+        parts: list[str],
+    ) -> None:
+        if reply is None:
+            return
+        if reply.author.user_id == user_id:
+            parts.extend(cls._segment_text(reply.segments))
+        cls._collect_authored_reply_text(reply.reply, user_id, parts)
+
+    @classmethod
+    def _collect_authored_node_text(
+        cls,
+        node: ForwardNode,
+        user_id: str,
+        parts: list[str],
+    ) -> None:
+        if node.author.user_id == user_id:
+            parts.extend(cls._segment_text(node.segments))
+        cls._collect_authored_reply_text(node.reply, user_id, parts)
+        for nested in node.nested_forwards:
+            for child in nested.nodes:
+                cls._collect_authored_node_text(child, user_id, parts)
+
+    @classmethod
+    def _node_text(cls, node: ForwardNode) -> list[str]:
+        result = [
+            segment.text or "" for segment in node.segments if segment.type == "text"
+        ]
+        result.extend(cls._reply_text(node.reply))
+        for nested in node.nested_forwards:
+            for child in nested.nodes:
+                result.extend(cls._node_text(child))
+        return result
 
     @classmethod
     def _reply_text(cls, reply: ReplySnapshot | None) -> list[str]:
@@ -240,19 +351,52 @@ class QuoteRecord:
         return (
             any(segment.type in {"face", "sticker"} for segment in self._all_segments())
             or self.reply is not None
-            or any(node.reply is not None for node in self.nodes)
+            or any(self._node_has_reply(node) for node in self.nodes)
+        )
+
+    @classmethod
+    def _node_has_reply(cls, node: ForwardNode) -> bool:
+        return node.reply is not None or any(
+            cls._node_has_reply(child)
+            for nested in node.nested_forwards
+            for child in nested.nodes
         )
 
     def has_stickers(self) -> bool:
         """判断正文或回复快照中是否包含商城表情。"""
         return any(segment.type == "sticker" for segment in self._all_segments())
 
+    def has_replies(self) -> bool:
+        """判断正文或任意递归转发节点是否包含回复快照。"""
+        return self.reply is not None or any(
+            self._node_has_reply(node) for node in self.nodes
+        )
+
+    def has_nested_forwards(self) -> bool:
+        """判断记录是否包含任意层级的子合并转发。"""
+        return any(self._node_has_nested(node) for node in self.nodes)
+
+    @classmethod
+    def _node_has_nested(cls, node: ForwardNode) -> bool:
+        return bool(node.nested_forwards) or any(
+            cls._node_has_nested(child)
+            for nested in node.nested_forwards
+            for child in nested.nodes
+        )
+
     def _all_segments(self) -> list[QuoteSegment]:
         result = list(self.segments)
         result.extend(self._reply_segments(self.reply))
         for node in self.nodes:
-            result.extend(node.segments)
-            result.extend(self._reply_segments(node.reply))
+            result.extend(self._node_segments(node))
+        return result
+
+    @classmethod
+    def _node_segments(cls, node: ForwardNode) -> list[QuoteSegment]:
+        result = list(node.segments) + cls._reply_segments(node.reply)
+        for nested in node.nested_forwards:
+            for child in nested.nodes:
+                result.extend(cls._node_segments(child))
         return result
 
     @classmethod
@@ -265,13 +409,33 @@ class QuoteRecord:
         """判断用户是否是普通消息作者或聊天记录中的任一节点作者。"""
         if self.type == "message":
             return bool(self.author and self.author.user_id == user_id)
-        return any(node.author.user_id == user_id for node in self.nodes)
+        return any(self._node_involves_user(node, user_id) for node in self.nodes)
+
+    @classmethod
+    def _node_involves_user(cls, node: ForwardNode, user_id: str) -> bool:
+        return node.author.user_id == user_id or any(
+            cls._node_involves_user(child, user_id)
+            for nested in node.nested_forwards
+            for child in nested.nodes
+        )
 
     def personal_owner_id(self) -> str | None:
         """返回可安全归入个人随机池的 QQ 号。"""
         if self.type == "message":
             return self.author.user_id if self.author else None
-        ids = {node.author.user_id for node in self.nodes}
+        ids = {
+            author_id
+            for node in self.nodes
+            for author_id in self._node_author_ids(node)
+        }
         if len(ids) == 1 and None not in ids:
             return next(iter(ids))
         return None
+
+    @classmethod
+    def _node_author_ids(cls, node: ForwardNode) -> list[str | None]:
+        result = [node.author.user_id]
+        for nested in node.nested_forwards:
+            for child in nested.nodes:
+                result.extend(cls._node_author_ids(child))
+        return result

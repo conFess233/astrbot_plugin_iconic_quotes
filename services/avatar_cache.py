@@ -106,7 +106,7 @@ class AvatarCacheService:
                 return
             await self._download_and_store(normalized, settings)
         except Exception:  # noqa: BLE001 - 头像失败不能改变已经完成的金句收录。
-            logger.exception("新金句头像预缓存失败: user=%s", user_id)
+            logger.warning("群典：头像预缓存失败")
 
     async def blank_data_url(self) -> str:
         data = await asyncio.to_thread(self.blank_avatar_path.read_bytes)
@@ -186,7 +186,7 @@ class AvatarCacheService:
                     int(settings["max_media_mb"]) * 1024 * 1024,
                     protect=user_id,
                 ):
-                    logger.warning("头像缓存空间不足，已使用空白头像: user=%s", user_id)
+                    logger.warning("群典：头像缓存空间不足，已使用空白头像")
                     return None
                 await asyncio.to_thread(self._atomic_write, path, data)
             now = time.time()
@@ -211,9 +211,7 @@ class AvatarCacheService:
                 int(settings["max_media_mb"]) * 1024 * 1024,
                 protect=user_id,
             ):
-                logger.warning(
-                    "头像缓存刷新空间不足，已继续使用旧头像: user=%s", user_id
-                )
+                logger.warning("群典：头像缓存刷新空间不足，已继续使用旧头像")
                 return
             await asyncio.to_thread(self._atomic_write, path, data)
             now = time.time()
@@ -230,7 +228,7 @@ class AvatarCacheService:
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - 后台刷新不能泄漏未处理任务异常。
-            logger.exception("后台刷新 QQ 头像失败: user=%s", user_id)
+            logger.warning("群典：后台刷新 QQ 头像失败")
 
     async def _download(self, user_id: str, settings: dict[str, Any]) -> bytes | None:
         if self.http is None or self.http.closed:
@@ -255,9 +253,9 @@ class AvatarCacheService:
                 OSError,
                 UnidentifiedImageError,
                 ValueError,
-            ) as exc:
+            ):
                 if attempt + 1 >= attempts:
-                    logger.warning("QQ 头像获取失败: user=%s error=%s", user_id, exc)
+                    logger.warning("群典：QQ 头像获取失败，已使用空白头像")
                     return None
                 await asyncio.sleep(delay)
         return None

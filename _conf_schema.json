@@ -27,6 +27,12 @@
     "default": ["群典"],
     "hint": "去除首尾空白后完整匹配。"
   },
+  "max_query_keyword_chars": {
+    "description": "群典查询关键词长度上限",
+    "type": "int",
+    "default": 100,
+    "hint": "范围 1 到 1000；支持群级覆盖。"
+  },
   "burst_keyword_enabled": {
     "description": "启用爆典关键词",
     "type": "bool",
@@ -123,6 +129,12 @@
     "type": "int",
     "default": 3,
     "hint": "范围 1 到 10；超过深度会安全标记为已截断。"
+  },
+  "max_nested_forward_depth": {
+    "description": "嵌套合并转发最大深度",
+    "type": "int",
+    "default": 3,
+    "hint": "范围 1 到 10；根合并转发计为第 1 层，超限时整条添加失败。"
   },
   "add_roles": {
     "description": "添加权限",

@@ -10,10 +10,27 @@ from typing import Any
 
 import astrbot.api.message_components as Comp
 
-from ..models import QuoteRecord, QuoteSegment, ReplySnapshot
+from ..models import (
+    ForwardNode,
+    NestedForward,
+    QuoteRecord,
+    QuoteSegment,
+    ReplySnapshot,
+)
 from ..utils.image_processing import trim_card_canvas
 from .avatar_cache import AvatarCacheService
-from .storage import QuoteStorage
+from .storage import QuoteStorage, StorageError
+
+
+class _OneBotReply(Comp.Reply):
+    """为 NapCat 保留原生消息序号，同时兼容标准 OneBot 的消息 ID。"""
+
+    def toDict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"id": str(self.id)}
+        if self.seq not in (None, 0, "0", ""):
+            data["seq"] = str(self.seq)
+        return {"type": "reply", "data": data}
+
 
 CARD_TEMPLATE = """
 <!doctype html>
@@ -110,6 +127,7 @@ class QuoteRenderer:
         record: QuoteRecord,
         *,
         native_stickers: bool = True,
+        native_replies: bool = True,
     ) -> list[Any]:
         """构造保留原图顺序的文字发送链。"""
         if record.type != "message" or record.author is None:
@@ -118,6 +136,7 @@ class QuoteRenderer:
         chain = self._reply_to_components(
             record.reply,
             native_stickers=native_stickers,
+            native_replies=native_replies,
         )
         if record.segments and all(
             segment.type == "text" for segment in record.segments
@@ -209,6 +228,8 @@ class QuoteRenderer:
         *,
         replay: bool = False,
         native_stickers: bool = True,
+        native_replies: bool = True,
+        native_nested: bool = True,
     ) -> list[Any]:
         """构造新聚合转发或原生转发回放节点。"""
         nodes: list[Any] = []
@@ -218,27 +239,28 @@ class QuoteRenderer:
             )
         for record in records:
             if record.type == "forward":
-                for node in record.nodes:
-                    nodes.append(
-                        Comp.Node(
-                            uin=node.author.user_id or "0",
-                            name=node.author.nickname or "未知用户",
-                            content=self._reply_to_components(
-                                node.reply,
-                                native_stickers=native_stickers,
-                            )
-                            + self._segments_to_components(
-                                node.segments,
-                                native_stickers=native_stickers,
-                            ),
-                        )
+                nodes.extend(
+                    self._forward_level_nodes(
+                        record.nodes,
+                        native_stickers=native_stickers,
+                        native_replies=native_replies,
+                        native_nested=native_nested,
                     )
+                )
                 continue
             assert record.author is not None
             nickname = record.author.nickname or record.author.user_id or "未知用户"
+            if record.reply and not native_replies:
+                nodes.extend(
+                    self._reply_fallback_nodes(
+                        record.reply,
+                        native_stickers=native_stickers,
+                    )
+                )
             content = self._reply_to_components(
                 record.reply,
                 native_stickers=native_stickers,
+                native_replies=native_replies,
             )
             content.extend(
                 self._segments_to_components(
@@ -266,6 +288,7 @@ class QuoteRenderer:
         skipped: int,
         nested: bool,
         native_stickers: bool,
+        native_replies: bool,
         time_mode: str,
     ) -> list[Any]:
         """构造按时间排列的个人完整群典合集。"""
@@ -274,7 +297,12 @@ class QuoteRenderer:
             f"共 {total} 条｜第 {page} / {pages} 页" if pages > 1 else f"共 {total} 条"
         )
         if skipped:
-            title += f"\n另有 {skipped} 条记录因资源不完整已跳过"
+            title += f"\n另有 {skipped} 条记录完全损坏，无法展示"
+        missing_media = sum(
+            self.storage.missing_media_count(record) for record in records
+        )
+        if missing_media:
+            title += f"\n本页有 {missing_media} 处媒体资源缺失"
         result: list[Any] = [
             Comp.Node(uin="0", name="群典", content=[Comp.Plain(title)])
         ]
@@ -292,10 +320,18 @@ class QuoteRenderer:
             if record.type == "message":
                 assert record.author is not None
                 content: list[Any] = []
+                if record.reply and not native_replies:
+                    result.extend(
+                        self._reply_fallback_nodes(
+                            record.reply,
+                            native_stickers=native_stickers,
+                        )
+                    )
                 content.extend(
                     self._reply_to_components(
                         record.reply,
                         native_stickers=native_stickers,
+                        native_replies=native_replies,
                     )
                 )
                 content.extend(
@@ -316,32 +352,25 @@ class QuoteRenderer:
                     )
                 )
                 continue
-            inner = [
-                Comp.Node(
-                    uin=node.author.user_id or "0",
-                    name=node.author.nickname or node.author.user_id or "未知用户",
-                    content=self._reply_to_components(
-                        node.reply,
-                        native_stickers=native_stickers,
-                    )
-                    + self._segments_to_components(
-                        node.segments,
-                        native_stickers=native_stickers,
-                    ),
-                )
-                for node in record.nodes
-            ]
             if nested:
+                if not record.source_forward_id:
+                    raise ValueError("存档没有可用的原始合并转发 res_id")
                 result.append(
                     self._burst_node(
                         uin="0",
                         name="聊天记录存档",
-                        content=inner,
+                        content=[Comp.Forward(id=record.source_forward_id)],
                         native_time=native_time,
                         time_mode=time_mode,
                     )
                 )
             else:
+                inner = self._forward_level_nodes(
+                    record.nodes,
+                    native_stickers=native_stickers,
+                    native_replies=native_replies,
+                    native_nested=False,
+                )
                 result.append(
                     self._burst_node(
                         uin="0",
@@ -353,6 +382,144 @@ class QuoteRenderer:
                 )
                 result.extend(inner)
         return result
+
+    def _forward_level_nodes(
+        self,
+        nodes: list[ForwardNode],
+        *,
+        native_stickers: bool,
+        native_replies: bool,
+        native_nested: bool,
+    ) -> list[Any]:
+        result: list[Any] = []
+        for node in nodes:
+            if node.reply and not native_replies:
+                result.extend(
+                    self._reply_fallback_nodes(
+                        node.reply,
+                        native_stickers=native_stickers,
+                    )
+                )
+            if native_nested:
+                content = self._reply_to_components(
+                    node.reply,
+                    native_stickers=native_stickers,
+                    native_replies=native_replies,
+                )
+                content.extend(
+                    self._interleaved_node_content(
+                        node,
+                        native_stickers=native_stickers,
+                    )
+                )
+                result.append(self._author_node(node, content))
+                continue
+            result.extend(
+                self._flatten_node(
+                    node,
+                    native_stickers=native_stickers,
+                    native_replies=native_replies,
+                )
+            )
+        return result
+
+    def _interleaved_node_content(
+        self,
+        node: ForwardNode,
+        *,
+        native_stickers: bool,
+    ) -> list[Any]:
+        by_position: dict[int, list[NestedForward]] = {}
+        for nested in node.nested_forwards:
+            if not nested.source_forward_id:
+                raise ValueError("本地嵌套转发没有可用的原始 res_id")
+            by_position.setdefault(nested.position, []).append(nested)
+        result: list[Any] = []
+        for index in range(len(node.segments) + 1):
+            result.extend(
+                Comp.Forward(id=nested.source_forward_id or "")
+                for nested in by_position.get(index, [])
+            )
+            if index < len(node.segments):
+                result.extend(
+                    self._segments_to_components(
+                        [node.segments[index]],
+                        native_stickers=native_stickers,
+                    )
+                )
+        return result
+
+    def _flatten_node(
+        self,
+        node: ForwardNode,
+        *,
+        native_stickers: bool,
+        native_replies: bool,
+    ) -> list[Any]:
+        result: list[Any] = []
+        by_position: dict[int, list[NestedForward]] = {}
+        for nested in node.nested_forwards:
+            by_position.setdefault(nested.position, []).append(nested)
+        chunk: list[QuoteSegment] = []
+        first_chunk = True
+
+        def flush() -> None:
+            nonlocal first_chunk
+            content: list[Any] = []
+            if first_chunk:
+                content.extend(
+                    self._reply_to_components(
+                        node.reply,
+                        native_stickers=native_stickers,
+                        native_replies=native_replies,
+                    )
+                )
+            content.extend(
+                self._segments_to_components(chunk, native_stickers=native_stickers)
+            )
+            if content:
+                result.append(self._author_node(node, content))
+                first_chunk = False
+            chunk.clear()
+
+        for index in range(len(node.segments) + 1):
+            if by_position.get(index):
+                flush()
+            for nested in by_position.get(index, []):
+                result.append(
+                    Comp.Node(
+                        uin="0",
+                        name="嵌套聊天记录",
+                        content=[Comp.Plain("嵌套聊天记录开始")],
+                    )
+                )
+                result.extend(
+                    self._forward_level_nodes(
+                        nested.nodes,
+                        native_stickers=native_stickers,
+                        native_replies=native_replies,
+                        native_nested=False,
+                    )
+                )
+                result.append(
+                    Comp.Node(
+                        uin="0",
+                        name="嵌套聊天记录",
+                        content=[Comp.Plain("嵌套聊天记录结束")],
+                    )
+                )
+            if index < len(node.segments):
+                chunk.append(node.segments[index])
+        flush()
+        return result
+
+    @staticmethod
+    def _author_node(node: ForwardNode, content: list[Any]) -> Any:
+        return Comp.Node(
+            uin=node.author.user_id or "0",
+            name=node.author.nickname or node.author.user_id or "未知用户",
+            content=content,
+        )
 
     @staticmethod
     def _burst_node(
@@ -390,6 +557,14 @@ class QuoteRenderer:
             if segment.type == "text" and segment.text:
                 result.append(Comp.Plain(segment.text))
             elif segment.type in {"image", "sticker"} and segment.path:
+                try:
+                    media_path = self.storage.resolve_media_path(segment.path)
+                    if not self.storage.media_segment_valid(segment):
+                        raise StorageError("媒体哈希不匹配")
+                except (OSError, StorageError):
+                    label = "表情" if segment.type == "sticker" else "图片"
+                    result.append(Comp.Plain(f"[{label}资源缺失]"))
+                    continue
                 if (
                     segment.type == "sticker"
                     and native_stickers
@@ -406,11 +581,10 @@ class QuoteRenderer:
                         )
                     )
                     continue
-                result.append(
-                    Comp.Image.fromFileSystem(
-                        self.storage.resolve_media_path(segment.path)
-                    )
-                )
+                result.append(Comp.Image.fromFileSystem(media_path))
+            elif segment.type in {"image", "sticker"}:
+                label = "表情" if segment.type == "sticker" else "图片"
+                result.append(Comp.Plain(f"[{label}资源缺失]"))
             elif segment.type == "face" and segment.face_id:
                 result.append(Comp.Face(id=int(segment.face_id)))
         return result
@@ -420,28 +594,51 @@ class QuoteRenderer:
         reply: ReplySnapshot | None,
         *,
         native_stickers: bool,
+        native_replies: bool,
     ) -> list[Any]:
         if reply is None:
             return []
-        name = reply.author.nickname or reply.author.user_id or "未知用户"
-        result: list[Any] = [Comp.Plain(f"↩ 回复 {name}\n┌ ")]
-        result.extend(
-            self._segments_to_components(
-                reply.segments,
-                native_stickers=native_stickers,
+        if not native_replies:
+            return []
+        if not reply.source_message_id:
+            raise ValueError("回复快照缺少原始消息 ID")
+        return [
+            _OneBotReply(
+                id=reply.source_message_id,
+                seq=reply.source_message_seq or 0,
             )
-        )
+        ]
+
+    def _reply_fallback_nodes(
+        self,
+        reply: ReplySnapshot,
+        *,
+        native_stickers: bool,
+    ) -> list[Any]:
+        result: list[Any] = []
         if reply.reply:
-            result.append(Comp.Plain("\n"))
             result.extend(
-                self._reply_to_components(
+                self._reply_fallback_nodes(
                     reply.reply,
                     native_stickers=native_stickers,
                 )
             )
+        content = self._segments_to_components(
+            reply.segments,
+            native_stickers=native_stickers,
+        )
         if reply.truncated:
-            result.append(Comp.Plain("\n更早的回复已省略"))
-        result.append(Comp.Plain("\n└\n"))
+            content.append(Comp.Plain("更早的回复已省略"))
+        if reply.incomplete:
+            content.append(Comp.Plain("[回复内容来自消息内嵌快照]"))
+        if content:
+            result.append(
+                Comp.Node(
+                    uin=reply.author.user_id or "0",
+                    name=reply.author.nickname or reply.author.user_id or "未知用户",
+                    content=content,
+                )
+            )
         return result
 
     @staticmethod

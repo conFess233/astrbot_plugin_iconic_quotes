@@ -190,6 +190,53 @@ class WebManager:
         except (TypeError, ValueError, StorageError) as exc:
             return error_response(str(exc))
 
+    async def delete_forward_node(self):
+        """从后台删除合并转发中的一个完整聊天节点。"""
+        if not self._authenticated():
+            return error_response("未登录 Dashboard", status_code=401)
+        payload = await request.json(default={})
+        try:
+            if not isinstance(payload, dict):
+                raise TypeError("请求格式无效")
+            group_id = validate_numeric_id(payload.get("group_id"), "群号")
+            record_id = str(payload.get("record_id") or "").strip()
+            expected_hash = str(payload.get("content_hash") or "").strip()
+            node_path = payload.get("node_path")
+            if not record_id or not expected_hash:
+                raise ValueError("记录 ID 或内容哈希缺失")
+            if (
+                not isinstance(node_path, list)
+                or not node_path
+                or len(node_path) > 21
+                or len(node_path) % 2 == 0
+                or any(
+                    not isinstance(index, int) or isinstance(index, bool) or index < 0
+                    for index in node_path
+                )
+            ):
+                raise ValueError("节点路径无效")
+            record, removed_nodes = await self.storage.delete_forward_node(
+                group_id,
+                record_id,
+                expected_hash,
+                node_path,
+                deleted_by=f"dashboard:{request.username}",
+                audit_limit=self.settings.global_settings()["audit_limit"],
+            )
+            item = None
+            if record is not None:
+                item = record.to_dict()
+                item["broken"] = not await self.storage.record_is_healthy(record)
+            return json_response(
+                {
+                    "record_deleted": record is None,
+                    "removed_nodes": removed_nodes,
+                    "record": item,
+                }
+            )
+        except (TypeError, ValueError, StorageError) as exc:
+            return error_response(str(exc))
+
     async def audit(self):
         """返回最近删除审计。"""
         if not self._authenticated():

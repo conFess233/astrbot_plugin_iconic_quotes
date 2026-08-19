@@ -44,6 +44,22 @@ def validate_numeric_id(value: object, label: str = "ID") -> str:
     return text
 
 
+def match_command_syntax(
+    plain_text: str,
+    keywords: list[str],
+) -> tuple[bool, str | None]:
+    """完整匹配可选斜杠的关键词，并返回清理空白后的参数尾部。"""
+    for keyword in sorted(keywords, key=len, reverse=True):
+        match = re.fullmatch(
+            rf"/?{re.escape(keyword)}(?:\s+(.+))?",
+            plain_text.strip(),
+        )
+        if match:
+            tail = (match.group(1) or "").strip()
+            return True, tail or None
+    return False, None
+
+
 def sanitize_custom_css(value: str) -> str:
     """拒绝可能加载外部资源或破坏页面边界的 CSS。"""
     if len(value) > 100_000:

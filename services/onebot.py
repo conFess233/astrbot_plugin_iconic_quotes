@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import html
+import re
 import time
 import uuid
 from collections.abc import Iterable
@@ -17,6 +19,7 @@ from astrbot.api import logger
 from ..models import (
     AuthorSnapshot,
     ForwardNode,
+    NestedForward,
     QuoteRecord,
     QuoteSegment,
     ReplySnapshot,
@@ -33,6 +36,7 @@ class CaptureError(RuntimeError):
 @dataclass(slots=True)
 class _RawReply:
     message_id: str
+    message_seq: str | None = None
 
 
 @dataclass(slots=True)
@@ -89,13 +93,42 @@ def _raw_component(value: dict[str, Any]) -> Any:
         except (TypeError, ValueError):
             return None
     if component_type == "reply":
-        return _RawReply(str(data.get("id") or data.get("message_id") or ""))
+        return _RawReply(
+            str(data.get("id") or data.get("message_id") or ""),
+            str(data.get("seq") or data.get("message_seq") or "") or None,
+        )
     if component_type == "forward":
-        return Comp.Forward(id=str(data.get("id") or ""))
+        return Comp.Forward(
+            id=str(data.get("res_id") or data.get("resid") or data.get("id") or "")
+        )
     if component_type == "node":
         # 用 Forward 哨兵交给统一的嵌套来源检查，不能静默忽略 Node。
         return Comp.Forward(id="__nested_node__")
     return None
+
+
+_CQ_PATTERN = re.compile(r"\[CQ:([a-zA-Z0-9_]+)((?:,[^\]]*)?)\]")
+
+
+def _cq_components(value: str) -> list[Any]:
+    """解析 OneBot 可能返回的 CQ 字符串，未知段保留为普通文字。"""
+    result: list[Any] = []
+    cursor = 0
+    for match in _CQ_PATTERN.finditer(value):
+        if match.start() > cursor:
+            result.append(Comp.Plain(html.unescape(value[cursor : match.start()])))
+        data: dict[str, str] = {}
+        raw_params = match.group(2).lstrip(",")
+        for item in raw_params.split(",") if raw_params else []:
+            key, separator, raw_value = item.partition("=")
+            if separator:
+                data[key] = html.unescape(raw_value)
+        component = _raw_component({"type": match.group(1), "data": data})
+        result.append(component or Comp.Plain(html.unescape(match.group(0))))
+        cursor = match.end()
+    if cursor < len(value):
+        result.append(Comp.Plain(html.unescape(value[cursor:])))
+    return result
 
 
 class OneBotQuoteExtractor:
@@ -104,7 +137,9 @@ class OneBotQuoteExtractor:
     def __init__(self, storage: QuoteStorage):
         self.storage = storage
         self.last_ignored_segments = 0
-        self._bot_cache: dict[tuple[str, str], tuple[float, bool | None]] = {}
+        self._member_cache: dict[
+            tuple[str, str], tuple[float, str | None, bool | None]
+        ] = {}
 
     async def extract(
         self,
@@ -164,9 +199,14 @@ class OneBotQuoteExtractor:
         source_id = str(getattr(reply, "id", "") or "") or None
         if source_id:
             try:
-                payload = await self._get_message(event, source_id)
+                payload = await self._get_message(
+                    event,
+                    source_id,
+                    group_id=group_id,
+                    message_seq=str(getattr(reply, "seq", "") or "") or None,
+                )
                 payload_chain = self._payload_components(payload)
-                if payload_chain:
+                if not chain and payload_chain:
                     chain = payload_chain
                 sender = (
                     payload.get("sender")
@@ -181,6 +221,7 @@ class OneBotQuoteExtractor:
             except CaptureError:
                 if not chain:
                     raise
+        author = await self._resolve_author(event, group_id, author)
         nested_sources = [
             item
             for item in chain
@@ -246,54 +287,16 @@ class OneBotQuoteExtractor:
         settings: dict[str, Any],
         source_message_id: str | None = None,
     ) -> QuoteRecord:
-        if isinstance(component, Comp.Forward):
-            forward_id = str(getattr(component, "id", "") or "")
-            if not forward_id:
-                raise CaptureError("合并转发缺少可读取的消息 ID")
-            payload = await self._get_forward_message(event, forward_id)
-            raw_nodes = self._forward_payload_nodes(payload)
-        elif isinstance(component, Comp.Nodes):
-            raw_nodes = list(component.nodes)
-        else:
-            raw_nodes = [component]
-        if not raw_nodes:
-            raise CaptureError("合并转发内容为空或已过期")
-        if len(raw_nodes) > settings["max_forward_nodes"]:
-            raise CaptureError("合并转发节点数超过配置上限")
-        nodes: list[ForwardNode] = []
+        raw_nodes, forward_id = await self._load_forward_source(event, component)
         image_counter = [0]
-        total_text = 0
-        for raw_node in raw_nodes:
-            author, chain, sent_at = self._parse_forward_node(raw_node)
-            await self._check_author_allowed(event, group_id, author, settings)
-            reply_snapshot = await self._capture_reply_from_chain(
-                event,
-                chain,
-                group_id,
-                settings,
-                image_counter,
-                visited=set(),
-            )
-            segments, ignored = await self._segments(
-                chain,
-                group_id,
-                settings,
-                image_counter,
-                nested_forbidden=True,
-            )
-            self.last_ignored_segments += ignored
-            if not segments and reply_snapshot is None:
-                raise CaptureError("合并转发包含无法保存的空节点")
-            node_text = self._validate_text_limits(segments, settings["max_text_chars"])
-            total_text += node_text + self._reply_text_length(reply_snapshot)
-            nodes.append(
-                ForwardNode(
-                    author=author,
-                    segments=segments,
-                    source_sent_at=sent_at,
-                    reply=reply_snapshot,
-                )
-            )
+        nodes, total_text = await self._capture_forward_nodes(
+            event,
+            raw_nodes,
+            group_id,
+            settings,
+            image_counter,
+            depth=1,
+        )
         if total_text > settings["max_forward_text_chars"]:
             raise CaptureError("合并转发累计文字长度超过配置上限")
         return QuoteRecord(
@@ -305,10 +308,151 @@ class OneBotQuoteExtractor:
             source_message_id=source_message_id,
             recorded_at=datetime.now(UTC).isoformat(),
             recorded_by=operator,
-            identity_incomplete=any(node.author.user_id is None for node in nodes),
+            identity_incomplete=any(
+                author_id is None
+                for node in nodes
+                for author_id in QuoteRecord._node_author_ids(node)
+            ),
+            source_forward_id=forward_id,
         )
 
-    async def _get_message(self, event: Any, message_id: str) -> dict[str, Any]:
+    async def _load_forward_source(
+        self,
+        event: Any,
+        component: Any,
+    ) -> tuple[list[Any], str | None]:
+        if isinstance(component, Comp.Forward):
+            forward_id = str(getattr(component, "id", "") or "")
+            if not forward_id or forward_id == "__nested_node__":
+                raise CaptureError("合并转发缺少可读取的消息 ID")
+            payload = await self._get_forward_message(event, forward_id)
+            raw_nodes = self._forward_payload_nodes(payload)
+        elif isinstance(component, Comp.Nodes):
+            raw_nodes = list(component.nodes)
+            forward_id = None
+        elif isinstance(component, Comp.Node):
+            raw_nodes = [component]
+            forward_id = None
+        else:
+            raise CaptureError("合并转发来源格式无效")
+        if not raw_nodes:
+            raise CaptureError("合并转发内容为空或已过期")
+        return raw_nodes, forward_id
+
+    async def _capture_forward_nodes(
+        self,
+        event: Any,
+        raw_nodes: list[Any],
+        group_id: str,
+        settings: dict[str, Any],
+        image_counter: list[int],
+        *,
+        depth: int,
+    ) -> tuple[list[ForwardNode], int]:
+        if len(raw_nodes) > settings["max_forward_nodes"]:
+            raise CaptureError("合并转发节点数超过配置上限")
+        nodes: list[ForwardNode] = []
+        total_text = 0
+        for raw_node in raw_nodes:
+            author, chain, sent_at = self._parse_forward_node(raw_node)
+            author = await self._resolve_author(event, group_id, author)
+            await self._check_author_allowed(event, group_id, author, settings)
+            reply_snapshot = await self._capture_reply_from_chain(
+                event,
+                chain,
+                group_id,
+                settings,
+                image_counter,
+                visited=set(),
+            )
+            segments: list[QuoteSegment] = []
+            nested_forwards: list[NestedForward] = []
+            ordinary_chunk: list[Any] = []
+
+            for component in chain:
+                if not isinstance(component, (Comp.Forward, Comp.Node, Comp.Nodes)):
+                    ordinary_chunk.append(component)
+                    continue
+                await self._append_segment_chunk(
+                    ordinary_chunk,
+                    segments,
+                    group_id,
+                    settings,
+                    image_counter,
+                )
+                if depth >= settings["max_nested_forward_depth"]:
+                    raise CaptureError(
+                        "嵌套合并转发深度超过配置上限 "
+                        f"{settings['max_nested_forward_depth']}"
+                    )
+                child_raw, child_id = await self._load_forward_source(event, component)
+                child_nodes, child_text = await self._capture_forward_nodes(
+                    event,
+                    child_raw,
+                    group_id,
+                    settings,
+                    image_counter,
+                    depth=depth + 1,
+                )
+                nested_forwards.append(
+                    NestedForward(
+                        position=len(segments),
+                        nodes=child_nodes,
+                        source_forward_id=child_id,
+                    )
+                )
+                total_text += child_text
+            await self._append_segment_chunk(
+                ordinary_chunk,
+                segments,
+                group_id,
+                settings,
+                image_counter,
+            )
+            if not segments and reply_snapshot is None and not nested_forwards:
+                raise CaptureError("合并转发包含无法保存的空节点")
+            node_text = self._validate_text_limits(segments, settings["max_text_chars"])
+            total_text += node_text + self._reply_text_length(reply_snapshot)
+            nodes.append(
+                ForwardNode(
+                    author=author,
+                    segments=segments,
+                    source_sent_at=sent_at,
+                    reply=reply_snapshot,
+                    nested_forwards=nested_forwards,
+                )
+            )
+        return nodes, total_text
+
+    async def _append_segment_chunk(
+        self,
+        chunk: list[Any],
+        target: list[QuoteSegment],
+        group_id: str,
+        settings: dict[str, Any],
+        image_counter: list[int],
+    ) -> None:
+        if not chunk:
+            return
+        parsed, ignored = await self._segments(
+            chunk,
+            group_id,
+            settings,
+            image_counter,
+            nested_forbidden=False,
+        )
+        target.extend(parsed)
+        self.last_ignored_segments += ignored
+        chunk.clear()
+
+    async def _get_message(
+        self,
+        event: Any,
+        message_id: str,
+        *,
+        group_id: str | None = None,
+        message_seq: str | None = None,
+    ) -> dict[str, Any]:
         attempts: Iterable[Any] = (
             message_id,
             int(message_id) if message_id.isdigit() else message_id,
@@ -318,11 +462,67 @@ class OneBotQuoteExtractor:
                 try:
                     payload = await call_onebot_action(event, "get_msg", **{key: value})
                     if isinstance(payload, dict):
-                        return payload
-                except Exception as exc:  # noqa: BLE001 - OneBot 实现异常类型不统一。
-                    logger.debug("读取引用消息失败: action=get_msg error=%s", exc)
+                        normalized = self._unwrap_payload(payload)
+                        if self._payload_components(normalized):
+                            return normalized
+                except Exception:  # noqa: BLE001 - OneBot 实现异常类型不统一。
+                    logger.debug("群典：读取引用消息尝试失败")
                     continue
+        if group_id:
+            history_keys = [
+                ("message_seq", message_seq),
+                ("message_id", message_id),
+            ]
+            for key, raw_value in history_keys:
+                if not raw_value:
+                    continue
+                value: Any = int(raw_value) if str(raw_value).isdigit() else raw_value
+                try:
+                    payload = await call_onebot_action(
+                        event,
+                        "get_group_msg_history",
+                        group_id=int(group_id),
+                        **{key: value},
+                    )
+                    matched = self._find_history_message(
+                        payload, message_id, message_seq
+                    )
+                    if matched is not None:
+                        return matched
+                except Exception:  # noqa: BLE001 - NapCat 扩展异常不统一。
+                    logger.debug("群典：读取群历史回复尝试失败")
         raise CaptureError("无法读取被引用消息，消息可能已过期")
+
+    @classmethod
+    def _find_history_message(
+        cls,
+        payload: Any,
+        message_id: str,
+        message_seq: str | None,
+    ) -> dict[str, Any] | None:
+        normalized = cls._unwrap_payload(payload)
+        raw_messages = normalized.get("messages") or normalized.get("message")
+        if isinstance(raw_messages, dict):
+            raw_messages = [raw_messages]
+        if not isinstance(raw_messages, list):
+            return None
+        fallback: dict[str, Any] | None = None
+        for item in raw_messages:
+            if not isinstance(item, dict):
+                continue
+            candidate = cls._unwrap_payload(item)
+            if not cls._payload_components(candidate):
+                continue
+            fallback = candidate
+            identifiers = {
+                str(candidate.get(key) or "")
+                for key in ("message_id", "id", "message_seq", "real_id", "real_seq")
+            }
+            if message_id in identifiers or (
+                message_seq and message_seq in identifiers
+            ):
+                return candidate
+        return fallback if len(raw_messages) == 1 else None
 
     async def _get_forward_message(self, event: Any, forward_id: str) -> dict[str, Any]:
         """兼容 OneBot 实现对 get_forward_msg 参数名和 ID 类型的差异。"""
@@ -339,18 +539,36 @@ class OneBotQuoteExtractor:
                         **{key: value},
                     )
                     if isinstance(payload, dict):
-                        return payload
-                except Exception as exc:  # noqa: BLE001 - OneBot 实现异常类型不统一。
-                    logger.debug(
-                        "读取合并转发失败: action=get_forward_msg error=%s", exc
-                    )
+                        normalized = self._unwrap_payload(payload)
+                        if self._forward_payload_nodes(normalized):
+                            return normalized
+                except Exception:  # noqa: BLE001 - OneBot 实现异常类型不统一。
+                    logger.debug("群典：读取合并转发尝试失败")
         raise CaptureError("无法读取合并转发，消息可能已过期")
+
+    @classmethod
+    def _unwrap_payload(cls, payload: Any) -> dict[str, Any]:
+        current = payload
+        for _ in range(4):
+            if not isinstance(current, dict):
+                return {}
+            nested = current.get("data")
+            if not isinstance(nested, dict):
+                return current
+            if any(
+                key in current for key in ("message", "content", "messages", "nodes")
+            ):
+                return current
+            current = nested
+        return current if isinstance(current, dict) else {}
 
     @staticmethod
     def _payload_components(payload: dict[str, Any]) -> list[Any]:
         raw = payload.get("message")
-        if not isinstance(raw, list):
+        if raw in (None, ""):
             raw = payload.get("content")
+        if isinstance(raw, str):
+            return _cq_components(raw)
         if not isinstance(raw, list):
             return []
         return [
@@ -360,9 +578,10 @@ class OneBotQuoteExtractor:
             if (component := _raw_component(item))
         ]
 
-    @staticmethod
-    def _forward_payload_nodes(payload: Any) -> list[Any]:
+    @classmethod
+    def _forward_payload_nodes(cls, payload: Any) -> list[Any]:
         if isinstance(payload, dict):
+            payload = cls._unwrap_payload(payload)
             raw = (
                 payload.get("messages")
                 or payload.get("message")
@@ -387,17 +606,17 @@ class OneBotQuoteExtractor:
         data = (
             raw_node.get("data") if isinstance(raw_node.get("data"), dict) else raw_node
         )
-        if str(raw_node.get("type") or "").lower() == "forward":
-            raise CaptureError("暂不支持嵌套合并转发")
         sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
         author = _as_author(
             data.get("user_id") or data.get("uin") or sender.get("user_id"),
-            data.get("nickname")
+            sender.get("card")
+            or data.get("nickname")
             or data.get("name")
-            or sender.get("card")
             or sender.get("nickname"),
         )
         raw_content = data.get("content") or data.get("message")
+        if isinstance(raw_content, str):
+            return author, _cq_components(raw_content), _utc_iso(data.get("time"))
         if not isinstance(raw_content, list):
             raise CaptureError("合并转发节点内容格式无效")
         chain = [
@@ -510,6 +729,11 @@ class OneBotQuoteExtractor:
             if isinstance(component, _RawReply)
             else str(getattr(component, "id", "") or "")
         )
+        source_message_seq = (
+            component.message_seq
+            if isinstance(component, _RawReply)
+            else str(getattr(component, "seq", "") or "") or None
+        )
         if not message_id:
             raise CaptureError("回复关系缺少可读取的消息 ID")
         if message_id in visited:
@@ -517,6 +741,8 @@ class OneBotQuoteExtractor:
                 author=AuthorSnapshot(nickname="更早的回复"),
                 segments=[],
                 truncated=True,
+                source_message_id=message_id,
+                source_message_seq=source_message_seq,
             )
         next_visited = {*visited, message_id}
         fallback_chain = (
@@ -524,9 +750,25 @@ class OneBotQuoteExtractor:
             if isinstance(component, Comp.Reply)
             else []
         )
+        incomplete = False
         try:
-            payload = await self._get_message(event, message_id)
-            reply_chain = self._payload_components(payload) or fallback_chain
+            payload = await self._get_message(
+                event,
+                message_id,
+                group_id=group_id,
+                message_seq=source_message_seq,
+            )
+            source_message_seq = (
+                str(
+                    payload.get("real_seq")
+                    or payload.get("msg_seq")
+                    or source_message_seq
+                    or payload.get("message_seq")
+                    or ""
+                )
+                or None
+            )
+            reply_chain = fallback_chain or self._payload_components(payload)
             sender = (
                 payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
             )
@@ -538,10 +780,12 @@ class OneBotQuoteExtractor:
             if not fallback_chain:
                 raise CaptureError("无法读取被回复消息，回复快照保存失败") from None
             reply_chain = fallback_chain
+            incomplete = True
             author = _as_author(
                 getattr(component, "sender_id", None),
                 getattr(component, "sender_nickname", None),
             )
+        author = await self._resolve_author(event, group_id, author)
         await self._check_author_allowed(event, group_id, author, settings)
         segments, ignored = await self._segments(
             reply_chain,
@@ -574,6 +818,9 @@ class OneBotQuoteExtractor:
             segments=segments,
             reply=nested,
             truncated=truncated,
+            source_message_id=message_id,
+            source_message_seq=source_message_seq,
+            incomplete=incomplete,
         )
 
     @classmethod
@@ -609,28 +856,49 @@ class OneBotQuoteExtractor:
             raise CaptureError("发送者身份不完整，无法完成禁止收录名单校验")
         if settings["allow_bot_authors"] or author.user_id is None:
             return
-        cache_key = (group_id, author.user_id)
-        cached = self._bot_cache.get(cache_key)
-        if cached and cached[0] > time.monotonic():
-            is_bot = cached[1]
-        else:
-            is_bot = None
-            try:
-                payload = await call_onebot_action(
-                    event,
-                    "get_group_member_info",
-                    group_id=int(group_id),
-                    user_id=int(author.user_id),
-                    no_cache=False,
-                )
-                if isinstance(payload, dict) and (
-                    "is_robot" in payload or "is_bot" in payload
-                ):
-                    is_bot = bool(payload.get("is_robot") or payload.get("is_bot"))
-            except Exception as exc:  # noqa: BLE001 - 机器人标记不是 OneBot 11 标准字段。
-                logger.debug(
-                    "无法读取群成员机器人标记: user=%s error=%s", author.user_id, exc
-                )
-            self._bot_cache[cache_key] = (time.monotonic() + 300, is_bot)
+        _, is_bot = await self._member_info(event, group_id, author.user_id)
         if is_bot:
             raise CaptureError("配置不允许收录机器人发送的消息")
+
+    async def _resolve_author(
+        self,
+        event: Any,
+        group_id: str,
+        author: AuthorSnapshot,
+    ) -> AuthorSnapshot:
+        if author.user_id is None:
+            return author
+        name, _ = await self._member_info(event, group_id, author.user_id)
+        if name:
+            author.nickname = name
+        return author
+
+    async def _member_info(
+        self,
+        event: Any,
+        group_id: str,
+        user_id: str,
+    ) -> tuple[str | None, bool | None]:
+        cache_key = (group_id, user_id)
+        cached = self._member_cache.get(cache_key)
+        if cached and cached[0] > time.monotonic():
+            return cached[1], cached[2]
+        name: str | None = None
+        is_bot: bool | None = None
+        try:
+            payload = await call_onebot_action(
+                event,
+                "get_group_member_info",
+                group_id=int(group_id),
+                user_id=int(user_id),
+                no_cache=False,
+            )
+            payload = self._unwrap_payload(payload)
+            name = str(payload.get("card") or payload.get("nickname") or "").strip()
+            name = name or None
+            if "is_robot" in payload or "is_bot" in payload:
+                is_bot = bool(payload.get("is_robot") or payload.get("is_bot"))
+        except Exception:  # noqa: BLE001 - OneBot 群成员扩展字段不统一。
+            logger.debug("群典：读取群成员信息失败")
+        self._member_cache[cache_key] = (time.monotonic() + 300, name, is_bot)
+        return name, is_bot

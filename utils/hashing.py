@@ -54,36 +54,65 @@ def _segment_key(segment: QuoteSegment) -> dict[str, Any]:
     return {"type": "image", "sha256": segment.sha256 or ""}
 
 
-def _reply_key(reply: ReplySnapshot | None) -> dict[str, Any] | None:
+def _reply_key(
+    reply: ReplySnapshot | None,
+) -> dict[str, Any] | None:
     if reply is None:
         return None
-    return {
+    value = {
         "author": _author_key(reply.author),
         "segments": [_segment_key(segment) for segment in reply.segments],
         "reply": _reply_key(reply.reply),
         "truncated": reply.truncated,
     }
+    return value
 
 
-def _node_key(node: ForwardNode, *, include_reply: bool) -> dict[str, Any]:
+def _node_key(
+    node: ForwardNode,
+    *,
+    include_reply: bool,
+    include_nested: bool,
+) -> dict[str, Any]:
     value = {
         "author": _author_key(node.author),
         "segments": [_segment_key(segment) for segment in node.segments],
     }
     if include_reply:
         value["reply"] = _reply_key(node.reply)
+    if include_nested:
+        value["nested_forwards"] = [
+            {
+                "position": nested.position,
+                "nodes": [
+                    _node_key(
+                        child,
+                        include_reply=include_reply,
+                        include_nested=include_nested,
+                    )
+                    for child in nested.nodes
+                ],
+            }
+            for nested in node.nested_forwards
+        ]
     return value
 
 
-def calculate_record_hash(record: QuoteRecord, *, schema_version: int = 2) -> str:
+def calculate_record_hash(record: QuoteRecord, *, schema_version: int = 3) -> str:
     """计算排除时间、操作者和昵称变化的稳定内容哈希。"""
     include_reply = schema_version >= 2
+    include_nested = schema_version >= 3
     payload: dict[str, Any] = {
         "type": record.type,
         "author": _author_key(record.author),
         "segments": [_segment_key(segment) for segment in record.segments],
         "nodes": [
-            _node_key(node, include_reply=include_reply) for node in record.nodes
+            _node_key(
+                node,
+                include_reply=include_reply,
+                include_nested=include_nested,
+            )
+            for node in record.nodes
         ],
     }
     if include_reply:

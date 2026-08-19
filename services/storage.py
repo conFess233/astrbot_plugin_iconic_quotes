@@ -20,8 +20,8 @@ from ..models import QuoteRecord
 from ..utils.hashing import calculate_record_hash, normalize_search
 from ..utils.validation import identify_image, safe_storage_path
 
-SCHEMA_VERSION = 2
-SUPPORTED_SCHEMA_VERSIONS = {1, SCHEMA_VERSION}
+SCHEMA_VERSION = 3
+SUPPORTED_SCHEMA_VERSIONS = {1, 2, SCHEMA_VERSION}
 
 
 class StorageError(RuntimeError):
@@ -163,16 +163,21 @@ class QuoteStorage:
                 raise StorageError("普通群典缺少作者或内容")
             if record.type == "forward" and (
                 not record.nodes
-                or any(
-                    not node.segments and node.reply is None for node in record.nodes
-                )
+                or any(not self._node_has_content(node) for node in record.nodes)
             ):
                 raise StorageError("合并转发缺少节点内容")
         return document
 
+    @classmethod
+    def _node_has_content(cls, node: Any) -> bool:
+        return bool(node.segments or node.reply or node.nested_forwards) and all(
+            nested.nodes and all(cls._node_has_content(child) for child in nested.nodes)
+            for nested in node.nested_forwards
+        )
+
     @staticmethod
     def _upgrade_document(document: dict[str, Any]) -> None:
-        """在下一次业务写入时把 v1 内容哈希惰性升级到 v2。"""
+        """在下一次业务写入时把旧内容哈希惰性升级到当前版本。"""
         if document.get("schema_version") == SCHEMA_VERSION:
             return
         records = [QuoteRecord.from_dict(raw) for raw in document["records"]]
@@ -352,15 +357,107 @@ class QuoteStorage:
             await self._cleanup_unreferenced_images_unlocked(group_id, remaining)
             return len(selected)
 
+    async def delete_forward_node(
+        self,
+        group_id: str,
+        record_id: str,
+        expected_hash: str,
+        node_path: list[int],
+        *,
+        deleted_by: str,
+        audit_limit: int = 10_000,
+    ) -> tuple[QuoteRecord | None, int]:
+        """按稳定路径删除合并转发节点，并清理空容器与无引用媒体。"""
+        if (
+            not node_path
+            or len(node_path) % 2 == 0
+            or any(
+                not isinstance(index, int) or isinstance(index, bool) or index < 0
+                for index in node_path
+            )
+        ):
+            raise StorageError("节点路径无效，请刷新页面后重试")
+        async with self._maintenance_lock, self._lock(group_id):
+            document = await asyncio.to_thread(self._load_document_sync, group_id)
+            self._upgrade_document(document)
+            records = [QuoteRecord.from_dict(raw) for raw in document["records"]]
+            record = next((item for item in records if item.id == record_id), None)
+            if record is None or record.type != "forward":
+                raise StorageError("合并转发记录不存在，请刷新页面后重试")
+            if record.content_hash != expected_hash:
+                raise StorageError("记录内容已发生变化，请刷新页面后重试")
+            removed_nodes = self._delete_node_at_path(record.nodes, node_path)
+            record.source_forward_id = None
+            record_deleted = not record.nodes
+            if record_deleted:
+                records = [item for item in records if item.id != record_id]
+                updated = None
+            else:
+                record.content_hash = calculate_record_hash(record)
+                updated = record
+            document["records"] = [item.to_dict() for item in records]
+            await asyncio.to_thread(
+                self._atomic_json_write,
+                self._group_path(group_id),
+                document,
+            )
+            await self._append_node_audit(
+                group_id=group_id,
+                record_id=record_id,
+                content_hash=expected_hash,
+                deleted_by=deleted_by,
+                node_path=node_path,
+                removed_nodes=removed_nodes,
+                record_deleted=record_deleted,
+                limit=audit_limit,
+            )
+            await self._cleanup_unreferenced_images_unlocked(group_id, records)
+            return updated, removed_nodes
+
+    @classmethod
+    def _delete_node_at_path(cls, nodes: list[Any], path: list[int]) -> int:
+        node_index = path[0]
+        if node_index >= len(nodes):
+            raise StorageError("节点路径已失效，请刷新页面后重试")
+        if len(path) == 1:
+            removed = nodes.pop(node_index)
+            return cls._node_count(removed)
+        node = nodes[node_index]
+        nested_index = path[1]
+        if nested_index >= len(node.nested_forwards):
+            raise StorageError("嵌套节点路径已失效，请刷新页面后重试")
+        nested = node.nested_forwards[nested_index]
+        removed_count = cls._delete_node_at_path(nested.nodes, path[2:])
+        nested.source_forward_id = None
+        if not nested.nodes:
+            node.nested_forwards.pop(nested_index)
+        return removed_count
+
+    @classmethod
+    def _node_count(cls, node: Any) -> int:
+        return 1 + sum(
+            cls._node_count(child)
+            for nested in node.nested_forwards
+            for child in nested.nodes
+        )
+
     async def select_random(
         self,
         group_id: str,
         count: int,
         author_id: str | None = None,
+        keyword: str | None = None,
     ) -> tuple[list[QuoteRecord], int]:
         """从有效记录中等概率无放回抽取。"""
         candidates = await self.records(group_id)
-        if author_id:
+        needle = normalize_search(keyword or "")
+        if author_id and needle:
+            candidates = [
+                record
+                for record in candidates
+                if needle in normalize_search(record.authored_text(author_id))
+            ]
+        elif author_id:
             candidates = [
                 record
                 for record in candidates
@@ -382,32 +479,50 @@ class QuoteStorage:
         group_id: str,
         user_id: str,
     ) -> tuple[list[QuoteRecord], int]:
-        """按添加时间返回用户参与的全部健康记录及损坏数量。"""
+        """按添加时间返回用户参与的可展示记录及完全损坏数量。"""
         candidates = [
             record
             for record in await self.records(group_id)
             if record.involves_user(user_id)
         ]
-        healthy: list[QuoteRecord] = []
+        usable: list[QuoteRecord] = []
         broken = 0
         for record in candidates:
-            if await asyncio.to_thread(self._record_images_valid, record):
-                healthy.append(record)
+            if self._record_has_displayable_content(record):
+                usable.append(record)
             else:
                 broken += 1
-        healthy.sort(key=lambda record: record.recorded_at)
-        return healthy, broken
+        usable.sort(key=lambda record: record.recorded_at)
+        return usable, broken
+
+    @classmethod
+    def _record_has_displayable_content(cls, record: QuoteRecord) -> bool:
+        if record.type == "message":
+            return bool(record.segments or record.reply)
+        return any(cls._node_has_content(node) for node in record.nodes)
+
+    def missing_media_count(self, record: QuoteRecord) -> int:
+        """返回记录中缺失、越界或哈希不匹配的媒体数量。"""
+        return sum(
+            not self.media_segment_valid(segment) for segment in record.image_segments()
+        )
+
+    def media_segment_valid(self, segment: Any) -> bool:
+        """验证单个媒体段的路径、文件与内容哈希。"""
+        if not segment.path or not segment.sha256:
+            return False
+        path = (self.root / segment.path).resolve()
+        if self.root not in path.parents or not path.is_file():
+            return False
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest() == segment.sha256
+        except OSError:
+            return False
 
     def _record_images_valid(self, record: QuoteRecord) -> bool:
-        for segment in record.image_segments():
-            if not segment.path or not segment.sha256:
-                return False
-            path = (self.root / segment.path).resolve()
-            if self.root not in path.parents or not path.is_file():
-                return False
-            if hashlib.sha256(path.read_bytes()).hexdigest() != segment.sha256:
-                return False
-        return True
+        return all(
+            self.media_segment_valid(segment) for segment in record.image_segments()
+        )
 
     async def record_is_healthy(self, record: QuoteRecord) -> bool:
         """供管理页检查单条记录引用的图片是否仍完整。"""
@@ -506,9 +621,7 @@ class QuoteStorage:
                     result.add(record.author.user_id)
                 self._collect_reply_author_ids(record.reply, result)
                 for node in record.nodes:
-                    if node.author.user_id:
-                        result.add(node.author.user_id)
-                    self._collect_reply_author_ids(node.reply, result)
+                    self._collect_node_author_ids(node, result)
         return result
 
     @staticmethod
@@ -529,10 +642,17 @@ class QuoteStorage:
                     result.add(record.author.user_id)
                 self._collect_reply_author_ids(record.reply, result)
                 for node in record.nodes:
-                    if node.author.user_id:
-                        result.add(node.author.user_id)
-                    self._collect_reply_author_ids(node.reply, result)
+                    self._collect_node_author_ids(node, result)
         return result
+
+    @classmethod
+    def _collect_node_author_ids(cls, node: Any, result: set[str]) -> None:
+        if node.author.user_id:
+            result.add(node.author.user_id)
+        cls._collect_reply_author_ids(node.reply, result)
+        for nested in node.nested_forwards:
+            for child in nested.nodes:
+                cls._collect_node_author_ids(child, result)
 
     @classmethod
     def _collect_reply_author_ids(cls, reply: Any, result: set[str]) -> None:
@@ -599,6 +719,50 @@ class QuoteStorage:
                     "source": source,
                 }
                 for record in records
+            )
+            self._atomic_json_write(
+                self.audit_path,
+                entries[-limit:],
+                keep_backup=True,
+            )
+
+        await asyncio.to_thread(append)
+
+    async def _append_node_audit(
+        self,
+        *,
+        group_id: str,
+        record_id: str,
+        content_hash: str,
+        deleted_by: str,
+        node_path: list[int],
+        removed_nodes: int,
+        record_deleted: bool,
+        limit: int,
+    ) -> None:
+        """追加不包含被删正文的节点级删除审计。"""
+
+        def append() -> None:
+            entries: list[dict[str, Any]] = []
+            if self.audit_path.exists():
+                try:
+                    loaded = json.loads(self.audit_path.read_text(encoding="utf-8-sig"))
+                    if isinstance(loaded, list):
+                        entries = loaded
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+                    entries = []
+            entries.append(
+                {
+                    "group_id": group_id,
+                    "record_id": record_id,
+                    "content_hash": content_hash,
+                    "deleted_by": deleted_by,
+                    "deleted_at": datetime.now(UTC).isoformat(),
+                    "source": "page_node",
+                    "node_path": list(node_path),
+                    "removed_nodes": removed_nodes,
+                    "record_deleted": record_deleted,
+                }
             )
             self._atomic_json_write(
                 self.audit_path,
