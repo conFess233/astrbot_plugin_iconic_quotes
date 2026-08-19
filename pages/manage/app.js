@@ -202,11 +202,13 @@ const CONFIG_SECTIONS = [
     { key: "send_retry_count", label: "发送重试次数", type: "number", min: 0, max: 5 },
     { key: "send_retry_delay_ms", label: "重试延迟（毫秒）", type: "number", min: 100, max: 10000 },
     { key: "retry_on_ambiguous_failure", label: "不明确失败时也重试", type: "boolean", hint: "可能造成重复发送，默认关闭。" },
+    { key: "nested_forward_fallback_message", label: "多层嵌套降级提示", type: "text", full: true },
+    { key: "nested_forward_unknown_message", label: "多层嵌套结果未知提示", type: "text", full: true },
   ]},
 ];
 
 const ALL_FIELDS = CONFIG_SECTIONS.flatMap((section) => section.fields);
-const OVERRIDE_KEYS = new Set(["add_keyword_enabled", "add_keywords", "query_keyword_enabled", "query_keywords", "burst_keyword_enabled", "burst_keywords", "burst_page_size", "burst_time_mode", "send_count", "random_send_count", "send_mode", "aggregate_multiple", "allow_bot_authors", "max_records_per_group", "add_roles", "query_roles", "burst_roles", "info_roles", "delete_roles", "user_blacklist", "user_whitelist", "excluded_author_ids"]);
+const OVERRIDE_KEYS = new Set(["add_keyword_enabled", "add_keywords", "query_keyword_enabled", "query_keywords", "burst_keyword_enabled", "burst_keywords", "burst_page_size", "burst_time_mode", "send_count", "random_send_count", "send_mode", "aggregate_multiple", "allow_bot_authors", "max_records_per_group", "add_roles", "query_roles", "burst_roles", "info_roles", "delete_roles", "user_blacklist", "user_whitelist", "excluded_author_ids", "nested_forward_fallback_message", "nested_forward_unknown_message"]);
 const OVERRIDE_FIELDS = ALL_FIELDS.filter((field) => OVERRIDE_KEYS.has(field.key));
 
 function normalizeList(value) { return Array.isArray(value) ? value : []; }
