@@ -2,8 +2,7 @@ name: astrbot_plugin_iconic_quotes
 display_name: 群典
 short_desc: 记录并查询 QQ 群聊中的文字、图片、表情、回复与合并转发金句
 desc: |
-    QQ 群聊的群典插件。支持引用及回复快照收录、表情本地化、合并转发、
-    哈希去重、随机群典与爆典合集、权限控制、数据备份和 Plugin Pages 后台管理。
+    可收录群友的文字、图片、QQ 表情、商城表情、回复关系和合并转发，并通过随机群典或个人“爆典”合集重新发送。
 version: 1.1.0
 author: conFess233
 repo: https://github.com/conFess233/astrbot_plugin_iconic_quotes
