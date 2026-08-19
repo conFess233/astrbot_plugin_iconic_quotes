@@ -124,7 +124,7 @@ python -m pip install -r requirements.txt
 - 被收录消息自身带有回复关系时，会将被回复消息保存为本地快照；添加命令用于选择来源的引用不会被误存为回复。
 - QQ 内置表情保存表情 ID 并原生重放；商城表情保存本地图片和必要元数据，原生发送失败时降级为图片。
 - Unicode Emoji 作为普通文字保存；JPEG、PNG、WebP 和 GIF 按内容哈希存储。
-- 头像不会持久化。卡片发送时通过 API 实时获取，失败或不存在时使用空白头像区域。
+- 卡片头像默认通过 API 临时获取；可选按 QQ 号本地缓存，失败或不存在时使用内置空白头像。
 - 语音、视频和文件等不支持的消息段不会保存；没有任何可保存内容时会明确提示添加失败。
 
 ### 查询与发送
@@ -132,6 +132,8 @@ python -m pip install -r requirements.txt
 `/群典` 对普通记录和合并转发记录等概率抽取，单次抽取不会重复。`/群典 @某人` 使用 QQ ID 精确匹配普通记录；合并转发只有在能够安全归属于该成员时才会进入其随机池。
 
 `/爆典 @某人` 则会收集该成员作为普通消息作者或任一转发节点作者参与的记录，按收录时间从旧到新排列。多作者合并转发整体计为一条，不拆分、不重复计数。
+
+爆典默认在每条记录前增加一条独立的“记录时间”节点，正文不再包含时间或横线分隔符。也可以尝试让 OneBot 节点携带实验性原生时间，或完全隐藏记录时间；原生显示是否生效取决于当前 OneBot 实现。
 
 发送方式包括：
 
@@ -168,6 +170,7 @@ python -m pip install -r requirements.txt
 | `burst_keyword_enabled` | `true`   | 启用爆典关键词              |
 | `burst_keywords`        | `爆典`   | 爆典关键词列表              |
 | `burst_page_size`       | `50`     | 爆典每页记录数，范围 1～100 |
+| `burst_time_mode`       | `text`   | `text` 独立节点、实验性 `native` 或 `none` |
 | `burst_roles`           | `member` | 可使用爆典的角色            |
 
 ### 权限与名单
@@ -215,6 +218,8 @@ python -m pip install -r requirements.txt
 | `card_min_height` / `card_max_height` | `480` / `2000`      | 卡片高度边界                       |
 | `card_auto_height`                    | `true`              | 按内容收缩并裁切右侧、底部画布留白 |
 | `card_custom_css`                     | 空                  | 自定义卡片 CSS，不允许外部资源     |
+| `localize_avatars`                    | `false`             | 将卡片和后台使用的头像缓存到本地   |
+| `avatar_cache_ttl_days`               | `7`                 | 头像缓存有效天数，`0` 表示永久有效 |
 
 <details>
 <summary>高级配置与群级覆盖</summary>
@@ -240,6 +245,7 @@ python -m pip install -r requirements.txt
 - 导出 ZIP 备份
 - 预检并确认导入备份，查看新增、重复、冲突和缺失资源统计
 - 显式迁移存储目录，并保留迁移前备份
+- 查看头像缓存数量与占用，清理无引用头像或二次确认后清空缓存
 
 <a id="data-security"></a>
 
@@ -251,6 +257,7 @@ python -m pip install -r requirements.txt
 AstrBot/data/plugin_data/astrbot_plugin_iconic_quotes/iconic_quotes/
 ├── groups/<群号>.json
 ├── images/<群号>/<内容哈希>.<扩展名>
+├── avatars/<QQ号>.jpg
 ├── backups/
 └── audit.json
 ```
@@ -259,7 +266,8 @@ AstrBot/data/plugin_data/astrbot_plugin_iconic_quotes/iconic_quotes/
 - v1 数据和官方备份仍可读取，并在下一次修改时创建 `.bak` 后惰性升级。
 - JSON 使用临时文件原子替换；主文件损坏时可尝试读取 `.bak`。
 - 图片和商城表情按二进制 SHA-256 去重，单独存放在 `images/`。
-- 头像通过 API 临时获取，不保存到 JSON 或磁盘。
+- `localize_avatars` 默认关闭；启用后头像按 QQ 号保存到 `avatars/`，不会写入金句 JSON，也不会为每条记录重复保存。
+- 头像缓存计入 `max_media_mb`，容量不足时优先清理无引用头像，再按最久未使用顺序清理；不会删除金句正文或金句图片。
 - 导入备份会校验路径、清单、文件哈希、图片格式和容量，再由管理员确认写入。
 - 数据为明文，请保护 AstrBot 数据目录和导出的 ZIP 文件。
 
@@ -271,6 +279,7 @@ AstrBot/data/plugin_data/astrbot_plugin_iconic_quotes/iconic_quotes/
 - 仅支持收录一层合并转发；发送爆典时会优先尝试嵌套，并提供兼容降级。
 - 纯图片记录不能通过字符串删除命令命中，请在管理页删除。
 - OneBot 无法返回作者 QQ ID 时，记录会标记为身份不完整，只能进入群级随机池。
+- OneBot 11 自定义转发节点不支持本地头像字段，因此头像本地化只用于 CSS 卡片和后台展示，不能替换爆典或合并转发气泡旁的原生头像。
 - 图片或 JSON 被外部修改后，异常记录不会参与随机发送或爆典健康记录统计。
 
 <a id="changelog"></a>
