@@ -3,7 +3,7 @@ display_name: 群典
 short_desc: 记录并查询 QQ 群聊中的文字、图片、表情、回复与合并转发金句
 desc: |
     可收录群友的文字、图片、QQ 表情、商城表情、回复关系和合并转发，并通过随机群典或个人“爆典”合集重新发送。
-version: 1.1.1
+version: 1.1.2
 author: conFess233
 repo: https://github.com/conFess233/astrbot_plugin_iconic_quotes
 astrbot_version: ">=4.24.2,<5"
