@@ -92,21 +92,39 @@ function authorOf(record) {
   return record.author || {};
 }
 
+function replySegments(reply) { return reply ? [...(reply.segments || []), ...replySegments(reply.reply)] : []; }
 function segmentsOf(record) {
-  if (record.type === "message") return record.segments || [];
-  return (record.nodes || []).flatMap((node) => node.segments || []);
+  if (record.type === "message") return [...(record.segments || []), ...replySegments(record.reply)];
+  return (record.nodes || []).flatMap((node) => [...(node.segments || []), ...replySegments(node.reply)]);
+}
+
+function segmentText(segments) {
+  const values = (segments || []).map((segment) => {
+    if (segment.type === "text") return segment.text || "";
+    if (segment.type === "face") return `[QQ 表情 ${segment.face_id || "未知"}]`;
+    if (segment.type === "sticker") return segment.summary || "[商城表情]";
+    if (segment.type === "image") return "[图片]";
+    return "";
+  }).filter(Boolean);
+  return values.join("") || "（空消息）";
+}
+
+function replyText(reply) {
+  if (!reply) return "";
+  const who = reply.author?.nickname || reply.author?.user_id || "未知发送者";
+  const nested = replyText(reply.reply);
+  return `↩ 回复 ${who}：${segmentText(reply.segments)}${reply.truncated ? " [更早回复已截断]" : ""}${nested ? ` / ${nested}` : ""}`;
 }
 
 function textOf(record) {
-  if (record.type === "message") return (record.segments || []).filter((x) => x.type === "text").map((x) => x.text || "").join("") || "（仅图片消息）";
+  if (record.type === "message") return [replyText(record.reply), segmentText(record.segments)].filter(Boolean).join(" · ");
   return (record.nodes || []).map((node) => {
     const who = node.author?.nickname || node.author?.user_id || "未知发送者";
-    const text = (node.segments || []).filter((x) => x.type === "text").map((x) => x.text || "").join("") || "（仅图片）";
-    return `${who}：${text}`;
+    return `${who}：${[replyText(node.reply), segmentText(node.segments)].filter(Boolean).join(" · ")}`;
   }).join(" · ") || "（空合并转发）";
 }
 
-function imageSegments(record) { return segmentsOf(record).filter((x) => x.type === "image" && x.path); }
+function imageSegments(record) { return segmentsOf(record).filter((x) => ["image", "sticker"].includes(x.type) && x.path); }
 
 const ROLE_OPTIONS = [["bot_admin", "Bot 管理员"], ["owner", "群主"], ["admin", "群管理员"], ["member", "群成员"], ["everyone", "所有人"]];
 const CONFIG_SECTIONS = [
@@ -115,6 +133,9 @@ const CONFIG_SECTIONS = [
     { key: "add_keywords", label: "添加关键词", type: "list", hint: "每行一个关键词。" },
     { key: "query_keyword_enabled", label: "启用查询关键词", type: "boolean", hint: "命令消息不会再次触发关键词。" },
     { key: "query_keywords", label: "查询关键词", type: "list", hint: "每行一个关键词。" },
+    { key: "burst_keyword_enabled", label: "启用爆典关键词", type: "boolean", hint: "关闭后仍可使用 /爆典 命令。" },
+    { key: "burst_keywords", label: "爆典关键词", type: "list", hint: "每行一个关键词；用法：爆典 @某人 [页码]。" },
+    { key: "burst_page_size", label: "爆典每页条数", type: "number", min: 1, max: 100 },
     { key: "send_count", label: "最大发送条数", type: "number", min: 1, max: 10 },
     { key: "random_send_count", label: "随机发送条数", type: "boolean", hint: "开启后每次从 1 到最大发送条数中随机。" },
     { key: "send_mode", label: "单条发送方式", type: "select", options: [["text", "文字"], ["card", "图片卡片"]] },
@@ -129,11 +150,13 @@ const CONFIG_SECTIONS = [
     { key: "max_forward_nodes", label: "转发节点上限", type: "number", min: 1, max: 200 },
     { key: "max_text_chars", label: "普通消息字符上限", type: "number", min: 1, max: 100000 },
     { key: "max_forward_text_chars", label: "转发消息字符上限", type: "number", min: 1, max: 1000000 },
+    { key: "max_reply_depth", label: "回复快照最大深度", type: "number", min: 1, max: 10 },
     { key: "delete_preview_limit", label: "删除预览上限", type: "number", min: 1, max: 50 },
     { key: "audit_limit", label: "删除审计保留条数", type: "number", min: 1, max: 100000 },
   ]},
-  { id: "permissions", title: "权限", description: "分别控制添加、查询、统计与删除操作。", icon: "groups", fields: [
+  { id: "permissions", title: "权限", description: "分别控制添加、随机查询、爆典、统计与删除操作。", icon: "groups", fields: [
     { key: "add_roles", label: "添加权限", type: "roles", full: true }, { key: "query_roles", label: "查询权限", type: "roles", full: true },
+    { key: "burst_roles", label: "爆典权限", type: "roles", full: true },
     { key: "info_roles", label: "查看统计权限", type: "roles", full: true }, { key: "delete_roles", label: "删除权限", type: "roles", full: true },
   ]},
   { id: "lists", title: "名单", description: "白名单为空时不限制；ID 每行一个。", icon: "filter", fields: [
@@ -158,7 +181,7 @@ const CONFIG_SECTIONS = [
 ];
 
 const ALL_FIELDS = CONFIG_SECTIONS.flatMap((section) => section.fields);
-const OVERRIDE_KEYS = new Set(["add_keyword_enabled", "add_keywords", "query_keyword_enabled", "query_keywords", "send_count", "random_send_count", "send_mode", "aggregate_multiple", "allow_bot_authors", "max_records_per_group", "add_roles", "query_roles", "info_roles", "delete_roles", "user_blacklist", "user_whitelist", "excluded_author_ids"]);
+const OVERRIDE_KEYS = new Set(["add_keyword_enabled", "add_keywords", "query_keyword_enabled", "query_keywords", "burst_keyword_enabled", "burst_keywords", "burst_page_size", "send_count", "random_send_count", "send_mode", "aggregate_multiple", "allow_bot_authors", "max_records_per_group", "add_roles", "query_roles", "burst_roles", "info_roles", "delete_roles", "user_blacklist", "user_whitelist", "excluded_author_ids"]);
 const OVERRIDE_FIELDS = ALL_FIELDS.filter((field) => OVERRIDE_KEYS.has(field.key));
 
 function normalizeList(value) { return Array.isArray(value) ? value : []; }
@@ -321,18 +344,31 @@ function renderRecords() {
 async function mediaData(path) { if (!state.media.has(path)) state.media.set(path, bridge.apiGet("media-data", { path }).then((result) => result.data_url)); return state.media.get(path); }
 
 function appendMedia(parent, segments) {
-  const images = segments.filter((segment) => segment.type === "image" && segment.path); if (!images.length) return;
+  const images = segments.filter((segment) => ["image", "sticker"].includes(segment.type) && segment.path); if (!images.length) return;
   const grid = element("div", "media-grid");
   images.forEach((segment) => { const tile = element("button", "media-tile"); tile.type = "button"; const skeleton = element("div", "skeleton"); skeleton.style.width = "65%"; tile.append(skeleton); grid.append(tile); mediaData(segment.path).then((source) => { const image = document.createElement("img"); image.src = source; image.alt = "群典图片"; tile.replaceChildren(image); tile.addEventListener("click", () => openLightbox(images, images.indexOf(segment))); }).catch((error) => { const broken = element("div", "media-placeholder"); broken.append(icon("alert"), element("strong", "", "图片不可用"), element("small", "", error.message || segment.path)); tile.replaceChildren(broken); tile.disabled = true; }); }); parent.append(grid);
 }
 
-function appendSegmentContent(parent, segments) { const text = segments.filter((segment) => segment.type === "text").map((segment) => segment.text || "").join(""); if (text) parent.append(element("div", "detail-text", text)); appendMedia(parent, segments); }
+function appendSegmentContent(parent, segments) {
+  const text = segmentText(segments); if (text !== "（空消息）") parent.append(element("div", "detail-text", text)); appendMedia(parent, segments);
+}
+
+function appendReplyContent(parent, reply, depth = 1) {
+  if (!reply) return;
+  const box = element("section", "forward-node");
+  const who = reply.author?.nickname || reply.author?.user_id || "未知发送者";
+  box.append(element("h3", "", `↩ 回复 ${who}`));
+  appendSegmentContent(box, reply.segments || []);
+  if (reply.truncated) box.append(element("small", "", "更早回复已达到本地化深度上限"));
+  if (reply.reply) appendReplyContent(box, reply.reply, depth + 1);
+  parent.append(box);
+}
 
 function openDrawer(record) {
   state.activeRecord = record; const author = authorOf(record); $("#drawer-title").textContent = author.nickname || (record.type === "forward" ? "合并转发" : "未知发送者"); const content = $("#drawer-content"); content.replaceChildren();
   const meta = element("div", "detail-meta"); [["群号", record.group_id], ["记录时间", dateParts(record.recorded_at).join(" ")], ["记录 ID", record.id], ["状态", record.broken ? "异常" : "正常"]].forEach(([label, value]) => { const item = element("div"); item.append(element("span", "", label), element("strong", "", String(value || "—"))); meta.append(item); }); content.append(meta);
-  if (record.type === "message") appendSegmentContent(content, record.segments || []); else (record.nodes || []).forEach((node, index) => { const nodeBox = element("section", "forward-node"); const heading = element("h3"); heading.append(document.createTextNode(node.author?.nickname || "未知发送者"), element("small", "", node.author?.user_id || `节点 ${index + 1}`)); nodeBox.append(heading); appendSegmentContent(nodeBox, node.segments || []); content.append(nodeBox); });
-  $("#drawer-preview").hidden = record.type !== "message"; $("#drawer-backdrop").hidden = false; $("#record-drawer").classList.add("open"); $("#record-drawer").setAttribute("aria-hidden", "false");
+  if (record.type === "message") { appendReplyContent(content, record.reply); appendSegmentContent(content, record.segments || []); } else (record.nodes || []).forEach((node, index) => { const nodeBox = element("section", "forward-node"); const heading = element("h3"); heading.append(document.createTextNode(node.author?.nickname || "未知发送者"), element("small", "", node.author?.user_id || `节点 ${index + 1}`)); nodeBox.append(heading); appendReplyContent(nodeBox, node.reply); appendSegmentContent(nodeBox, node.segments || []); content.append(nodeBox); });
+  $("#drawer-preview").hidden = record.type !== "message" || segmentsOf(record).some((segment) => ["face", "sticker"].includes(segment.type)) || Boolean(record.reply); $("#drawer-backdrop").hidden = false; $("#record-drawer").classList.add("open"); $("#record-drawer").setAttribute("aria-hidden", "false");
 }
 
 function closeDrawer() { $("#record-drawer").classList.remove("open"); $("#record-drawer").setAttribute("aria-hidden", "true"); window.setTimeout(() => { $("#drawer-backdrop").hidden = true; }, 270); }

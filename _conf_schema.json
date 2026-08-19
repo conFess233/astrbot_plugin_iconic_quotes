@@ -27,6 +27,24 @@
     "default": ["群典"],
     "hint": "去除首尾空白后完整匹配。"
   },
+  "burst_keyword_enabled": {
+    "description": "启用爆典关键词",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后仍可使用 /爆典 命令。"
+  },
+  "burst_keywords": {
+    "description": "爆典关键词",
+    "type": "list",
+    "default": ["爆典"],
+    "hint": "用法：爆典 @某人 [页码]；去除首尾空白后完整匹配语法。"
+  },
+  "burst_page_size": {
+    "description": "爆典每页条数",
+    "type": "int",
+    "default": 50,
+    "hint": "范围 1 到 100；超过此数量时先提示页数。"
+  },
   "send_count": {
     "description": "每次发送条数",
     "type": "int",
@@ -92,6 +110,12 @@
     "type": "int",
     "default": 50000
   },
+  "max_reply_depth": {
+    "description": "回复快照最大深度",
+    "type": "int",
+    "default": 3,
+    "hint": "范围 1 到 10；超过深度会安全标记为已截断。"
+  },
   "add_roles": {
     "description": "添加权限",
     "type": "list",
@@ -103,6 +127,13 @@
     "description": "查询权限",
     "type": "list",
     "default": ["everyone"],
+    "options": ["bot_admin", "owner", "admin", "member", "everyone"],
+    "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
+  },
+  "burst_roles": {
+    "description": "爆典权限",
+    "type": "list",
+    "default": ["member"],
     "options": ["bot_admin", "owner", "admin", "member", "everyone"],
     "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
   },

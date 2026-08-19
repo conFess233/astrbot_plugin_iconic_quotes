@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -20,7 +22,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from .models import QuoteRecord
 from .services.cooldown import GlobalCooldown
 from .services.onebot import CaptureError, OneBotQuoteExtractor
-from .services.permissions import PermissionService, RoleLookupError
+from .services.permissions import PermissionService, RoleLookupError, call_onebot_action
 from .services.renderer import QuoteRenderer
 from .services.settings import SettingsService
 from .services.storage import DuplicateQuoteError, QuoteStorage, StorageError
@@ -154,6 +156,19 @@ class IconicQuotesPlugin(Star):
             return
         await self._dispatch(event, "query", self._send_random_quote)
 
+    @filter.command("爆典")
+    async def burst_quote(self, event: AstrMessageEvent, argument: str = ""):
+        """分页获取当前群中指定成员参与的全部群典记录。"""
+        event.set_extra(COMMAND_EVENT_KEY, True)
+        _, page_value = self._match_burst_syntax(self._plain_text(event), ["爆典"])
+        if page_value is None and argument.strip().isdigit():
+            page_value = argument.strip()
+        await self._dispatch(
+            event,
+            "burst",
+            lambda current, values: self._send_burst(current, values, page_value),
+        )
+
     @filter.command("删除群典")
     async def delete_quote(self, event: AstrMessageEvent, keyword: str = ""):
         """预览正文包含指定字符串的记录，并创建删除确认。"""
@@ -192,17 +207,28 @@ class IconicQuotesPlugin(Star):
         )
         has_source = self._has_capture_source(event)
         add_match = values["add_keyword_enabled"] and text in values["add_keywords"]
-        query_match = (
-            values["query_keyword_enabled"]
-            and (
-                text in values["query_keywords"]
-                or (
-                    bool(self._mentioned_users(event))
-                    and plain_text in values["query_keywords"]
-                )
+        query_match = values["query_keyword_enabled"] and (
+            text in values["query_keywords"]
+            or (
+                bool(self._mentioned_users(event))
+                and plain_text in values["query_keywords"]
             )
         )
-        if add_match and has_source:
+        burst_match, burst_page = self._match_burst_syntax(
+            plain_text,
+            values["burst_keywords"],
+        )
+        if values["burst_keyword_enabled"] and burst_match:
+            await self._dispatch(
+                event,
+                "burst",
+                lambda current, current_values: self._send_burst(
+                    current,
+                    current_values,
+                    burst_page,
+                ),
+            )
+        elif add_match and has_source:
             await self._dispatch(event, "add", self._add_quote)
         elif query_match:
             await self._dispatch(event, "query", self._send_random_quote)
@@ -259,10 +285,7 @@ class IconicQuotesPlugin(Star):
         except DuplicateQuoteError as exc:
             await self._send_text(
                 event,
-                (
-                    "该群典已存在。\n"
-                    f"记录 ID：{exc.record.id[:8]}"
-                ),
+                (f"该群典已存在。\n记录 ID：{exc.record.id[:8]}"),
                 values,
             )
         except (CaptureError, StorageError, ValueError) as exc:
@@ -327,6 +350,115 @@ class IconicQuotesPlugin(Star):
             return
         await self._send_records(event, records, values)
 
+    async def _send_burst(
+        self,
+        event: AstrMessageEvent,
+        values: dict[str, Any],
+        page_value: str | None,
+    ) -> None:
+        targets = self._mentioned_users(event)
+        if len(targets) != 1:
+            await self._send_text(event, "用法：爆典 @某人 [页码]", values)
+            return
+        target_id = targets[0]
+        records, broken = await self.storage.records_for_user(
+            str(event.get_group_id()),
+            target_id,
+        )
+        if not records:
+            message = (
+                "该用户的群典记录均存在资源缺失，请联系管理员检查插件数据。"
+                if broken
+                else "未找到该用户的群典记录。"
+            )
+            await self._send_text(event, message, values)
+            return
+        page_size = values["burst_page_size"]
+        pages = math.ceil(len(records) / page_size)
+        if page_value is None and len(records) > page_size:
+            await self._send_text(
+                event,
+                f"当前记录数量大于 {page_size} 条，将分页发送。当前共有 {pages} 页，"
+                "请发送“爆典 @某人 {页码}”获取。",
+                values,
+            )
+            return
+        try:
+            page = int(page_value) if page_value is not None else 1
+        except (TypeError, ValueError):
+            page = 0
+        if page < 1 or page > pages:
+            await self._send_text(event, f"页码无效，有效范围为 1 到 {pages}。", values)
+            return
+        start = (page - 1) * page_size
+        selected = records[start : start + page_size]
+        target_name = await self._burst_target_name(event, target_id, records)
+        variants = [(True, True)]
+        if any(record.type == "forward" for record in selected):
+            variants.append((False, True))
+        if any(record.has_stickers() for record in selected):
+            variants.append((False, False))
+        last_error: Exception | None = None
+        for nested, native_stickers in variants:
+            try:
+                nodes = self.renderer.burst_nodes(
+                    selected,
+                    target_name=target_name,
+                    total=len(records),
+                    page=page,
+                    pages=pages,
+                    skipped=broken,
+                    nested=nested,
+                    native_stickers=native_stickers,
+                )
+                await self._send_chain(event, [Comp.Nodes(nodes)], values)
+                return
+            except Exception as exc:  # noqa: BLE001 - OneBot 错误类型不统一。
+                last_error = exc
+        logger.error(
+            "爆典合集发送失败: group=%s target=%s error=%s",
+            event.get_group_id(),
+            target_id,
+            last_error,
+        )
+        await self._send_text(
+            event,
+            "爆典合集发送失败，请稍后重试或联系管理员检查 OneBot 日志。",
+            values,
+        )
+
+    async def _burst_target_name(
+        self,
+        event: AstrMessageEvent,
+        target_id: str,
+        records: list[QuoteRecord],
+    ) -> str:
+        try:
+            payload = await call_onebot_action(
+                event,
+                "get_group_member_info",
+                group_id=int(event.get_group_id()),
+                user_id=int(target_id),
+                no_cache=False,
+            )
+            if isinstance(payload, dict):
+                name = str(payload.get("card") or payload.get("nickname") or "").strip()
+                if name:
+                    return name
+        except Exception as exc:  # noqa: BLE001 - 昵称查询失败应回退存档。
+            logger.debug("读取爆典目标群昵称失败: user=%s error=%s", target_id, exc)
+        for record in reversed(records):
+            if (
+                record.author
+                and record.author.user_id == target_id
+                and record.author.nickname
+            ):
+                return record.author.nickname
+            for node in reversed(record.nodes):
+                if node.author.user_id == target_id and node.author.nickname:
+                    return node.author.nickname
+        return target_id
+
     async def _send_records(
         self,
         event: AstrMessageEvent,
@@ -346,9 +478,7 @@ class IconicQuotesPlugin(Star):
                     ):
                         return False
                 else:
-                    await self._send_chain(
-                        event, self.renderer.text_chain(record), values
-                    )
+                    await self._send_record_chain(event, record, values)
             return True
         if len(records) > 1 and values["aggregate_multiple"]:
             ordinary = [record for record in records if record.type == "message"]
@@ -362,9 +492,12 @@ class IconicQuotesPlugin(Star):
             if record.type == "forward":
                 await self._send_forward(event, [record], values, replay=True)
             elif values["send_mode"] == "card":
-                await self._send_card_with_fallback(event, record, values)
+                if record.has_native_segments():
+                    await self._send_record_chain(event, record, values)
+                else:
+                    await self._send_card_with_fallback(event, record, values)
             else:
-                await self._send_chain(event, self.renderer.text_chain(record), values)
+                await self._send_record_chain(event, record, values)
         return True
 
     async def _send_card_with_fallback(
@@ -383,7 +516,7 @@ class IconicQuotesPlugin(Star):
             )
         except Exception:  # noqa: BLE001 - 渲染端点可抛出第三方异常。
             logger.exception("金句卡片生成失败: record_id=%s", record.id)
-            await self._send_chain(event, self.renderer.text_chain(record), values)
+            await self._send_record_chain(event, record, values)
             await self._send_text(
                 event, "金句图片生成失败，已使用文字方式发送。", values
             )
@@ -400,18 +533,61 @@ class IconicQuotesPlugin(Star):
         *,
         replay: bool,
     ) -> bool:
-        nodes = self.renderer.forward_nodes(records, replay=replay)
         try:
+            nodes = self.renderer.forward_nodes(
+                records,
+                replay=replay,
+                native_stickers=True,
+            )
             await self._send_chain(event, [Comp.Nodes(nodes)], values)
             return True
         except Exception:  # noqa: BLE001 - OneBot 适配器异常类型不稳定。
-            logger.exception(
-                "合并转发发送失败: group=%s record_ids=%s",
-                event.get_group_id(),
-                [record.id for record in records],
+            if not any(record.has_stickers() for record in records):
+                logger.exception(
+                    "合并转发发送失败: group=%s record_ids=%s",
+                    event.get_group_id(),
+                    [record.id for record in records],
+                )
+                await self._send_text(event, "合并转发发送失败，请稍后重试。", values)
+                return False
+            try:
+                nodes = self.renderer.forward_nodes(
+                    records,
+                    replay=replay,
+                    native_stickers=False,
+                )
+                await self._send_chain(event, [Comp.Nodes(nodes)], values)
+                return True
+            except Exception:  # noqa: BLE001 - OneBot 错误类型不统一。
+                logger.exception(
+                    "合并转发发送失败: group=%s record_ids=%s",
+                    event.get_group_id(),
+                    [record.id for record in records],
+                )
+                await self._send_text(event, "合并转发发送失败，请稍后重试。", values)
+                return False
+
+    async def _send_record_chain(
+        self,
+        event: AstrMessageEvent,
+        record: QuoteRecord,
+        values: dict[str, Any],
+    ) -> None:
+        if not record.has_stickers():
+            await self._send_chain(event, self.renderer.text_chain(record), values)
+            return
+        try:
+            await self._send_chain(
+                event,
+                self.renderer.text_chain(record, native_stickers=True),
+                values,
             )
-            await self._send_text(event, "合并转发发送失败，请稍后重试。", values)
-            return False
+        except Exception:  # noqa: BLE001 - 原生贴纸失败时降级本地图片。
+            await self._send_chain(
+                event,
+                self.renderer.text_chain(record, native_stickers=False),
+                values,
+            )
 
     async def _show_info(
         self,
@@ -570,8 +746,7 @@ class IconicQuotesPlugin(Star):
         else:
             prefixes = ["/"]
         return any(
-            prefix
-            and candidate.strip().startswith(str(prefix))
+            prefix and candidate.strip().startswith(str(prefix))
             for prefix in prefixes
             for candidate in candidates
         )
@@ -587,6 +762,28 @@ class IconicQuotesPlugin(Star):
             if target not in {"", "all", self_id} and target not in result:
                 result.append(target)
         return result
+
+    @staticmethod
+    def _plain_text(event: AstrMessageEvent) -> str:
+        return "".join(
+            str(item.text)
+            for item in event.get_messages()
+            if isinstance(item, Comp.Plain)
+        ).strip()
+
+    @staticmethod
+    def _match_burst_syntax(
+        plain_text: str,
+        keywords: list[str],
+    ) -> tuple[bool, str | None]:
+        for keyword in sorted(keywords, key=len, reverse=True):
+            match = re.fullmatch(
+                rf"/?{re.escape(keyword)}(?:\s+(.+))?",
+                plain_text.strip(),
+            )
+            if match:
+                return True, match.group(1)
+        return False, None
 
     @staticmethod
     def _is_bot_message(event: AstrMessageEvent) -> bool:

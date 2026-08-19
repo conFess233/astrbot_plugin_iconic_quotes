@@ -13,6 +13,9 @@ GROUP_OVERRIDE_KEYS = {
     "add_keywords",
     "query_keyword_enabled",
     "query_keywords",
+    "burst_keyword_enabled",
+    "burst_keywords",
+    "burst_page_size",
     "send_count",
     "random_send_count",
     "send_mode",
@@ -21,6 +24,7 @@ GROUP_OVERRIDE_KEYS = {
     "max_records_per_group",
     "add_roles",
     "query_roles",
+    "burst_roles",
     "info_roles",
     "delete_roles",
     "user_blacklist",
@@ -35,6 +39,10 @@ DEFAULTS: dict[str, Any] = {
     "add_keywords": ["添加群典"],
     "query_keyword_enabled": True,
     "query_keywords": ["群典"],
+    "burst_keyword_enabled": True,
+    "burst_keywords": ["爆典"],
+    "burst_page_size": 50,
+    "max_reply_depth": 3,
     "max_records_per_group": 5000,
     "max_media_mb": 2048,
     "max_image_mb": 10,
@@ -49,6 +57,7 @@ DEFAULTS: dict[str, Any] = {
     "allow_bot_authors": False,
     "add_roles": ["everyone"],
     "query_roles": ["everyone"],
+    "burst_roles": ["member"],
     "info_roles": ["everyone"],
     "delete_roles": ["bot_admin"],
     "group_blacklist": [],
@@ -140,6 +149,8 @@ class SettingsService:
             "max_text_chars": (1, 100_000),
             "max_forward_text_chars": (1, 1_000_000),
             "send_count": (1, 10),
+            "burst_page_size": (1, 100),
+            "max_reply_depth": (1, 10),
             "global_cooldown_ms": (0, 60_000),
             "delete_preview_limit": (1, 50),
             "send_retry_count": (0, 5),
@@ -164,6 +175,7 @@ class SettingsService:
         for key in (
             "add_keyword_enabled",
             "query_keyword_enabled",
+            "burst_keyword_enabled",
             "aggregate_multiple",
             "random_send_count",
             "allow_bot_authors",
@@ -172,13 +184,19 @@ class SettingsService:
         ):
             if not isinstance(result.get(key), bool):
                 raise TypeError(f"{key} 必须是布尔值")
-        for key in ("add_keywords", "query_keywords"):
+        for key in ("add_keywords", "query_keywords", "burst_keywords"):
             raw = result.get(key)
             if not isinstance(raw, list):
                 raise TypeError(f"{key} 必须是列表")
             cleaned = [str(item).strip() for item in raw if str(item).strip()]
             result[key] = list(dict.fromkeys(cleaned))
-        for key in ("add_roles", "query_roles", "info_roles", "delete_roles"):
+        for key in (
+            "add_roles",
+            "query_roles",
+            "burst_roles",
+            "info_roles",
+            "delete_roles",
+        ):
             result[key] = cls._roles(result.get(key), key)
         for key in (
             "group_blacklist",
