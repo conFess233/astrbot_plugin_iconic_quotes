@@ -94,6 +94,7 @@ class IconicQuotesPlugin(Star):
             ("audit", self.web.audit, ["GET"], "删除审计"),
             ("config", self.web.get_config, ["GET"], "读取配置"),
             ("config/save", self.web.save_config, ["POST"], "保存配置"),
+            ("aliases/preview", self.web.preview_aliases, ["POST"], "预览作者别名影响"),
             ("backup/export", self.web.export, ["GET"], "导出备份"),
             ("backup/import", self.web.import_backup, ["POST"], "预检导入备份"),
             (

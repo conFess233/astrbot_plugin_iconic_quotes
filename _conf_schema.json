@@ -202,6 +202,12 @@
     "default": {},
     "hint": "建议通过群典管理页面编辑。"
   },
+  "author_aliases": {
+    "description": "合并转发作者别名",
+    "type": "dict",
+    "default": {},
+    "hint": "按群号和 QQ 号配置，建议通过群典管理页面编辑；只影响合并转发节点和回复快照。"
+  },
   "global_cooldown_ms": {
     "description": "全局冷却毫秒",
     "type": "int",

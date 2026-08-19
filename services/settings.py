@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+from ..utils.hashing import normalize_search
 from ..utils.validation import sanitize_custom_css, validate_numeric_id
 
 ROLE_VALUES = {"bot_admin", "owner", "admin", "member", "everyone"}
@@ -71,6 +72,8 @@ DEFAULTS: dict[str, Any] = {
     "user_whitelist": [],
     "excluded_author_ids": [],
     "group_overrides": {},
+    # 作者别名只用于合并转发节点和回复快照，不会改写普通消息作者。
+    "author_aliases": {},
     "global_cooldown_ms": 1000,
     "cooldown_message": "群典功能冷却中...",
     "delete_preview_limit": 20,
@@ -138,6 +141,42 @@ class SettingsService:
         if any(role not in ROLE_VALUES for role in roles):
             raise ValueError(f"{label} 包含未知角色")
         return list(dict.fromkeys(roles))
+
+    @staticmethod
+    def _author_aliases(value: Any) -> dict[str, dict[str, list[str]]]:
+        """校验群级作者别名，并阻止同一规范化别名指向多个 QQ。"""
+        if not isinstance(value, dict):
+            raise TypeError("author_aliases 必须是对象")
+        cleaned: dict[str, dict[str, list[str]]] = {}
+        for raw_group_id, raw_targets in value.items():
+            group_id = validate_numeric_id(raw_group_id, "作者别名群号")
+            if not isinstance(raw_targets, dict):
+                raise TypeError(f"群 {group_id} 的作者别名必须是对象")
+            owners: dict[str, str] = {}
+            targets: dict[str, list[str]] = {}
+            for raw_user_id, raw_aliases in raw_targets.items():
+                user_id = validate_numeric_id(raw_user_id, "作者别名 QQ")
+                if not isinstance(raw_aliases, list):
+                    raise TypeError(f"QQ {user_id} 的作者别名必须是列表")
+                aliases: list[str] = []
+                for raw_alias in raw_aliases:
+                    alias = str(raw_alias).strip()
+                    if not alias or len(alias) > 100:
+                        raise ValueError("作者别名不能为空且不能超过 100 个字符")
+                    normalized = normalize_search(alias)
+                    owner = owners.get(normalized)
+                    if owner and owner != user_id:
+                        raise ValueError(
+                            f"群 {group_id} 的别名“{alias}”不能同时绑定多个 QQ"
+                        )
+                    owners[normalized] = user_id
+                    if alias not in aliases:
+                        aliases.append(alias)
+                if aliases:
+                    targets[user_id] = aliases
+            if targets:
+                cleaned[group_id] = targets
+        return cleaned
 
     @classmethod
     def _validate(
@@ -242,6 +281,7 @@ class SettingsService:
                     key: validated[key] for key in raw_override
                 }
             result["group_overrides"] = cleaned_overrides
+        result["author_aliases"] = cls._author_aliases(result.get("author_aliases", {}))
         result["card_custom_css"] = sanitize_custom_css(
             str(result.get("card_custom_css") or "")
         )

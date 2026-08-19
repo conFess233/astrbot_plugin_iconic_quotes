@@ -184,6 +184,9 @@ const CONFIG_SECTIONS = [
     { key: "user_blacklist", label: "用户黑名单", type: "list" }, { key: "user_whitelist", label: "用户白名单", type: "list" },
     { key: "excluded_author_ids", label: "不记录的发送者 ID", type: "list", full: true },
   ]},
+  { id: "aliases", title: "作者别名", description: "仅纠正合并转发节点和回复快照；格式为 群号 → QQ → 别名列表。保存前会预览影响范围。", icon: "groups", fields: [
+    { key: "author_aliases", label: "群级作者别名", type: "alias-map", full: true, hint: "同群同名不能绑定多个 QQ；每行填写一个完整昵称或旧昵称。" },
+  ]},
   { id: "card", title: "卡片样式", description: "控制图片卡片尺寸与自定义 CSS。", icon: "image", fields: [
     { key: "localize_avatars", label: "本地化卡片头像", type: "boolean", hint: "仅用于卡片与后台，合并转发头像仍由 QQ 解析。" },
     { key: "avatar_cache_ttl_days", label: "头像缓存有效天数", type: "number", min: 0, max: 3650, hint: "设为 0 时不自动刷新。" },
@@ -209,6 +212,37 @@ const OVERRIDE_FIELDS = ALL_FIELDS.filter((field) => OVERRIDE_KEYS.has(field.key
 function normalizeList(value) { return Array.isArray(value) ? value : []; }
 function parseList(value) { return [...new Set(value.split(/\r?\n|,/).map((x) => x.trim()).filter(Boolean))]; }
 
+function renderAliasMap(value, onChange) {
+  const root = element("div", "alias-editor"); const rows = element("div", "alias-rows");
+  const entries = Object.entries(value || {}).flatMap(([groupId, targets]) => Object.entries(targets || {}).map(([userId, aliases]) => ({ groupId, userId, aliases: normalizeList(aliases) })));
+  function commit() {
+    const result = {};
+    entries.forEach((entry) => {
+      if (!/^\d+$/.test(entry.groupId) || !/^\d+$/.test(entry.userId) || !entry.aliases.length) return;
+      result[entry.groupId] ||= {}; result[entry.groupId][entry.userId] = entry.aliases;
+    });
+    onChange(result);
+  }
+  function draw() {
+    rows.replaceChildren();
+    entries.forEach((entry, index) => {
+      const row = element("div", "alias-row");
+      const group = document.createElement("input"); group.inputMode = "numeric"; group.placeholder = "群号"; group.value = entry.groupId;
+      const user = document.createElement("input"); user.inputMode = "numeric"; user.placeholder = "QQ 号"; user.value = entry.userId;
+      const aliases = document.createElement("textarea"); aliases.rows = 3; aliases.placeholder = "每行一个昵称"; aliases.value = entry.aliases.join("\n");
+      const remove = element("button", "btn btn-danger-tonal", "删除"); remove.type = "button"; remove.prepend(icon("delete"));
+      group.addEventListener("input", () => { entry.groupId = group.value.trim(); commit(); });
+      user.addEventListener("input", () => { entry.userId = user.value.trim(); commit(); });
+      aliases.addEventListener("input", () => { entry.aliases = parseList(aliases.value); commit(); });
+      remove.addEventListener("click", () => { entries.splice(index, 1); commit(); draw(); });
+      row.append(group, user, aliases, remove); rows.append(row);
+    });
+  }
+  const add = element("button", "btn btn-tonal", "添加作者别名"); add.type = "button";
+  add.addEventListener("click", () => { entries.push({ groupId: "", userId: "", aliases: [] }); draw(); });
+  root.append(rows, add); draw(); return root;
+}
+
 function renderControl(field, value, onChange, idPrefix = "global") {
   const id = `${idPrefix}-${field.key}`;
   if (field.type === "boolean") {
@@ -226,17 +260,26 @@ function renderControl(field, value, onChange, idPrefix = "global") {
       label.append(input, document.createTextNode(name)); grid.append(label);
     }); return grid;
   }
+  if (field.type === "alias-map") return renderAliasMap(value, onChange);
   if (field.type === "select") {
     const select = document.createElement("select"); select.id = id;
     field.options.forEach(([optionValue, name]) => { const option = element("option", "", name); option.value = optionValue; option.selected = optionValue === value; select.append(option); });
     select.addEventListener("change", () => onChange(select.value)); return select;
   }
-  const input = field.type === "textarea" || field.type === "list" ? document.createElement("textarea") : document.createElement("input");
+  const input = ["textarea", "list", "json"].includes(field.type) ? document.createElement("textarea") : document.createElement("input");
   input.id = id;
   if (field.type === "number") { input.type = "number"; input.min = field.min; input.max = field.max; input.value = value ?? ""; }
   else if (field.type === "list") { input.rows = 4; input.value = normalizeList(value).join("\n"); }
+  else if (field.type === "json") { input.rows = 10; input.value = JSON.stringify(value || {}, null, 2); }
   else { if (input.tagName === "INPUT") input.type = "text"; input.value = value ?? ""; if (field.type === "textarea") input.rows = 10; }
-  input.addEventListener("input", () => onChange(field.type === "number" ? Number(input.value) : field.type === "list" ? parseList(input.value) : input.value));
+  input.addEventListener("input", () => {
+    if (field.type === "json") {
+      try { onChange(JSON.parse(input.value)); input.setCustomValidity(""); }
+      catch { input.setCustomValidity("请输入有效 JSON"); }
+      return;
+    }
+    onChange(field.type === "number" ? Number(input.value) : field.type === "list" ? parseList(input.value) : input.value);
+  });
   return input;
 }
 
@@ -428,7 +471,15 @@ function applyAdvancedJson() {
 
 async function saveConfig() {
   if (!applyAdvancedJson()) return;
-  try { const saved = await task(() => bridge.apiPost("config/save", state.draft)); state.config = structuredClone(saved); state.draft = structuredClone(saved); setDirty(false); renderConfig(); notify("配置已校验、保存并热更新。"); } catch (error) { notify(error.message, true); }
+  try {
+    const aliasesChanged = JSON.stringify(state.config?.author_aliases || {}) !== JSON.stringify(state.draft.author_aliases || {});
+    if (aliasesChanged) {
+      const preview = await task(() => bridge.apiPost("aliases/preview", { author_aliases: state.draft.author_aliases || {} }));
+      const message = `此次修改会影响 ${preview.affected_records} 条记录中的 ${preview.affected_nodes} 个作者节点。确定保存吗？`;
+      if (!await confirmAction("确认修改作者别名", message)) return;
+    }
+    const saved = await task(() => bridge.apiPost("config/save", state.draft)); state.config = structuredClone(saved); state.draft = structuredClone(saved); setDirty(false); renderConfig(); notify("配置已校验、保存并热更新。");
+  } catch (error) { notify(error.message, true); }
 }
 
 async function loadAudit() { const data = await bridge.apiGet("audit", { limit: 1000 }); state.audit = (data.items || []).slice().sort((a, b) => String(b.deleted_at).localeCompare(String(a.deleted_at))); renderAudit(); }
@@ -470,14 +521,14 @@ async function deleteForwardNode(record, node, path) {
   } catch (error) { notify(error.message, true); }
 }
 
-function showImportInspection(inspection) { const fields = [["新增记录", inspection.added], ["重复跳过", inspection.duplicates], ["ID 冲突", inspection.conflicts], ["新增图片", formatBytes(inspection.image_bytes)]]; const box = $("#import-inspection"); box.hidden = false; box.replaceChildren(...fields.map(([label, value]) => { const item = element("div", "inspection-item"); item.append(element("span", "", label), element("strong", "", String(value ?? 0))); return item; })); }
+function showImportInspection(inspection) { const fields = [["新增记录", inspection.added], ["重复跳过", inspection.duplicates], ["ID 冲突", inspection.conflicts], ["新增图片", formatBytes(inspection.image_bytes)], ["备份作者别名（未恢复配置时跳过）", inspection.alias_count]]; const box = $("#import-inspection"); box.hidden = false; box.replaceChildren(...fields.map(([label, value]) => { const item = element("div", "inspection-item"); item.append(element("span", "", label), element("strong", "", String(value ?? 0))); return item; })); }
 
 async function inspectAndImport() {
   const file = $("#import-file").files[0]; if (!file) return notify("请先选择 ZIP 备份。", true);
   try { const inspection = await task(() => bridge.upload("backup/import", file)); showImportInspection(inspection); if (inspection.missing_images) return notify(`预检失败：缺少 ${inspection.missing_images} 张被记录引用的图片。`, true);
     const summary = `将新增 ${inspection.added} 条，跳过重复 ${inspection.duplicates} 条，跳过 ID 冲突 ${inspection.conflicts} 条，新增图片 ${formatBytes(inspection.image_bytes)}。`;
     if (!await confirmAction("确认导入备份", `${summary} 确认执行合并吗？`)) return;
-    const result = await task(() => bridge.apiPost("backup/import/commit", { token: inspection.token, restore_settings: $("#restore-settings").checked })); notify(`导入完成：新增 ${result.added} 条，跳过重复 ${result.duplicates} 条。`); await task(() => Promise.all([loadStats(), loadConfig()]));
+    const result = await task(() => bridge.apiPost("backup/import/commit", { token: inspection.token, restore_settings: $("#restore-settings").checked })); const skipped = result.aliases_skipped ? `，未恢复 ${result.aliases_skipped} 个作者别名` : ""; notify(`导入完成：新增 ${result.added} 条，跳过重复 ${result.duplicates} 条${skipped}。`); await task(() => Promise.all([loadStats(), loadConfig()]));
   } catch (error) { notify(error.message, true); }
 }
 

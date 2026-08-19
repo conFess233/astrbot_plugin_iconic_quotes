@@ -164,3 +164,7 @@ dialog { width: min(430px, calc(100% - 28px)); padding: 0; border: 1px solid var
 .forward-node-head h3 { flex: 1; gap: 8px; }
 .node-delete { flex: none; padding: 6px 9px; font-size: 11px; }
 #dialog-message { max-height: 45vh; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.alias-editor, .alias-rows { display: grid; gap: 12px; }
+.alias-row { display: grid; grid-template-columns: minmax(130px, .8fr) minmax(130px, .8fr) minmax(220px, 2fr) auto; gap: 10px; align-items: start; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); }
+.alias-row textarea { min-height: 76px; resize: vertical; }
+@media (max-width: 780px) { .alias-row { grid-template-columns: 1fr; } }

@@ -268,6 +268,80 @@ class WebManager:
         except (TypeError, ValueError) as exc:
             return error_response(str(exc))
 
+    async def preview_aliases(self):
+        """保存别名前只返回受影响记录/节点数量，不泄露群典正文。"""
+        if not self._authenticated():
+            return error_response("未登录 Dashboard", status_code=401)
+        payload = await request.json(default={})
+        try:
+            if not isinstance(payload, dict):
+                raise TypeError("请求格式无效")
+            candidate = SettingsService._author_aliases(
+                payload.get("author_aliases", {})
+            )
+            current = self.settings.global_settings().get("author_aliases", {})
+            affected_records = 0
+            affected_nodes = 0
+            for group_id in sorted(set(current) | set(candidate)):
+                old_map = self._alias_map(current.get(group_id, {}))
+                new_map = self._alias_map(candidate.get(group_id, {}))
+                for record in await self.storage.records(group_id):
+                    changed = self._alias_changes_in_record(record, old_map, new_map)
+                    affected_nodes += changed
+                    affected_records += int(changed > 0)
+            return json_response(
+                {
+                    "affected_records": affected_records,
+                    "affected_nodes": affected_nodes,
+                }
+            )
+        except (TypeError, ValueError, StorageError) as exc:
+            return error_response(str(exc))
+
+    @staticmethod
+    def _alias_map(group: dict[str, list[str]]) -> dict[str, str]:
+        return {
+            normalize_search(alias): str(user_id)
+            for user_id, aliases in group.items()
+            for alias in aliases
+        }
+
+    @classmethod
+    def _alias_changes_in_record(
+        cls,
+        record: QuoteRecord,
+        old: dict[str, str],
+        new: dict[str, str],
+    ) -> int:
+        """只统计别名允许覆盖的转发节点与回复快照。"""
+        changed = cls._alias_changes_in_reply(record.reply, old, new)
+        for node in record.nodes:
+            changed += cls._alias_changes_in_node(node, old, new)
+        return changed
+
+    @classmethod
+    def _alias_changes_in_node(
+        cls, node: Any, old: dict[str, str], new: dict[str, str]
+    ) -> int:
+        key = normalize_search(node.author.nickname)
+        changed = int(old.get(key) != new.get(key))
+        changed += cls._alias_changes_in_reply(node.reply, old, new)
+        for nested in node.nested_forwards:
+            for child in nested.nodes:
+                changed += cls._alias_changes_in_node(child, old, new)
+        return changed
+
+    @classmethod
+    def _alias_changes_in_reply(
+        cls, reply: Any, old: dict[str, str], new: dict[str, str]
+    ) -> int:
+        if reply is None:
+            return 0
+        key = normalize_search(reply.author.nickname)
+        return int(old.get(key) != new.get(key)) + cls._alias_changes_in_reply(
+            reply.reply, old, new
+        )
+
     async def export(self):
         """下载不包含环境路径的完整 ZIP 备份。"""
         if not self._authenticated():
@@ -315,6 +389,12 @@ class WebManager:
             if portable:
                 probe = SettingsService(dict(self.config))
                 result["settings"] = probe.update_from_page(portable)
+            aliases = result.get("settings", {}).get("author_aliases", {})
+            result["alias_count"] = sum(
+                len(values)
+                for targets in aliases.values()
+                for values in targets.values()
+            )
             if result["missing_images"]:
                 temporary.unlink(missing_ok=True)
                 temporary = None
@@ -362,6 +442,14 @@ class WebManager:
             if bool(payload.get("restore_settings")) and result.get("settings"):
                 self.settings.update_from_page(result["settings"])
                 await self._save_config()
+                result["aliases_skipped"] = 0
+            else:
+                aliases = result.get("settings", {}).get("author_aliases", {})
+                result["aliases_skipped"] = sum(
+                    len(values)
+                    for targets in aliases.values()
+                    for values in targets.values()
+                )
             return json_response(result)
         except (OSError, TypeError, ValueError, StorageError) as exc:
             return error_response(str(exc))
