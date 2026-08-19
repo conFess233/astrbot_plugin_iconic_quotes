@@ -20,7 +20,8 @@ from ..models import QuoteRecord
 from ..utils.hashing import calculate_record_hash, normalize_search
 from ..utils.validation import identify_image, safe_storage_path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = {1, SCHEMA_VERSION}
 
 
 class StorageError(RuntimeError):
@@ -127,7 +128,7 @@ class QuoteStorage:
         if not isinstance(document, dict):
             raise StorageError("群典 JSON 根节点不是对象")
         version = document.get("schema_version")
-        if version != SCHEMA_VERSION:
+        if version not in SUPPORTED_SCHEMA_VERSIONS:
             if isinstance(version, int) and version > SCHEMA_VERSION:
                 raise StorageError("数据由更高版本插件创建，请先升级插件")
             raise StorageError(f"不支持的数据版本: {version}")
@@ -145,20 +146,38 @@ class QuoteStorage:
             if not record.id or record.id in seen_ids:
                 raise StorageError("记录 ID 为空或重复")
             seen_ids.add(record.id)
-            if (
-                len(record.content_hash) != 64
-                or any(ch not in "0123456789abcdef" for ch in record.content_hash.lower())
+            if len(record.content_hash) != 64 or any(
+                ch not in "0123456789abcdef" for ch in record.content_hash.lower()
             ):
                 raise StorageError("记录内容哈希无效")
-            if calculate_record_hash(record) != record.content_hash:
+            if (
+                calculate_record_hash(record, schema_version=version)
+                != record.content_hash
+            ):
                 raise StorageError("记录内容与哈希不一致")
-            if record.type == "message" and (record.author is None or not record.segments):
+            if record.type == "message" and (
+                record.author is None or (not record.segments and record.reply is None)
+            ):
                 raise StorageError("普通群典缺少作者或内容")
             if record.type == "forward" and (
-                not record.nodes or any(not node.segments for node in record.nodes)
+                not record.nodes
+                or any(
+                    not node.segments and node.reply is None for node in record.nodes
+                )
             ):
                 raise StorageError("合并转发缺少节点内容")
         return document
+
+    @staticmethod
+    def _upgrade_document(document: dict[str, Any]) -> None:
+        """在下一次业务写入时把 v1 内容哈希惰性升级到 v2。"""
+        if document.get("schema_version") == SCHEMA_VERSION:
+            return
+        records = [QuoteRecord.from_dict(raw) for raw in document["records"]]
+        for record in records:
+            record.content_hash = calculate_record_hash(record)
+        document["records"] = [record.to_dict() for record in records]
+        document["schema_version"] = SCHEMA_VERSION
 
     def _load_document_sync(self, group_id: str) -> dict[str, Any]:
         if group_id in self._broken_groups:
@@ -253,6 +272,7 @@ class QuoteStorage:
                 self._load_document_sync,
                 record.group_id,
             )
+            self._upgrade_document(document)
             records = [QuoteRecord.from_dict(raw) for raw in document["records"]]
             duplicate = next(
                 (item for item in records if item.content_hash == record.content_hash),
@@ -300,6 +320,7 @@ class QuoteStorage:
         """按已锁定的 ID 删除记录并清理无引用图片。"""
         async with self._maintenance_lock, self._lock(group_id):
             document = await asyncio.to_thread(self._load_document_sync, group_id)
+            self._upgrade_document(document)
             current = [QuoteRecord.from_dict(raw) for raw in document["records"]]
             selected = [record for record in current if record.id in record_ids]
             if len(selected) != len(record_ids):
@@ -346,6 +367,27 @@ class QuoteStorage:
         if not healthy:
             return [], broken
         return random.sample(healthy, min(count, len(healthy))), broken
+
+    async def records_for_user(
+        self,
+        group_id: str,
+        user_id: str,
+    ) -> tuple[list[QuoteRecord], int]:
+        """按添加时间返回用户参与的全部健康记录及损坏数量。"""
+        candidates = [
+            record
+            for record in await self.records(group_id)
+            if record.involves_user(user_id)
+        ]
+        healthy: list[QuoteRecord] = []
+        broken = 0
+        for record in candidates:
+            if await asyncio.to_thread(self._record_images_valid, record):
+                healthy.append(record)
+            else:
+                broken += 1
+        healthy.sort(key=lambda record: record.recorded_at)
+        return healthy, broken
 
     def _record_images_valid(self, record: QuoteRecord) -> bool:
         for segment in record.image_segments():
@@ -543,7 +585,13 @@ class QuoteStorage:
                 )
             except StorageError:
                 raise
-            except (OSError, KeyError, TypeError, ValueError, zipfile.BadZipFile) as exc:
+            except (
+                OSError,
+                KeyError,
+                TypeError,
+                ValueError,
+                zipfile.BadZipFile,
+            ) as exc:
                 raise StorageError("备份文件损坏或格式无效") from exc
 
     async def inspect_zip(
@@ -567,7 +615,13 @@ class QuoteStorage:
                 )
             except StorageError:
                 raise
-            except (OSError, KeyError, TypeError, ValueError, zipfile.BadZipFile) as exc:
+            except (
+                OSError,
+                KeyError,
+                TypeError,
+                ValueError,
+                zipfile.BadZipFile,
+            ) as exc:
                 raise StorageError("备份文件损坏或格式无效") from exc
 
     def _import_zip_sync(
@@ -658,10 +712,11 @@ class QuoteStorage:
                 self._validate_document(incoming, group_id)
                 current = self._load_document_sync(group_id)
                 original_documents[group_id] = json.loads(json.dumps(current))
+                self._upgrade_document(incoming)
+                self._upgrade_document(current)
                 hashes = {raw.get("content_hash") for raw in current["records"]}
                 ids = {
-                    raw.get("id"): raw.get("content_hash")
-                    for raw in current["records"]
+                    raw.get("id"): raw.get("content_hash") for raw in current["records"]
                 }
                 for raw in incoming["records"]:
                     if raw.get("content_hash") in hashes:
@@ -740,7 +795,10 @@ class QuoteStorage:
             for group_id in reversed(written_groups):
                 original = original_documents[group_id]
                 path = self._group_path(group_id)
-                if original["records"] or path.with_suffix(path.suffix + ".bak").exists():
+                if (
+                    original["records"]
+                    or path.with_suffix(path.suffix + ".bak").exists()
+                ):
                     with contextlib.suppress(Exception):
                         self._atomic_json_write(path, original, keep_backup=False)
                 else:

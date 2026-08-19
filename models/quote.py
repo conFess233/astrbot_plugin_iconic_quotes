@@ -26,19 +26,24 @@ class AuthorSnapshot:
 
 @dataclass(slots=True)
 class QuoteSegment:
-    """仅表示插件支持的文字或本地图片消息段。"""
+    """插件可持久化并重放的消息段。"""
 
-    type: Literal["text", "image"]
+    type: Literal["text", "image", "face", "sticker"]
     text: str | None = None
     path: str | None = None
     sha256: str | None = None
     mime: str | None = None
     size: int | None = None
+    face_id: str | None = None
+    emoji_package_id: str | None = None
+    emoji_id: str | None = None
+    key: str | None = None
+    summary: str | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> QuoteSegment:
         segment_type = str(value.get("type") or "")
-        if segment_type not in {"text", "image"}:
+        if segment_type not in {"text", "image", "face", "sticker"}:
             raise ValueError(f"不支持的消息段类型: {segment_type}")
         return cls(
             type=segment_type,
@@ -47,6 +52,51 @@ class QuoteSegment:
             sha256=value.get("sha256"),
             mime=value.get("mime"),
             size=value.get("size"),
+            face_id=(
+                str(value["face_id"])
+                if value.get("face_id") not in (None, "")
+                else None
+            ),
+            emoji_package_id=(
+                str(value["emoji_package_id"])
+                if value.get("emoji_package_id") not in (None, "")
+                else None
+            ),
+            emoji_id=(
+                str(value["emoji_id"])
+                if value.get("emoji_id") not in (None, "")
+                else None
+            ),
+            key=str(value["key"]) if value.get("key") not in (None, "") else None,
+            summary=(
+                str(value["summary"])
+                if value.get("summary") not in (None, "")
+                else None
+            ),
+        )
+
+
+@dataclass(slots=True)
+class ReplySnapshot:
+    """不依赖易失 OneBot 消息 ID 的本地回复快照。"""
+
+    author: AuthorSnapshot
+    segments: list[QuoteSegment]
+    reply: ReplySnapshot | None = None
+    truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> ReplySnapshot:
+        nested = value.get("reply")
+        return cls(
+            author=AuthorSnapshot.from_dict(value.get("author") or {}),
+            segments=[
+                QuoteSegment.from_dict(item)
+                for item in value.get("segments", [])
+                if isinstance(item, dict)
+            ],
+            reply=cls.from_dict(nested) if isinstance(nested, dict) else None,
+            truncated=bool(value.get("truncated", False)),
         )
 
 
@@ -57,6 +107,7 @@ class ForwardNode:
     author: AuthorSnapshot
     segments: list[QuoteSegment]
     source_sent_at: str | None = None
+    reply: ReplySnapshot | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> ForwardNode:
@@ -68,6 +119,11 @@ class ForwardNode:
                 if isinstance(item, dict)
             ],
             source_sent_at=value.get("source_sent_at"),
+            reply=(
+                ReplySnapshot.from_dict(value["reply"])
+                if isinstance(value.get("reply"), dict)
+                else None
+            ),
         )
 
 
@@ -87,6 +143,7 @@ class QuoteRecord:
     recorded_at: str = ""
     recorded_by: AuthorSnapshot = field(default_factory=AuthorSnapshot)
     identity_incomplete: bool = False
+    reply: ReplySnapshot | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """转换为可直接写入 JSON 的字典。"""
@@ -123,29 +180,92 @@ class QuoteRecord:
             recorded_at=str(value.get("recorded_at") or ""),
             recorded_by=AuthorSnapshot.from_dict(value.get("recorded_by") or {}),
             identity_incomplete=bool(value.get("identity_incomplete", False)),
+            reply=(
+                ReplySnapshot.from_dict(value["reply"])
+                if isinstance(value.get("reply"), dict)
+                else None
+            ),
         )
 
     def image_segments(self) -> list[QuoteSegment]:
-        """返回记录中全部图片段。"""
-        result = [segment for segment in self.segments if segment.type == "image"]
+        """返回正文与回复快照中的全部本地媒体段。"""
+        result = [
+            segment for segment in self.segments if segment.type in {"image", "sticker"}
+        ]
+        result.extend(self._reply_media(self.reply))
         for node in self.nodes:
             result.extend(
-                segment for segment in node.segments if segment.type == "image"
+                segment
+                for segment in node.segments
+                if segment.type in {"image", "sticker"}
             )
+            result.extend(self._reply_media(node.reply))
         return result
+
+    @classmethod
+    def _reply_media(cls, reply: ReplySnapshot | None) -> list[QuoteSegment]:
+        if reply is None:
+            return []
+        return [
+            segment
+            for segment in reply.segments
+            if segment.type in {"image", "sticker"}
+        ] + cls._reply_media(reply.reply)
 
     def searchable_text(self) -> str:
         """返回仅由正文组成的删除搜索文本。"""
         parts = [
             segment.text or "" for segment in self.segments if segment.type == "text"
         ]
+        parts.extend(self._reply_text(self.reply))
         for node in self.nodes:
             parts.extend(
                 segment.text or ""
                 for segment in node.segments
                 if segment.type == "text"
             )
+            parts.extend(self._reply_text(node.reply))
         return "\n".join(part for part in parts if part)
+
+    @classmethod
+    def _reply_text(cls, reply: ReplySnapshot | None) -> list[str]:
+        if reply is None:
+            return []
+        return [
+            segment.text or "" for segment in reply.segments if segment.type == "text"
+        ] + cls._reply_text(reply.reply)
+
+    def has_native_segments(self) -> bool:
+        """返回记录是否包含不适合 CSS 卡片表达的原生消息段。"""
+        return (
+            any(segment.type in {"face", "sticker"} for segment in self._all_segments())
+            or self.reply is not None
+            or any(node.reply is not None for node in self.nodes)
+        )
+
+    def has_stickers(self) -> bool:
+        """判断正文或回复快照中是否包含商城表情。"""
+        return any(segment.type == "sticker" for segment in self._all_segments())
+
+    def _all_segments(self) -> list[QuoteSegment]:
+        result = list(self.segments)
+        result.extend(self._reply_segments(self.reply))
+        for node in self.nodes:
+            result.extend(node.segments)
+            result.extend(self._reply_segments(node.reply))
+        return result
+
+    @classmethod
+    def _reply_segments(cls, reply: ReplySnapshot | None) -> list[QuoteSegment]:
+        if reply is None:
+            return []
+        return list(reply.segments) + cls._reply_segments(reply.reply)
+
+    def involves_user(self, user_id: str) -> bool:
+        """判断用户是否是普通消息作者或聊天记录中的任一节点作者。"""
+        if self.type == "message":
+            return bool(self.author and self.author.user_id == user_id)
+        return any(node.author.user_id == user_id for node in self.nodes)
 
     def personal_owner_id(self) -> str | None:
         """返回可安全归入个人随机池的 QQ 号。"""

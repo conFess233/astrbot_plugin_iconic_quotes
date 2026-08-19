@@ -385,6 +385,8 @@ class WebManager:
             )
             if record.type != "message":
                 raise ValueError("合并转发不生成卡片预览")
+            if record.has_native_segments():
+                raise ValueError("包含表情、贴纸或回复快照的记录不生成 CSS 卡片")
             paths = await self.renderer.card_paths(
                 record, self.settings.for_group(group_id)
             )

@@ -6,6 +6,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,13 @@ from typing import Any
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 
-from ..models import AuthorSnapshot, ForwardNode, QuoteRecord, QuoteSegment
+from ..models import (
+    AuthorSnapshot,
+    ForwardNode,
+    QuoteRecord,
+    QuoteSegment,
+    ReplySnapshot,
+)
 from ..utils.hashing import calculate_record_hash
 from .permissions import call_onebot_action
 from .storage import QuoteStorage, StorageError
@@ -21,6 +28,21 @@ from .storage import QuoteStorage, StorageError
 
 class CaptureError(RuntimeError):
     """表示无法完整、可靠地收录本次消息。"""
+
+
+@dataclass(slots=True)
+class _RawReply:
+    message_id: str
+
+
+@dataclass(slots=True)
+class _RawSticker:
+    file: str
+    url: str
+    emoji_package_id: str
+    emoji_id: str
+    key: str
+    summary: str
 
 
 def _utc_iso(timestamp: Any = None) -> str | None:
@@ -43,6 +65,17 @@ def _raw_component(value: dict[str, Any]) -> Any:
     data = value.get("data") if isinstance(value.get("data"), dict) else {}
     if component_type == "text":
         return Comp.Plain(str(data.get("text") or ""))
+    if component_type in {"image", "mface"} and (
+        component_type == "mface" or data.get("emoji_id")
+    ):
+        return _RawSticker(
+            file=str(data.get("file") or data.get("url") or ""),
+            url=str(data.get("url") or ""),
+            emoji_package_id=str(data.get("emoji_package_id") or ""),
+            emoji_id=str(data.get("emoji_id") or ""),
+            key=str(data.get("key") or ""),
+            summary=str(data.get("summary") or "[商城表情]"),
+        )
     if component_type == "image":
         return Comp.Image(
             file=str(data.get("file") or data.get("url") or ""),
@@ -50,6 +83,13 @@ def _raw_component(value: dict[str, Any]) -> Any:
         )
     if component_type == "at":
         return Comp.At(qq=data.get("qq", ""), name=data.get("name", ""))
+    if component_type == "face":
+        try:
+            return Comp.Face(id=int(data.get("id")))
+        except (TypeError, ValueError):
+            return None
+    if component_type == "reply":
+        return _RawReply(str(data.get("id") or data.get("message_id") or ""))
     if component_type == "forward":
         return Comp.Forward(id=str(data.get("id") or ""))
     if component_type == "node":
@@ -122,17 +162,25 @@ class OneBotQuoteExtractor:
         )
         sent_at = _utc_iso(getattr(reply, "time", None))
         source_id = str(getattr(reply, "id", "") or "") or None
-        if not chain and source_id:
-            payload = await self._get_message(event, source_id)
-            chain = self._payload_components(payload)
-            sender = (
-                payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
-            )
-            author = _as_author(
-                sender.get("user_id") or payload.get("user_id"),
-                sender.get("card") or sender.get("nickname"),
-            )
-            sent_at = _utc_iso(payload.get("time")) or sent_at
+        if source_id:
+            try:
+                payload = await self._get_message(event, source_id)
+                payload_chain = self._payload_components(payload)
+                if payload_chain:
+                    chain = payload_chain
+                sender = (
+                    payload.get("sender")
+                    if isinstance(payload.get("sender"), dict)
+                    else {}
+                )
+                author = _as_author(
+                    sender.get("user_id") or payload.get("user_id"),
+                    sender.get("card") or sender.get("nickname"),
+                )
+                sent_at = _utc_iso(payload.get("time")) or sent_at
+            except CaptureError:
+                if not chain:
+                    raise
         nested_sources = [
             item
             for item in chain
@@ -151,6 +199,14 @@ class OneBotQuoteExtractor:
             )
         await self._check_author_allowed(event, group_id, author, settings)
         counter = [0]
+        reply_snapshot = await self._capture_reply_from_chain(
+            event,
+            chain,
+            group_id,
+            settings,
+            counter,
+            visited={source_id} if source_id else set(),
+        )
         segments, ignored = await self._segments(
             chain,
             group_id,
@@ -159,9 +215,14 @@ class OneBotQuoteExtractor:
             nested_forbidden=True,
         )
         self.last_ignored_segments += ignored
-        if not segments:
-            raise CaptureError("引用消息没有可保存的文字或图片")
-        self._validate_text_limits(segments, settings["max_text_chars"])
+        if not segments and reply_snapshot is None:
+            raise CaptureError("引用消息没有可保存的文字、图片或表情")
+        text_length = self._validate_text_limits(segments, settings["max_text_chars"])
+        if (
+            text_length + self._reply_text_length(reply_snapshot)
+            > settings["max_forward_text_chars"]
+        ):
+            raise CaptureError("消息与回复链累计文字长度超过配置上限")
         return QuoteRecord(
             id=uuid.uuid4().hex,
             type="message",
@@ -173,6 +234,7 @@ class OneBotQuoteExtractor:
             recorded_at=datetime.now(UTC).isoformat(),
             recorded_by=operator,
             identity_incomplete=author.user_id is None,
+            reply=reply_snapshot,
         )
 
     async def _from_forward_component(
@@ -204,6 +266,14 @@ class OneBotQuoteExtractor:
         for raw_node in raw_nodes:
             author, chain, sent_at = self._parse_forward_node(raw_node)
             await self._check_author_allowed(event, group_id, author, settings)
+            reply_snapshot = await self._capture_reply_from_chain(
+                event,
+                chain,
+                group_id,
+                settings,
+                image_counter,
+                visited=set(),
+            )
             segments, ignored = await self._segments(
                 chain,
                 group_id,
@@ -212,12 +282,17 @@ class OneBotQuoteExtractor:
                 nested_forbidden=True,
             )
             self.last_ignored_segments += ignored
-            if not segments:
+            if not segments and reply_snapshot is None:
                 raise CaptureError("合并转发包含无法保存的空节点")
             node_text = self._validate_text_limits(segments, settings["max_text_chars"])
-            total_text += node_text
+            total_text += node_text + self._reply_text_length(reply_snapshot)
             nodes.append(
-                ForwardNode(author=author, segments=segments, source_sent_at=sent_at)
+                ForwardNode(
+                    author=author,
+                    segments=segments,
+                    source_sent_at=sent_at,
+                    reply=reply_snapshot,
+                )
             )
         if total_text > settings["max_forward_text_chars"]:
             raise CaptureError("合并转发累计文字长度超过配置上限")
@@ -266,7 +341,9 @@ class OneBotQuoteExtractor:
                     if isinstance(payload, dict):
                         return payload
                 except Exception as exc:  # noqa: BLE001 - OneBot 实现异常类型不统一。
-                    logger.debug("读取合并转发失败: action=get_forward_msg error=%s", exc)
+                    logger.debug(
+                        "读取合并转发失败: action=get_forward_msg error=%s", exc
+                    )
         raise CaptureError("无法读取合并转发，消息可能已过期")
 
     @staticmethod
@@ -374,14 +451,140 @@ class OneBotQuoteExtractor:
                 except (OSError, ValueError, StorageError) as exc:
                     raise CaptureError(f"图片保存失败: {exc}") from exc
                 result.append(QuoteSegment.from_dict(saved))
+            elif isinstance(component, Comp.Face):
+                face_id = str(getattr(component, "id", "") or "").strip()
+                if not face_id:
+                    raise CaptureError("QQ 表情缺少表情 ID")
+                result.append(QuoteSegment(type="face", face_id=face_id))
+            elif isinstance(component, _RawSticker):
+                image_counter[0] += 1
+                if image_counter[0] > settings["max_images_per_record"]:
+                    raise CaptureError("图片与贴纸数量超过配置上限")
+                try:
+                    image = Comp.Image(file=component.file, url=component.url)
+                    image_path = await image.convert_to_file_path()
+                    data = await asyncio.to_thread(Path(image_path).read_bytes)
+                    saved = await self.storage.save_image(
+                        group_id,
+                        data,
+                        max_image_bytes=settings["max_image_mb"] * 1024 * 1024,
+                        max_media_bytes=settings["max_media_mb"] * 1024 * 1024,
+                    )
+                except (OSError, ValueError, StorageError) as exc:
+                    raise CaptureError(f"贴纸保存失败: {exc}") from exc
+                sticker = QuoteSegment.from_dict(saved)
+                sticker.type = "sticker"
+                sticker.emoji_package_id = component.emoji_package_id or None
+                sticker.emoji_id = component.emoji_id or None
+                sticker.key = component.key or None
+                sticker.summary = component.summary or None
+                result.append(sticker)
             elif isinstance(component, (Comp.Forward, Comp.Node, Comp.Nodes)):
                 if nested_forbidden:
                     raise CaptureError("暂不支持嵌套合并转发")
-            elif isinstance(component, Comp.Reply):
+            elif isinstance(component, (Comp.Reply, _RawReply)):
                 continue
             else:
                 ignored += 1
         return result, ignored
+
+    async def _capture_reply_from_chain(
+        self,
+        event: Any,
+        chain: list[Any],
+        group_id: str,
+        settings: dict[str, Any],
+        image_counter: list[int],
+        *,
+        visited: set[str],
+        depth: int = 1,
+    ) -> ReplySnapshot | None:
+        replies = [item for item in chain if isinstance(item, (Comp.Reply, _RawReply))]
+        if len(replies) > 1:
+            raise CaptureError("消息包含多个回复来源，无法可靠本地化")
+        if not replies:
+            return None
+        component = replies[0]
+        message_id = (
+            component.message_id
+            if isinstance(component, _RawReply)
+            else str(getattr(component, "id", "") or "")
+        )
+        if not message_id:
+            raise CaptureError("回复关系缺少可读取的消息 ID")
+        if message_id in visited:
+            return ReplySnapshot(
+                author=AuthorSnapshot(nickname="更早的回复"),
+                segments=[],
+                truncated=True,
+            )
+        next_visited = {*visited, message_id}
+        fallback_chain = (
+            list(getattr(component, "chain", None) or [])
+            if isinstance(component, Comp.Reply)
+            else []
+        )
+        try:
+            payload = await self._get_message(event, message_id)
+            reply_chain = self._payload_components(payload) or fallback_chain
+            sender = (
+                payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
+            )
+            author = _as_author(
+                sender.get("user_id") or payload.get("user_id"),
+                sender.get("card") or sender.get("nickname"),
+            )
+        except CaptureError:
+            if not fallback_chain:
+                raise CaptureError("无法读取被回复消息，回复快照保存失败") from None
+            reply_chain = fallback_chain
+            author = _as_author(
+                getattr(component, "sender_id", None),
+                getattr(component, "sender_nickname", None),
+            )
+        await self._check_author_allowed(event, group_id, author, settings)
+        segments, ignored = await self._segments(
+            reply_chain,
+            group_id,
+            settings,
+            image_counter,
+            nested_forbidden=True,
+        )
+        self.last_ignored_segments += ignored
+        nested_exists = any(
+            isinstance(item, (Comp.Reply, _RawReply)) for item in reply_chain
+        )
+        truncated = nested_exists and depth >= settings["max_reply_depth"]
+        nested = None
+        if nested_exists and not truncated:
+            nested = await self._capture_reply_from_chain(
+                event,
+                reply_chain,
+                group_id,
+                settings,
+                image_counter,
+                visited=next_visited,
+                depth=depth + 1,
+            )
+        if not segments and nested is None and not truncated:
+            raise CaptureError("被回复消息没有可保存的文字、图片或表情")
+        self._validate_text_limits(segments, settings["max_text_chars"])
+        return ReplySnapshot(
+            author=author,
+            segments=segments,
+            reply=nested,
+            truncated=truncated,
+        )
+
+    @classmethod
+    def _reply_text_length(cls, reply: ReplySnapshot | None) -> int:
+        if reply is None:
+            return 0
+        return sum(
+            len(segment.text or "")
+            for segment in reply.segments
+            if segment.type == "text"
+        ) + cls._reply_text_length(reply.reply)
 
     @staticmethod
     def _validate_text_limits(segments: list[QuoteSegment], limit: int) -> int:
@@ -425,7 +628,9 @@ class OneBotQuoteExtractor:
                 ):
                     is_bot = bool(payload.get("is_robot") or payload.get("is_bot"))
             except Exception as exc:  # noqa: BLE001 - 机器人标记不是 OneBot 11 标准字段。
-                logger.debug("无法读取群成员机器人标记: user=%s error=%s", author.user_id, exc)
+                logger.debug(
+                    "无法读取群成员机器人标记: user=%s error=%s", author.user_id, exc
+                )
             self._bot_cache[cache_key] = (time.monotonic() + 300, is_bot)
         if is_bot:
             raise CaptureError("配置不允许收录机器人发送的消息")

@@ -12,7 +12,7 @@ from typing import Any
 import aiohttp
 import astrbot.api.message_components as Comp
 
-from ..models import QuoteRecord, QuoteSegment
+from ..models import QuoteRecord, QuoteSegment, ReplySnapshot
 from ..utils.image_processing import trim_card_canvas
 from .storage import QuoteStorage
 
@@ -49,6 +49,27 @@ html, body { margin: 0; padding: 0; background: transparent; }
   </section>
 </article></body></html>
 """
+
+
+class MarketFaceComponent(Comp.BaseMessageComponent):
+    """AstrBot 尚未内建的 OneBot mface 发送组件。"""
+
+    type: Comp.ComponentType = Comp.ComponentType.Image
+    emoji_package_id: str
+    emoji_id: str
+    key: str
+    summary: str
+
+    def toDict(self) -> dict[str, Any]:
+        return {
+            "type": "mface",
+            "data": {
+                "emoji_package_id": self.emoji_package_id,
+                "emoji_id": self.emoji_id,
+                "key": self.key,
+                "summary": self.summary,
+            },
+        }
 
 
 class QuoteRenderer:
@@ -96,26 +117,33 @@ class QuoteRenderer:
             f"data:image/jpeg;base64,{base64.b64encode(data).decode()}" if data else ""
         )
 
-    def text_chain(self, record: QuoteRecord) -> list[Any]:
+    def text_chain(
+        self,
+        record: QuoteRecord,
+        *,
+        native_stickers: bool = True,
+    ) -> list[Any]:
         """构造保留原图顺序的文字发送链。"""
         if record.type != "message" or record.author is None:
             raise ValueError("文字链只适用于普通群典")
-        text = "".join(
-            segment.text or "" for segment in record.segments if segment.type == "text"
-        )
         nickname = record.author.nickname or record.author.user_id or "未知用户"
-        chain: list[Any] = []
-        if text:
+        chain = self._reply_to_components(
+            record.reply,
+            native_stickers=native_stickers,
+        )
+        if record.segments and all(
+            segment.type == "text" for segment in record.segments
+        ):
+            text = "".join(segment.text or "" for segment in record.segments)
             chain.append(Comp.Plain(f"“{text}”——{nickname}"))
-        for segment in record.segments:
-            if segment.type == "image" and segment.path:
-                chain.append(
-                    Comp.Image.fromFileSystem(
-                        self.storage.resolve_media_path(segment.path)
-                    )
-                )
-        if not text:
-            chain.append(Comp.Plain(f"——{nickname}"))
+            return chain
+        chain.extend(
+            self._segments_to_components(
+                record.segments,
+                native_stickers=native_stickers,
+            )
+        )
+        chain.append(Comp.Plain(f"——{nickname}"))
         return chain
 
     async def card_paths(
@@ -188,7 +216,11 @@ class QuoteRenderer:
             return "记录时间未知"
 
     def forward_nodes(
-        self, records: list[QuoteRecord], *, replay: bool = False
+        self,
+        records: list[QuoteRecord],
+        *,
+        replay: bool = False,
+        native_stickers: bool = True,
     ) -> list[Any]:
         """构造新聚合转发或原生转发回放节点。"""
         nodes: list[Any] = []
@@ -203,24 +235,28 @@ class QuoteRenderer:
                         Comp.Node(
                             uin=node.author.user_id or "0",
                             name=node.author.nickname or "未知用户",
-                            content=self._segments_to_components(node.segments),
+                            content=self._reply_to_components(
+                                node.reply,
+                                native_stickers=native_stickers,
+                            )
+                            + self._segments_to_components(
+                                node.segments,
+                                native_stickers=native_stickers,
+                            ),
                         )
                     )
                 continue
             assert record.author is not None
-            text = "".join(
-                segment.text or ""
-                for segment in record.segments
-                if segment.type == "text"
-            )
             nickname = record.author.nickname or record.author.user_id or "未知用户"
-            content: list[Any] = []
-            if text:
-                content.append(Comp.Plain(f"“{text}”"))
+            content = self._reply_to_components(
+                record.reply,
+                native_stickers=native_stickers,
+            )
             content.extend(
-                Comp.Image.fromFileSystem(self.storage.resolve_media_path(segment.path))
-                for segment in record.segments
-                if segment.type == "image" and segment.path
+                self._segments_to_components(
+                    record.segments,
+                    native_stickers=native_stickers,
+                )
             )
             nodes.append(
                 Comp.Node(
@@ -231,15 +267,173 @@ class QuoteRenderer:
             )
         return nodes
 
-    def _segments_to_components(self, segments: list[QuoteSegment]) -> list[Any]:
+    def burst_nodes(
+        self,
+        records: list[QuoteRecord],
+        *,
+        target_name: str,
+        total: int,
+        page: int,
+        pages: int,
+        skipped: int,
+        nested: bool,
+        native_stickers: bool,
+    ) -> list[Any]:
+        """构造按时间排列的个人完整群典合集。"""
+        title = f"聊天记录：{target_name}\n"
+        title += (
+            f"--------共 {total} 条｜第 {page} / {pages} 页--------"
+            if pages > 1
+            else f"-------------共 {total} 条-------------"
+        )
+        if skipped:
+            title += f"\n另有 {skipped} 条记录因资源不完整已跳过"
+        result: list[Any] = [
+            Comp.Node(uin="0", name="群典", content=[Comp.Plain(title)])
+        ]
+        for record in records:
+            timestamp = self._record_time(record.recorded_at)
+            if record.type == "message":
+                assert record.author is not None
+                content = [Comp.Plain(f"---------{timestamp}---------\n")]
+                content.extend(
+                    self._reply_to_components(
+                        record.reply,
+                        native_stickers=native_stickers,
+                    )
+                )
+                content.extend(
+                    self._segments_to_components(
+                        record.segments,
+                        native_stickers=native_stickers,
+                    )
+                )
+                content.append(Comp.Plain("\n-------------------------------------"))
+                result.append(
+                    Comp.Node(
+                        uin=record.author.user_id or "0",
+                        name=record.author.nickname
+                        or record.author.user_id
+                        or "未知用户",
+                        content=content,
+                    )
+                )
+                continue
+            inner = [
+                Comp.Node(
+                    uin=node.author.user_id or "0",
+                    name=node.author.nickname or node.author.user_id or "未知用户",
+                    content=self._reply_to_components(
+                        node.reply,
+                        native_stickers=native_stickers,
+                    )
+                    + self._segments_to_components(
+                        node.segments,
+                        native_stickers=native_stickers,
+                    ),
+                )
+                for node in record.nodes
+            ]
+            if nested:
+                result.append(
+                    Comp.Node(
+                        uin="0",
+                        name="聊天记录存档",
+                        content=[
+                            Comp.Plain(f"---------{timestamp}---------"),
+                            Comp.Nodes(inner),
+                            Comp.Plain("-------------------------------------"),
+                        ],
+                    )
+                )
+            else:
+                result.append(
+                    Comp.Node(
+                        uin="0",
+                        name="聊天记录存档",
+                        content=[Comp.Plain(f"---------{timestamp}---------")],
+                    )
+                )
+                result.extend(inner)
+                result.append(
+                    Comp.Node(
+                        uin="0",
+                        name="聊天记录存档",
+                        content=[Comp.Plain("-------------------------------------")],
+                    )
+                )
+        return result
+
+    def _segments_to_components(
+        self,
+        segments: list[QuoteSegment],
+        *,
+        native_stickers: bool = True,
+    ) -> list[Any]:
         result: list[Any] = []
         for segment in segments:
             if segment.type == "text" and segment.text:
                 result.append(Comp.Plain(segment.text))
-            elif segment.type == "image" and segment.path:
+            elif segment.type in {"image", "sticker"} and segment.path:
+                if (
+                    segment.type == "sticker"
+                    and native_stickers
+                    and segment.emoji_package_id
+                    and segment.emoji_id
+                    and segment.key
+                ):
+                    result.append(
+                        MarketFaceComponent(
+                            emoji_package_id=segment.emoji_package_id,
+                            emoji_id=segment.emoji_id,
+                            key=segment.key,
+                            summary=segment.summary or "[商城表情]",
+                        )
+                    )
+                    continue
                 result.append(
                     Comp.Image.fromFileSystem(
                         self.storage.resolve_media_path(segment.path)
                     )
                 )
+            elif segment.type == "face" and segment.face_id:
+                result.append(Comp.Face(id=int(segment.face_id)))
         return result
+
+    def _reply_to_components(
+        self,
+        reply: ReplySnapshot | None,
+        *,
+        native_stickers: bool,
+    ) -> list[Any]:
+        if reply is None:
+            return []
+        name = reply.author.nickname or reply.author.user_id or "未知用户"
+        result: list[Any] = [Comp.Plain(f"↩ 回复 {name}\n┌ ")]
+        result.extend(
+            self._segments_to_components(
+                reply.segments,
+                native_stickers=native_stickers,
+            )
+        )
+        if reply.reply:
+            result.append(Comp.Plain("\n"))
+            result.extend(
+                self._reply_to_components(
+                    reply.reply,
+                    native_stickers=native_stickers,
+                )
+            )
+        if reply.truncated:
+            result.append(Comp.Plain("\n更早的回复已省略"))
+        result.append(Comp.Plain("\n└\n"))
+        return result
+
+    @staticmethod
+    def _record_time(value: str) -> str:
+        try:
+            return (
+                datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            )
+        except (TypeError, ValueError):
+            return "记录时间未知"
