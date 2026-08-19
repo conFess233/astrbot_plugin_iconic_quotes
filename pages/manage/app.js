@@ -88,14 +88,16 @@ function dateParts(value) {
 }
 
 function authorOf(record) {
-  if (record.type === "forward") return { nickname: "合并转发", user_id: `${record.nodes?.length || 0} 个节点` };
+  if (record.type === "forward") return { nickname: "合并转发", user_id: `${forwardNodeCount(record.nodes || [])} 个节点` };
   return record.author || {};
 }
 
 function replySegments(reply) { return reply ? [...(reply.segments || []), ...replySegments(reply.reply)] : []; }
+function forwardNodeCount(nodes) { return (nodes || []).reduce((total, node) => total + 1 + (node.nested_forwards || []).reduce((sum, nested) => sum + forwardNodeCount(nested.nodes || []), 0), 0); }
+function nodeSegments(node) { return [...(node.segments || []), ...replySegments(node.reply), ...(node.nested_forwards || []).flatMap((nested) => (nested.nodes || []).flatMap(nodeSegments))]; }
 function segmentsOf(record) {
   if (record.type === "message") return [...(record.segments || []), ...replySegments(record.reply)];
-  return (record.nodes || []).flatMap((node) => [...(node.segments || []), ...replySegments(node.reply)]);
+  return (record.nodes || []).flatMap(nodeSegments);
 }
 
 function segmentText(segments) {
@@ -118,10 +120,13 @@ function replyText(reply) {
 
 function textOf(record) {
   if (record.type === "message") return [replyText(record.reply), segmentText(record.segments)].filter(Boolean).join(" · ");
-  return (record.nodes || []).map((node) => {
+  const nodeText = (node, depth = 0) => {
     const who = node.author?.nickname || node.author?.user_id || "未知发送者";
-    return `${who}：${[replyText(node.reply), segmentText(node.segments)].filter(Boolean).join(" · ")}`;
-  }).join(" · ") || "（空合并转发）";
+    const own = `${who}：${[replyText(node.reply), segmentText(node.segments)].filter(Boolean).join(" · ")}`;
+    const children = (node.nested_forwards || []).flatMap((nested) => (nested.nodes || []).map((child) => nodeText(child, depth + 1)));
+    return [depth ? `第 ${depth + 1} 层 ${own}` : own, ...children].join(" · ");
+  };
+  return (record.nodes || []).map((node) => nodeText(node)).join(" · ") || "（空合并转发）";
 }
 
 function imageSegments(record) { return segmentsOf(record).filter((x) => ["image", "sticker"].includes(x.type) && x.path); }
@@ -163,7 +168,9 @@ const CONFIG_SECTIONS = [
     { key: "max_forward_nodes", label: "转发节点上限", type: "number", min: 1, max: 200 },
     { key: "max_text_chars", label: "普通消息字符上限", type: "number", min: 1, max: 100000 },
     { key: "max_forward_text_chars", label: "转发消息字符上限", type: "number", min: 1, max: 1000000 },
+    { key: "max_query_keyword_chars", label: "群典查询关键词长度上限", type: "number", min: 1, max: 1000 },
     { key: "max_reply_depth", label: "回复快照最大深度", type: "number", min: 1, max: 10 },
+    { key: "max_nested_forward_depth", label: "嵌套转发最大深度", type: "number", min: 1, max: 10 },
     { key: "delete_preview_limit", label: "删除预览上限", type: "number", min: 1, max: 50 },
     { key: "audit_limit", label: "删除审计保留条数", type: "number", min: 1, max: 100000 },
   ]},
@@ -379,10 +386,24 @@ function appendReplyContent(parent, reply, depth = 1) {
   parent.append(box);
 }
 
+function appendForwardNode(parent, node, label, path) {
+  const nodeBox = element("section", "forward-node"); const head = element("div", "forward-node-head"); const heading = element("h3");
+  heading.append(document.createTextNode(node.author?.nickname || "未知发送者"), element("small", "", node.author?.user_id || label));
+  const remove = element("button", "btn btn-danger-tonal node-delete", "删除此条"); remove.type = "button"; remove.prepend(icon("delete")); remove.addEventListener("click", async (event) => { event.stopPropagation(); await deleteForwardNode(state.activeRecord, node, path); });
+  head.append(heading, remove); nodeBox.append(head); appendReplyContent(nodeBox, node.reply); appendSegmentContent(nodeBox, node.segments || []);
+  (node.nested_forwards || []).forEach((nested, nestedIndex) => {
+    const nestedBox = element("section", "forward-node");
+    nestedBox.append(element("h3", "", `嵌套聊天记录 ${nestedIndex + 1}`));
+    (nested.nodes || []).forEach((child, childIndex) => appendForwardNode(nestedBox, child, `子节点 ${childIndex + 1}`, [...path, nestedIndex, childIndex]));
+    nodeBox.append(nestedBox);
+  });
+  parent.append(nodeBox);
+}
+
 function openDrawer(record) {
   state.activeRecord = record; const author = authorOf(record); $("#drawer-title").textContent = author.nickname || (record.type === "forward" ? "合并转发" : "未知发送者"); const content = $("#drawer-content"); content.replaceChildren();
   const meta = element("div", "detail-meta"); [["群号", record.group_id], ["记录时间", dateParts(record.recorded_at).join(" ")], ["记录 ID", record.id], ["状态", record.broken ? "异常" : "正常"]].forEach(([label, value]) => { const item = element("div"); item.append(element("span", "", label), element("strong", "", String(value || "—"))); meta.append(item); }); content.append(meta);
-  if (record.type === "message") { const identity = element("div", "drawer-author"); identity.append(avatarElement(author.user_id), element("strong", "", author.nickname || author.user_id || "未知发送者")); content.append(identity); appendReplyContent(content, record.reply); appendSegmentContent(content, record.segments || []); } else (record.nodes || []).forEach((node, index) => { const nodeBox = element("section", "forward-node"); const heading = element("h3"); heading.append(document.createTextNode(node.author?.nickname || "未知发送者"), element("small", "", node.author?.user_id || `节点 ${index + 1}`)); nodeBox.append(heading); appendReplyContent(nodeBox, node.reply); appendSegmentContent(nodeBox, node.segments || []); content.append(nodeBox); });
+  if (record.type === "message") { const identity = element("div", "drawer-author"); identity.append(avatarElement(author.user_id), element("strong", "", author.nickname || author.user_id || "未知发送者")); content.append(identity); appendReplyContent(content, record.reply); appendSegmentContent(content, record.segments || []); } else (record.nodes || []).forEach((node, index) => appendForwardNode(content, node, `节点 ${index + 1}`, [index]));
   $("#drawer-preview").hidden = record.type !== "message" || segmentsOf(record).some((segment) => ["face", "sticker"].includes(segment.type)) || Boolean(record.reply); $("#drawer-backdrop").hidden = false; $("#record-drawer").classList.add("open"); $("#record-drawer").setAttribute("aria-hidden", "false");
 }
 
@@ -411,12 +432,14 @@ async function saveConfig() {
 }
 
 async function loadAudit() { const data = await bridge.apiGet("audit", { limit: 1000 }); state.audit = (data.items || []).slice().sort((a, b) => String(b.deleted_at).localeCompare(String(a.deleted_at))); renderAudit(); }
+function auditSourceLabel(source) { return ({ page: "后台页面", page_node: "后台节点", command: "群聊命令" })[source] || source || "—"; }
+function auditScopeLabel(item) { return item.source === "page_node" ? `路径 ${(item.node_path || []).join(" › ")} · ${item.removed_nodes || 0} 个节点${item.record_deleted ? " · 整条记录已移除" : ""}` : "整条记录"; }
 function renderAudit() {
   const group = $("#audit-group").value.trim().toLowerCase(); const operator = $("#audit-operator").value.trim().toLowerCase(); const source = $("#audit-source").value;
   const items = state.audit.filter((item) => (!group || String(item.group_id).toLowerCase().includes(group)) && (!operator || String(item.deleted_by).toLowerCase().includes(operator)) && (!source || item.source === source));
-  const rows = items.map((item) => { const tr = document.createElement("tr"); [item.deleted_at, item.group_id, item.record_id, item.deleted_by, item.source].forEach((value) => tr.append(element("td", "", String(value || "—")))); return tr; });
-  if (!rows.length) { const td = element("td", "empty-cell", "没有符合条件的审计记录"); td.colSpan = 5; const tr = document.createElement("tr"); tr.append(td); rows.push(tr); } $("#audit-rows").replaceChildren(...rows);
-  $("#audit-cards").replaceChildren(...items.map((item) => { const card = element("article", "record-card audit-card"); card.append(element("strong", "", item.deleted_at || "—"), element("div", "summary-text", `群 ${item.group_id} · ${item.record_id}`), element("div", "record-card-meta", `${item.deleted_by} · ${item.source}`)); return card; }));
+  const rows = items.map((item) => { const tr = document.createElement("tr"); [item.deleted_at, item.group_id, item.record_id, item.deleted_by, auditSourceLabel(item.source), auditScopeLabel(item)].forEach((value) => tr.append(element("td", "", String(value || "—")))); return tr; });
+  if (!rows.length) { const td = element("td", "empty-cell", "没有符合条件的审计记录"); td.colSpan = 6; const tr = document.createElement("tr"); tr.append(td); rows.push(tr); } $("#audit-rows").replaceChildren(...rows);
+  $("#audit-cards").replaceChildren(...items.map((item) => { const card = element("article", "record-card audit-card"); card.append(element("strong", "", item.deleted_at || "—"), element("div", "summary-text", `群 ${item.group_id} · ${item.record_id}`), element("div", "record-card-meta", `${item.deleted_by} · ${auditSourceLabel(item.source)} · ${auditScopeLabel(item)}`)); return card; }));
 }
 
 function activateTab(name) {
@@ -429,6 +452,22 @@ function confirmAction(title, message) { const dialog = $("#confirm-dialog"); $(
 async function deleteRecords(ids) {
   if (!ids.length) return; if (!await confirmAction("删除群典", `确定永久删除所选 ${ids.length} 条记录吗？此操作会写入删除审计。`)) return;
   try { const result = await task(() => bridge.apiPost("records/delete", { group_id: $("#group").value, record_ids: ids })); ids.forEach((id) => state.selected.delete(id)); closeDrawer(); notify(`已删除 ${result.deleted} 条记录。`); await task(loadStats); } catch (error) { notify(error.message, true); }
+}
+
+async function deleteForwardNode(record, node, path) {
+  if (!record || record.type !== "forward") return;
+  const author = node.author?.nickname || node.author?.user_id || "未知发送者"; const sentAt = node.source_sent_at ? dateParts(node.source_sent_at).join(" ") : "未知时间";
+  const text = [replyText(node.reply), segmentText(node.segments || [])].filter((value) => value && value !== "（空消息）").join("\n") || "（无文字）";
+  const mediaCount = nodeSegments(node).filter((segment) => ["image", "sticker", "face"].includes(segment.type)).length; const descendants = Math.max(0, forwardNodeCount([node]) - 1);
+  const message = [`发送者：${author}`, `时间：${sentAt}`, `文字：${text}`, `媒体摘要：${mediaCount} 项`, descendants ? `将连带删除 ${descendants} 个嵌套节点。` : "不会连带删除其他节点。"].join("\n");
+  if (!await confirmAction("删除合并转发节点", message)) return;
+  try {
+    const result = await task(() => bridge.apiPost("records/nodes/delete", { group_id: record.group_id, record_id: record.id, content_hash: record.content_hash, node_path: path }));
+    if (result.record_deleted) state.selected.delete(record.id);
+    notify(result.record_deleted ? "最后一个节点已删除，整条群典记录已移除。" : `已删除该节点${result.removed_nodes > 1 ? `及 ${result.removed_nodes - 1} 个嵌套节点` : ""}。`);
+    await task(loadStats);
+    if (result.record_deleted) closeDrawer(); else { const refreshed = state.records.find((item) => item.id === record.id) || result.record; if (refreshed) openDrawer(refreshed); else closeDrawer(); }
+  } catch (error) { notify(error.message, true); }
 }
 
 function showImportInspection(inspection) { const fields = [["新增记录", inspection.added], ["重复跳过", inspection.duplicates], ["ID 冲突", inspection.conflicts], ["新增图片", formatBytes(inspection.image_bytes)]]; const box = $("#import-inspection"); box.hidden = false; box.replaceChildren(...fields.map(([label, value]) => { const item = element("div", "inspection-item"); item.append(element("span", "", label), element("strong", "", String(value ?? 0))); return item; })); }
