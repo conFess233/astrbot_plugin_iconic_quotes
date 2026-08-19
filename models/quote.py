@@ -13,14 +13,20 @@ class AuthorSnapshot:
     platform: str = "aiocqhttp"
     user_id: str | None = None
     nickname: str = ""
+    # raw_user_id 保留 OneBot 原始字段，便于在不污染内容哈希的前提下追溯错误映射。
+    raw_user_id: str | None = None
+    identity_source: str = "legacy"
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> AuthorSnapshot:
         user_id = value.get("user_id")
+        raw_user_id = value.get("raw_user_id")
         return cls(
             platform=str(value.get("platform") or "aiocqhttp"),
             user_id=str(user_id) if user_id not in (None, "") else None,
             nickname=str(value.get("nickname") or ""),
+            raw_user_id=(str(raw_user_id) if raw_user_id not in (None, "") else None),
+            identity_source=str(value.get("identity_source") or "legacy"),
         )
 
 

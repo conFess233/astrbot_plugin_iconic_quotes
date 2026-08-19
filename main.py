@@ -21,12 +21,14 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from .models import AuthorSnapshot, ForwardNode, QuoteRecord, ReplySnapshot
 from .services.avatar_cache import AvatarCacheService
 from .services.cooldown import GlobalCooldown
+from .services.identity import AuthorIdentityService
 from .services.onebot import CaptureError, OneBotQuoteExtractor
 from .services.permissions import PermissionService, RoleLookupError, call_onebot_action
 from .services.renderer import QuoteRenderer
 from .services.settings import SettingsService
 from .services.storage import DuplicateQuoteError, QuoteStorage, StorageError
 from .services.web_manager import WebManager
+from .utils.hashing import calculate_record_hash
 from .utils.randomization import resolve_send_count
 from .utils.validation import match_command_syntax
 
@@ -61,6 +63,7 @@ class IconicQuotesPlugin(Star):
         self.extractor = OneBotQuoteExtractor(self.storage)
         self.permissions = PermissionService()
         self.cooldown = GlobalCooldown()
+        self.identities = AuthorIdentityService()
         self.avatars = AvatarCacheService(self.storage)
         self.renderer = QuoteRenderer(self, self.storage, self.avatars)
         self.web = WebManager(
@@ -414,6 +417,12 @@ class IconicQuotesPlugin(Star):
         values: dict[str, Any],
     ) -> None:
         record = await self.extractor.extract(event, values)
+        # 新收录的转发/回复作者在落盘前完成别名与唯一昵称解析；旧数据仍只读纠正。
+        resolution = await self.identities.resolve_records(
+            event, record.group_id, [record], values
+        )
+        record = resolution.records[0]
+        record.content_hash = calculate_record_hash(record)
         await self.storage.add(record, values["max_records_per_group"])
         if record.type == "message" and record.author:
             await self.avatars.prefetch(record.author.user_id, values)
@@ -424,6 +433,8 @@ class IconicQuotesPlugin(Star):
             if self.extractor.last_ignored_segments
             else ""
         )
+        if resolution.incomplete_count:
+            warning += f"\n另有 {resolution.incomplete_count} 个作者身份未能确认。"
         await self._send_text(
             event,
             f"已收录 {author} 的群典，当前共 {info['total']} 条。\n记录 ID：{record.id[:8]}{warning}",
@@ -456,11 +467,19 @@ class IconicQuotesPlugin(Star):
             values["send_count"],
             values["random_send_count"],
         )
+        group_id = str(event.get_group_id())
+        resolution = await self.identities.resolve_records(
+            event,
+            group_id,
+            await self.storage.records(group_id),
+            values,
+        )
         records, broken = await self.storage.select_random(
-            str(event.get_group_id()),
+            group_id,
             requested_count,
             target_id,
             keyword or None,
+            candidate_records=resolution.records,
         )
         if not records:
             if target_id and keyword:
@@ -474,6 +493,15 @@ class IconicQuotesPlugin(Star):
                 message = "当前群还没有群典。"
             await self._send_text(event, message, values)
             return
+        if target_id and resolution.member_lookup_failed:
+            await self._send_text(
+                event, "群成员列表读取失败，本次结果可能不完整。", values
+            )
+        if any(
+            record.type == "forward" and record.identity_incomplete
+            for record in records
+        ):
+            await self._send_text(event, "部分历史节点的作者身份尚未确认。", values)
         await self._send_records(event, records, values)
 
     async def _send_burst(
@@ -487,9 +515,17 @@ class IconicQuotesPlugin(Star):
             await self._send_text(event, "用法：爆典 @某人 [页码]", values)
             return
         target_id = targets[0]
+        group_id = str(event.get_group_id())
+        resolution = await self.identities.resolve_records(
+            event,
+            group_id,
+            await self.storage.records(group_id),
+            values,
+        )
         records, broken = await self.storage.records_for_user(
-            str(event.get_group_id()),
+            group_id,
             target_id,
+            candidate_records=resolution.records,
         )
         if not records:
             message = (
@@ -499,6 +535,10 @@ class IconicQuotesPlugin(Star):
             )
             await self._send_text(event, message, values)
             return
+        if resolution.member_lookup_failed:
+            await self._send_text(
+                event, "群成员列表读取失败，本次结果可能不完整。", values
+            )
         page_size = values["burst_page_size"]
         pages = math.ceil(len(records) / page_size)
         if page_value is None and len(records) > page_size:
@@ -551,6 +591,9 @@ class IconicQuotesPlugin(Star):
                     page=page,
                     pages=pages,
                     skipped=broken,
+                    identity_incomplete=any(
+                        record.identity_incomplete for record in selected
+                    ),
                     nested=nested,
                     native_stickers=native_stickers,
                     native_replies=native_replies,

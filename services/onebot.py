@@ -49,6 +49,14 @@ class _RawSticker:
     summary: str
 
 
+@dataclass(slots=True)
+class _RawForward:
+    """保留 OneBot forward 段的内联节点，避免转成组件时丢失 content。"""
+
+    forward_id: str
+    content: list[Any]
+
+
 def _utc_iso(timestamp: Any = None) -> str | None:
     if timestamp in (None, "", 0, "0"):
         return None
@@ -58,10 +66,26 @@ def _utc_iso(timestamp: Any = None) -> str | None:
         return None
 
 
-def _as_author(user_id: Any, nickname: Any) -> AuthorSnapshot:
+def _as_author(
+    user_id: Any,
+    nickname: Any,
+    *,
+    raw_user_id: Any = None,
+    identity_source: str | None = None,
+) -> AuthorSnapshot:
     normalized_id = str(user_id).strip() if user_id not in (None, "", 0, "0") else None
     name = str(nickname or normalized_id or "未知用户").strip()
-    return AuthorSnapshot(user_id=normalized_id, nickname=name)
+    normalized_raw = (
+        str(raw_user_id).strip()
+        if raw_user_id not in (None, "", 0, "0")
+        else normalized_id
+    )
+    return AuthorSnapshot(
+        user_id=normalized_id,
+        nickname=name,
+        raw_user_id=normalized_raw,
+        identity_source=identity_source or ("onebot" if normalized_id else "unknown"),
+    )
 
 
 def _raw_component(value: dict[str, Any]) -> Any:
@@ -98,8 +122,12 @@ def _raw_component(value: dict[str, Any]) -> Any:
             str(data.get("seq") or data.get("message_seq") or "") or None,
         )
     if component_type == "forward":
-        return Comp.Forward(
-            id=str(data.get("res_id") or data.get("resid") or data.get("id") or "")
+        inline = data.get("content")
+        return _RawForward(
+            forward_id=str(
+                data.get("res_id") or data.get("resid") or data.get("id") or ""
+            ),
+            content=list(inline) if isinstance(inline, list) else [],
         )
     if component_type == "node":
         # 用 Forward 哨兵交给统一的嵌套来源检查，不能静默忽略 Node。
@@ -153,7 +181,7 @@ class OneBotQuoteExtractor:
         forwards = [
             item
             for item in messages
-            if isinstance(item, (Comp.Forward, Comp.Node, Comp.Nodes))
+            if isinstance(item, (_RawForward, Comp.Forward, Comp.Node, Comp.Nodes))
         ]
         if len(replies) + len(forwards) != 1:
             raise CaptureError("一次只能添加一个引用或合并转发来源")
@@ -225,7 +253,7 @@ class OneBotQuoteExtractor:
         nested_sources = [
             item
             for item in chain
-            if isinstance(item, (Comp.Forward, Comp.Node, Comp.Nodes))
+            if isinstance(item, (_RawForward, Comp.Forward, Comp.Node, Comp.Nodes))
         ]
         if len(nested_sources) > 1:
             raise CaptureError("引用消息中包含多个合并转发，无法确定唯一来源")
@@ -296,6 +324,8 @@ class OneBotQuoteExtractor:
             settings,
             image_counter,
             depth=1,
+            node_counter=[0],
+            ancestor_ids={forward_id} if forward_id else set(),
         )
         if total_text > settings["max_forward_text_chars"]:
             raise CaptureError("合并转发累计文字长度超过配置上限")
@@ -321,7 +351,17 @@ class OneBotQuoteExtractor:
         event: Any,
         component: Any,
     ) -> tuple[list[Any], str | None]:
-        if isinstance(component, Comp.Forward):
+        if isinstance(component, _RawForward):
+            forward_id = component.forward_id or None
+            # NapCat 已把完整子节点放在段内时，优先使用它，避免再次查询后被拍平。
+            if component.content:
+                raw_nodes = component.content
+            elif forward_id:
+                payload = await self._get_forward_message(event, forward_id)
+                raw_nodes = self._forward_payload_nodes(payload)
+            else:
+                raise CaptureError("合并转发既没有内联内容，也没有可回退读取的消息 ID")
+        elif isinstance(component, Comp.Forward):
             forward_id = str(getattr(component, "id", "") or "")
             if not forward_id or forward_id == "__nested_node__":
                 raise CaptureError("合并转发缺少可读取的消息 ID")
@@ -348,8 +388,12 @@ class OneBotQuoteExtractor:
         image_counter: list[int],
         *,
         depth: int,
+        node_counter: list[int],
+        ancestor_ids: set[str],
     ) -> tuple[list[ForwardNode], int]:
-        if len(raw_nodes) > settings["max_forward_nodes"]:
+        # 上限按整棵树累计，而不是每一层分别计算。
+        node_counter[0] += len(raw_nodes)
+        if node_counter[0] > settings["max_forward_nodes"]:
             raise CaptureError("合并转发节点数超过配置上限")
         nodes: list[ForwardNode] = []
         total_text = 0
@@ -370,7 +414,9 @@ class OneBotQuoteExtractor:
             ordinary_chunk: list[Any] = []
 
             for component in chain:
-                if not isinstance(component, (Comp.Forward, Comp.Node, Comp.Nodes)):
+                if not isinstance(
+                    component, (_RawForward, Comp.Forward, Comp.Node, Comp.Nodes)
+                ):
                     ordinary_chunk.append(component)
                     continue
                 await self._append_segment_chunk(
@@ -385,15 +431,29 @@ class OneBotQuoteExtractor:
                         "嵌套合并转发深度超过配置上限 "
                         f"{settings['max_nested_forward_depth']}"
                     )
-                child_raw, child_id = await self._load_forward_source(event, component)
-                child_nodes, child_text = await self._capture_forward_nodes(
-                    event,
-                    child_raw,
-                    group_id,
-                    settings,
-                    image_counter,
-                    depth=depth + 1,
-                )
+                child_id = self._forward_component_id(component)
+                if child_id and child_id in ancestor_ids:
+                    raise CaptureError(f"第 {depth + 1} 层嵌套合并转发存在循环引用")
+                try:
+                    child_raw, child_id = await self._load_forward_source(
+                        event, component
+                    )
+                    child_nodes, child_text = await self._capture_forward_nodes(
+                        event,
+                        child_raw,
+                        group_id,
+                        settings,
+                        image_counter,
+                        depth=depth + 1,
+                        node_counter=node_counter,
+                        ancestor_ids=(
+                            {*ancestor_ids, child_id} if child_id else ancestor_ids
+                        ),
+                    )
+                except CaptureError as exc:
+                    raise CaptureError(
+                        f"第 {depth + 1} 层嵌套合并转发保存失败: {exc}"
+                    ) from exc
                 nested_forwards.append(
                     NestedForward(
                         position=len(segments),
@@ -423,6 +483,16 @@ class OneBotQuoteExtractor:
                 )
             )
         return nodes, total_text
+
+    @staticmethod
+    def _forward_component_id(component: Any) -> str | None:
+        """只提取当前分支的转发 ID，供祖先链循环检测使用。"""
+        if isinstance(component, _RawForward):
+            return component.forward_id or None
+        if isinstance(component, Comp.Forward):
+            value = str(getattr(component, "id", "") or "")
+            return value if value != "__nested_node__" else None
+        return None
 
     async def _append_segment_chunk(
         self,
@@ -608,11 +678,24 @@ class OneBotQuoteExtractor:
         )
         sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
         author = _as_author(
-            data.get("user_id") or data.get("uin") or sender.get("user_id"),
+            sender.get("user_id") or sender.get("uin") or data.get("uin"),
             sender.get("card")
             or data.get("nickname")
             or data.get("name")
             or sender.get("nickname"),
+            raw_user_id=(
+                data.get("user_id")
+                or data.get("uin")
+                or sender.get("user_id")
+                or sender.get("uin")
+            ),
+            identity_source=(
+                "sender"
+                if sender.get("user_id") or sender.get("uin")
+                else "node_uin"
+                if data.get("uin")
+                else "compat_unverified"
+            ),
         )
         raw_content = data.get("content") or data.get("message")
         if isinstance(raw_content, str):
@@ -698,7 +781,9 @@ class OneBotQuoteExtractor:
                 sticker.key = component.key or None
                 sticker.summary = component.summary or None
                 result.append(sticker)
-            elif isinstance(component, (Comp.Forward, Comp.Node, Comp.Nodes)):
+            elif isinstance(
+                component, (_RawForward, Comp.Forward, Comp.Node, Comp.Nodes)
+            ):
                 if nested_forbidden:
                     raise CaptureError("暂不支持嵌套合并转发")
             elif isinstance(component, (Comp.Reply, _RawReply)):
@@ -866,6 +951,14 @@ class OneBotQuoteExtractor:
         group_id: str,
         author: AuthorSnapshot,
     ) -> AuthorSnapshot:
+        if author.identity_source == "compat_unverified" and author.raw_user_id:
+            # data.user_id 在部分实现中并非节点作者；仅在群成员 API 能验证时采用。
+            name, _ = await self._member_info(event, group_id, author.raw_user_id)
+            if name:
+                author.user_id = author.raw_user_id
+                author.identity_source = "compat_validated"
+                author.nickname = name
+            return author
         if author.user_id is None:
             return author
         name, _ = await self._member_info(event, group_id, author.user_id)

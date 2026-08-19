@@ -290,6 +290,7 @@ class QuoteRenderer:
         native_stickers: bool,
         native_replies: bool,
         time_mode: str,
+        identity_incomplete: bool = False,
     ) -> list[Any]:
         """构造按时间排列的个人完整群典合集。"""
         title = f"聊天记录：{target_name}\n"
@@ -298,6 +299,8 @@ class QuoteRenderer:
         )
         if skipped:
             title += f"\n另有 {skipped} 条记录完全损坏，无法展示"
+        if identity_incomplete:
+            title += "\n部分历史节点的作者身份尚未确认"
         missing_media = sum(
             self.storage.missing_media_count(record) for record in records
         )

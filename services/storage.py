@@ -447,9 +447,15 @@ class QuoteStorage:
         count: int,
         author_id: str | None = None,
         keyword: str | None = None,
+        *,
+        candidate_records: list[QuoteRecord] | None = None,
     ) -> tuple[list[QuoteRecord], int]:
         """从有效记录中等概率无放回抽取。"""
-        candidates = await self.records(group_id)
+        candidates = (
+            list(candidate_records)
+            if candidate_records is not None
+            else await self.records(group_id)
+        )
         needle = normalize_search(keyword or "")
         if author_id and needle:
             candidates = [
@@ -459,9 +465,7 @@ class QuoteStorage:
             ]
         elif author_id:
             candidates = [
-                record
-                for record in candidates
-                if record.personal_owner_id() == author_id
+                record for record in candidates if record.involves_user(author_id)
             ]
         healthy: list[QuoteRecord] = []
         broken = 0
@@ -478,11 +482,17 @@ class QuoteStorage:
         self,
         group_id: str,
         user_id: str,
+        *,
+        candidate_records: list[QuoteRecord] | None = None,
     ) -> tuple[list[QuoteRecord], int]:
         """按添加时间返回用户参与的可展示记录及完全损坏数量。"""
         candidates = [
             record
-            for record in await self.records(group_id)
+            for record in (
+                candidate_records
+                if candidate_records is not None
+                else await self.records(group_id)
+            )
             if record.involves_user(user_id)
         ]
         usable: list[QuoteRecord] = []
