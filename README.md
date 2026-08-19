@@ -3,7 +3,7 @@
 <p align="center">让群友的抽象发言变成经典罢！😋</p>
 
 <p align="center">
-  <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.1.3-blue" alt="Version 1.1.3"></a>
+  <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.1.4-blue" alt="Version 1.1.4"></a>
   <a href="https://github.com/AstrBotDevs/AstrBot"><img src="https://img.shields.io/badge/AstrBot-%3E%3D4.24.2%20%3C5-blue" alt="AstrBot >=4.24.2 <5"></a>
   <img src="https://img.shields.io/badge/platform-OneBot%2011%20%7C%20QQ-blue" alt="OneBot 11 / QQ">
   <a href="./LICENSE.txt"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="AGPL-3.0"></a>
@@ -220,6 +220,8 @@ python -m pip install -r requirements.txt
 | `send_retry_count`                    | `2`                 | 发送失败后的额外重试次数           |
 | `send_retry_delay_ms`                 | `500`               | 每次重试之间的固定延迟             |
 | `retry_on_ambiguous_failure`          | `false`             | 是否重试超时等结果不明确的失败     |
+| `nested_forward_fallback_message`     | 见配置页             | 原生多层发送明确失败后的降级提示   |
+| `nested_forward_unknown_message`      | 见配置页             | 发送结果未知且不降级时的提示       |
 | `card_width`                          | `1200`              | CSS 卡片画布宽度                   |
 | `card_min_height` / `card_max_height` | `480` / `2000`      | 卡片高度边界                       |
 | `card_auto_height`                    | `true`              | 按内容收缩并裁切右侧、底部画布留白 |
@@ -285,6 +287,7 @@ AstrBot/data/plugin_data/astrbot_plugin_iconic_quotes/iconic_quotes/
 
 - 仅支持 OneBot 11 / QQ 群聊。
 - 嵌套合并转发默认最多收录 3 层，可配置为 1～10 层；超限时整条添加失败。
+- NapCat 会对 2～3 层存档递归重建原生 `node.data.content`；超过原生发送深度、非 NapCat 环境或明确发送失败时会先提示再完整展开。超时、断线等结果未知的情况不会自动降级，以免重复发送。
 - 纯图片记录不能通过字符串删除命令命中，请在管理页删除。
 - 插件优先读取节点 `sender` 身份，并保留 OneBot 原始 ID 与解析来源。查询旧记录时只在内存副本中按管理员别名、有效 QQ 和群内唯一完整昵称纠正，不会自动改写 JSON；无法确认的节点会显示一次提示。
 - OneBot 11 自定义转发节点不支持本地头像字段，因此头像本地化只用于 CSS 卡片和后台展示，不能替换爆典或合并转发气泡旁的原生头像。
