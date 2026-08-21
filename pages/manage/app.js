@@ -160,6 +160,17 @@ const CONFIG_SECTIONS = [
     { key: "aggregate_multiple", label: "多条聚合为合并转发", type: "boolean" },
     { key: "allow_bot_authors", label: "允许记录 Bot 消息", type: "boolean" },
   ]},
+  { id: "help", title: "帮助消息", description: "配置主动帮助和参数错误后附带的对应用法。", icon: "info", fields: [
+    { key: "help_enabled", label: "启用帮助功能", type: "boolean", hint: "关闭后不发送主动帮助，也不附带用法。" },
+    { key: "help_keywords", label: "帮助子关键词", type: "list", hint: "每行一个；用于 /群典 <关键词> 和 群典 <关键词>。" },
+    { key: "help_overview_template", label: "总帮助模板", type: "textarea", full: true, hint: "留空时自动组合下方非空模板。" },
+    { key: "help_add_template", label: "添加用法", type: "textarea", full: true },
+    { key: "help_query_template", label: "查询用法", type: "textarea", full: true },
+    { key: "help_burst_template", label: "爆典用法", type: "textarea", full: true },
+    { key: "help_info_template", label: "统计用法", type: "textarea", full: true },
+    { key: "help_delete_template", label: "删除用法", type: "textarea", full: true },
+    { key: "help_help_template", label: "帮助用法", type: "textarea", full: true, hint: "支持 {add_keywords}、{query_keywords}、{burst_keywords}、{burst_page_size}、{max_query_keyword_chars}。" },
+  ]},
   { id: "limits", title: "容量与限制", description: "控制本地存储和单条消息的安全边界。", icon: "archive", fields: [
     { key: "max_records_per_group", label: "单群记录上限", type: "number", min: 1, max: 100000 },
     { key: "max_media_mb", label: "媒体目录上限（MB）", type: "number", min: 1, max: 102400 },
@@ -174,10 +185,11 @@ const CONFIG_SECTIONS = [
     { key: "delete_preview_limit", label: "删除预览上限", type: "number", min: 1, max: 50 },
     { key: "audit_limit", label: "删除审计保留条数", type: "number", min: 1, max: 100000 },
   ]},
-  { id: "permissions", title: "权限", description: "分别控制添加、随机查询、爆典、统计与删除操作。", icon: "groups", fields: [
+  { id: "permissions", title: "权限", description: "分别控制添加、随机查询、爆典、统计、删除与帮助操作。", icon: "groups", fields: [
     { key: "add_roles", label: "添加权限", type: "roles", full: true }, { key: "query_roles", label: "查询权限", type: "roles", full: true },
     { key: "burst_roles", label: "爆典权限", type: "roles", full: true },
     { key: "info_roles", label: "查看统计权限", type: "roles", full: true }, { key: "delete_roles", label: "删除权限", type: "roles", full: true },
+    { key: "help_roles", label: "帮助权限", type: "roles", full: true },
   ]},
   { id: "lists", title: "名单", description: "白名单为空时不限制；ID 每行一个。", icon: "filter", fields: [
     { key: "group_blacklist", label: "群黑名单", type: "list" }, { key: "group_whitelist", label: "群白名单", type: "list" },
@@ -208,7 +220,7 @@ const CONFIG_SECTIONS = [
 ];
 
 const ALL_FIELDS = CONFIG_SECTIONS.flatMap((section) => section.fields);
-const OVERRIDE_KEYS = new Set(["add_keyword_enabled", "add_keywords", "query_keyword_enabled", "query_keywords", "burst_keyword_enabled", "burst_keywords", "burst_page_size", "burst_time_mode", "send_count", "random_send_count", "send_mode", "aggregate_multiple", "allow_bot_authors", "max_records_per_group", "add_roles", "query_roles", "burst_roles", "info_roles", "delete_roles", "user_blacklist", "user_whitelist", "excluded_author_ids", "nested_forward_fallback_message", "nested_forward_unknown_message"]);
+const OVERRIDE_KEYS = new Set(["add_keyword_enabled", "add_keywords", "query_keyword_enabled", "query_keywords", "burst_keyword_enabled", "burst_keywords", "burst_page_size", "burst_time_mode", "help_enabled", "help_keywords", "help_overview_template", "help_add_template", "help_query_template", "help_burst_template", "help_info_template", "help_delete_template", "help_help_template", "send_count", "random_send_count", "send_mode", "aggregate_multiple", "allow_bot_authors", "max_records_per_group", "add_roles", "query_roles", "burst_roles", "info_roles", "delete_roles", "help_roles", "user_blacklist", "user_whitelist", "excluded_author_ids", "nested_forward_fallback_message", "nested_forward_unknown_message"]);
 const OVERRIDE_FIELDS = ALL_FIELDS.filter((field) => OVERRIDE_KEYS.has(field.key));
 
 function normalizeList(value) { return Array.isArray(value) ? value : []; }

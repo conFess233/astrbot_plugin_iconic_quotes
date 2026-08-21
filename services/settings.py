@@ -3,12 +3,29 @@
 from __future__ import annotations
 
 import copy
+from string import Formatter
 from typing import Any
 
 from ..utils.hashing import normalize_search
 from ..utils.validation import sanitize_custom_css, validate_numeric_id
 
 ROLE_VALUES = {"bot_admin", "owner", "admin", "member", "everyone"}
+HELP_PLACEHOLDERS = {
+    "add_keywords",
+    "query_keywords",
+    "burst_keywords",
+    "burst_page_size",
+    "max_query_keyword_chars",
+}
+HELP_TEMPLATE_KEYS = {
+    "help_overview_template",
+    "help_add_template",
+    "help_query_template",
+    "help_burst_template",
+    "help_info_template",
+    "help_delete_template",
+    "help_help_template",
+}
 GROUP_OVERRIDE_KEYS = {
     "add_keyword_enabled",
     "add_keywords",
@@ -19,6 +36,10 @@ GROUP_OVERRIDE_KEYS = {
     "burst_keywords",
     "burst_page_size",
     "burst_time_mode",
+    "help_enabled",
+    "help_keywords",
+    "help_roles",
+    *HELP_TEMPLATE_KEYS,
     "send_count",
     "random_send_count",
     "send_mode",
@@ -49,6 +70,28 @@ DEFAULTS: dict[str, Any] = {
     "burst_keywords": ["爆典"],
     "burst_page_size": 50,
     "burst_time_mode": "text",
+    "help_enabled": True,
+    "help_keywords": ["help", "帮助"],
+    "help_roles": ["everyone"],
+    "help_overview_template": (
+        "群典帮助\n"
+        "添加：引用消息或携带合并转发后发送 /添加群典；关键词：{add_keywords}\n"
+        "查询：/群典、/群典 @某人、/群典 @某人 <关键词>；关键词：{query_keywords}\n"
+        "爆典：/爆典 @某人 [页码]；关键词：{burst_keywords}\n"
+        "统计：/群典 info\n"
+        "删除：/删除群典 <关键词>，随后发送 /确认删除\n"
+        "帮助：/群典 help"
+    ),
+    "help_add_template": (
+        "引用一条消息或携带一个合并转发后发送 /添加群典；关键词：{add_keywords}"
+    ),
+    "help_query_template": (
+        "/群典、/群典 @某人，或 /群典 @某人 <关键词>；关键词：{query_keywords}"
+    ),
+    "help_burst_template": "/爆典 @某人 [页码]；关键词：{burst_keywords}",
+    "help_info_template": "/群典 info",
+    "help_delete_template": "/删除群典 <关键词>，预览后发送 /确认删除",
+    "help_help_template": "/群典 help",
     "max_reply_depth": 3,
     "max_nested_forward_depth": 3,
     "max_records_per_group": 5000,
@@ -182,6 +225,29 @@ class SettingsService:
                 cleaned[group_id] = targets
         return cleaned
 
+    @staticmethod
+    def _help_template(value: Any, label: str) -> str:
+        """校验可留空的帮助模板及其格式化占位符。"""
+        template = str(value or "").strip()
+        if len(template) > 4000:
+            raise ValueError(f"{label}不能超过 4000 个字符")
+        try:
+            parsed = list(Formatter().parse(template))
+        except ValueError as exc:
+            raise ValueError(f"{label}包含无效的大括号格式") from exc
+        if any(
+            field_name is not None and (format_spec or conversion)
+            for _, field_name, format_spec, conversion in parsed
+        ):
+            raise ValueError(f"{label}的占位符不支持格式说明或类型转换")
+        fields = {
+            field_name for _, field_name, _, _ in parsed if field_name is not None
+        }
+        unknown = fields - HELP_PLACEHOLDERS
+        if unknown:
+            raise ValueError(f"{label}包含未知占位符: " + ", ".join(sorted(unknown)))
+        return template
+
     @classmethod
     def _validate(
         cls,
@@ -231,6 +297,7 @@ class SettingsService:
             "add_keyword_enabled",
             "query_keyword_enabled",
             "burst_keyword_enabled",
+            "help_enabled",
             "aggregate_multiple",
             "random_send_count",
             "allow_bot_authors",
@@ -240,7 +307,12 @@ class SettingsService:
         ):
             if not isinstance(result.get(key), bool):
                 raise TypeError(f"{key} 必须是布尔值")
-        for key in ("add_keywords", "query_keywords", "burst_keywords"):
+        for key in (
+            "add_keywords",
+            "query_keywords",
+            "burst_keywords",
+            "help_keywords",
+        ):
             raw = result.get(key)
             if not isinstance(raw, list):
                 raise TypeError(f"{key} 必须是列表")
@@ -250,6 +322,7 @@ class SettingsService:
             "add_roles",
             "query_roles",
             "burst_roles",
+            "help_roles",
             "info_roles",
             "delete_roles",
         ):
@@ -286,6 +359,8 @@ class SettingsService:
                 }
             result["group_overrides"] = cleaned_overrides
         result["author_aliases"] = cls._author_aliases(result.get("author_aliases", {}))
+        for key in HELP_TEMPLATE_KEYS:
+            result[key] = cls._help_template(result.get(key), key)
         result["card_custom_css"] = sanitize_custom_css(
             str(result.get("card_custom_css") or "")
         )

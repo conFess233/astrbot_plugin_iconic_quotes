@@ -59,6 +59,58 @@
     "labels": ["独立文字节点", "原生时间（实验）", "不显示"],
     "hint": "原生时间依赖 OneBot 实现，平台忽略时不会显示。"
   },
+  "help_enabled": {
+    "description": "启用帮助功能",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后不发送主动帮助，也不在参数错误后附带用法。"
+  },
+  "help_keywords": {
+    "description": "帮助子关键词",
+    "type": "list",
+    "default": ["help", "帮助"],
+    "hint": "用于 /群典 <帮助关键词> 和 群典 <帮助关键词>，精确匹配。"
+  },
+  "help_overview_template": {
+    "description": "总帮助模板",
+    "type": "text",
+    "default": "群典帮助\n添加：引用消息或携带合并转发后发送 /添加群典；关键词：{add_keywords}\n查询：/群典、/群典 @某人、/群典 @某人 <关键词>；关键词：{query_keywords}\n爆典：/爆典 @某人 [页码]；关键词：{burst_keywords}\n统计：/群典 info\n删除：/删除群典 <关键词>，随后发送 /确认删除\n帮助：/群典 help",
+    "hint": "留空时由各操作用法自动组合；支持帮助占位符。"
+  },
+  "help_add_template": {
+    "description": "添加用法",
+    "type": "text",
+    "default": "引用一条消息或携带一个合并转发后发送 /添加群典；关键词：{add_keywords}",
+    "hint": "留空可关闭添加失败后的用法提示。"
+  },
+  "help_query_template": {
+    "description": "查询用法",
+    "type": "text",
+    "default": "/群典、/群典 @某人，或 /群典 @某人 <关键词>；关键词：{query_keywords}",
+    "hint": "留空可关闭查询失败后的用法提示。"
+  },
+  "help_burst_template": {
+    "description": "爆典用法",
+    "type": "text",
+    "default": "/爆典 @某人 [页码]；关键词：{burst_keywords}",
+    "hint": "留空可关闭爆典失败后的用法提示。"
+  },
+  "help_info_template": {
+    "description": "统计用法",
+    "type": "text",
+    "default": "/群典 info"
+  },
+  "help_delete_template": {
+    "description": "删除用法",
+    "type": "text",
+    "default": "/删除群典 <关键词>，预览后发送 /确认删除",
+    "hint": "留空可关闭删除失败后的用法提示。"
+  },
+  "help_help_template": {
+    "description": "帮助用法",
+    "type": "text",
+    "default": "/群典 help"
+  },
   "send_count": {
     "description": "每次发送条数",
     "type": "int",
@@ -168,6 +220,13 @@
     "description": "删除权限",
     "type": "list",
     "default": ["bot_admin"],
+    "options": ["bot_admin", "owner", "admin", "member", "everyone"],
+    "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
+  },
+  "help_roles": {
+    "description": "帮助权限",
+    "type": "list",
+    "default": ["everyone"],
     "options": ["bot_admin", "owner", "admin", "member", "everyone"],
     "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
   },
