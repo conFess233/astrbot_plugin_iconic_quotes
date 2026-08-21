@@ -117,6 +117,16 @@ class QuoteRenderer:
     async def close(self) -> None:
         """保留旧生命周期入口。"""
 
+    @staticmethod
+    def missing_reply_warning(records: list[QuoteRecord]) -> str | None:
+        """生成可供普通消息与合集共用的引用丢失提示。"""
+        missing_ids = [
+            record.id[:8] for record in records if record.has_missing_replies()
+        ]
+        if not missing_ids:
+            return None
+        return "以下群典存在无法追溯的引用内容：" + "、".join(missing_ids)
+
     async def avatar_data_url(
         self, user_id: str | None, settings: dict[str, Any]
     ) -> str:
@@ -230,13 +240,16 @@ class QuoteRenderer:
         replay: bool = False,
         native_stickers: bool = True,
         native_replies: bool = True,
-        native_nested: bool = True,
     ) -> list[Any]:
-        """构造新聚合转发或原生转发回放节点。"""
+        """构造不依赖历史 res_id 的展开式合并转发节点。"""
         nodes: list[Any] = []
         if replay:
             nodes.append(
                 Comp.Node(uin="0", name="群典", content=[Comp.Plain("群典存档回放")])
+            )
+        if warning := self.missing_reply_warning(records):
+            nodes.append(
+                Comp.Node(uin="0", name="引用丢失提示", content=[Comp.Plain(warning)])
             )
         for record in records:
             if record.type == "forward":
@@ -245,7 +258,6 @@ class QuoteRenderer:
                         record.nodes,
                         native_stickers=native_stickers,
                         native_replies=native_replies,
-                        native_nested=native_nested,
                     )
                 )
                 continue
@@ -294,6 +306,14 @@ class QuoteRenderer:
                     uin="0",
                     name="群典",
                     content=[{"type": "text", "data": {"text": "群典存档回放"}}],
+                )
+            )
+        if warning := self.missing_reply_warning(records):
+            result.append(
+                self._raw_node(
+                    uin="0",
+                    name="引用丢失提示",
+                    content=[{"type": "text", "data": {"text": warning}}],
                 )
             )
         for record in records:
@@ -362,6 +382,14 @@ class QuoteRenderer:
                 content=[{"type": "text", "data": {"text": title}}],
             )
         ]
+        if warning := self.missing_reply_warning(records):
+            result.append(
+                self._raw_node(
+                    uin="0",
+                    name="引用丢失提示",
+                    content=[{"type": "text", "data": {"text": warning}}],
+                )
+            )
         for record in records:
             native_time = self._native_time(record.recorded_at)
             if time_mode == "text":
@@ -641,7 +669,6 @@ class QuoteRenderer:
         page: int,
         pages: int,
         skipped: int,
-        nested: bool,
         native_stickers: bool,
         native_replies: bool,
         time_mode: str,
@@ -664,6 +691,14 @@ class QuoteRenderer:
         result: list[Any] = [
             Comp.Node(uin="0", name="群典", content=[Comp.Plain(title)])
         ]
+        if warning := self.missing_reply_warning(records):
+            result.append(
+                Comp.Node(
+                    uin="0",
+                    name="引用丢失提示",
+                    content=[Comp.Plain(warning)],
+                )
+            )
         for record in records:
             timestamp = self._record_time(record.recorded_at)
             native_time = self._native_time(record.recorded_at)
@@ -710,35 +745,21 @@ class QuoteRenderer:
                     )
                 )
                 continue
-            if nested:
-                if not record.source_forward_id:
-                    raise ValueError("存档没有可用的原始合并转发 res_id")
-                result.append(
-                    self._burst_node(
-                        uin="0",
-                        name="聊天记录存档",
-                        content=[Comp.Forward(id=record.source_forward_id)],
-                        native_time=native_time,
-                        time_mode=time_mode,
-                    )
+            inner = self._forward_level_nodes(
+                record.nodes,
+                native_stickers=native_stickers,
+                native_replies=native_replies,
+            )
+            result.append(
+                self._burst_node(
+                    uin="0",
+                    name="聊天记录存档",
+                    content=[Comp.Plain("以下为本地存档的聊天记录")],
+                    native_time=native_time,
+                    time_mode=time_mode,
                 )
-            else:
-                inner = self._forward_level_nodes(
-                    record.nodes,
-                    native_stickers=native_stickers,
-                    native_replies=native_replies,
-                    native_nested=False,
-                )
-                result.append(
-                    self._burst_node(
-                        uin="0",
-                        name="聊天记录存档",
-                        content=[Comp.Plain("以下为本地存档的聊天记录")],
-                        native_time=native_time,
-                        time_mode=time_mode,
-                    )
-                )
-                result.extend(inner)
+            )
+            result.extend(inner)
         return result
 
     def _forward_level_nodes(
@@ -747,7 +768,6 @@ class QuoteRenderer:
         *,
         native_stickers: bool,
         native_replies: bool,
-        native_nested: bool,
     ) -> list[Any]:
         result: list[Any] = []
         for node in nodes:
@@ -758,20 +778,6 @@ class QuoteRenderer:
                         native_stickers=native_stickers,
                     )
                 )
-            if native_nested:
-                content = self._reply_to_components(
-                    node.reply,
-                    native_stickers=native_stickers,
-                    native_replies=native_replies,
-                )
-                content.extend(
-                    self._interleaved_node_content(
-                        node,
-                        native_stickers=native_stickers,
-                    )
-                )
-                result.append(self._author_node(node, content))
-                continue
             result.extend(
                 self._flatten_node(
                     node,
@@ -779,32 +785,6 @@ class QuoteRenderer:
                     native_replies=native_replies,
                 )
             )
-        return result
-
-    def _interleaved_node_content(
-        self,
-        node: ForwardNode,
-        *,
-        native_stickers: bool,
-    ) -> list[Any]:
-        by_position: dict[int, list[NestedForward]] = {}
-        for nested in node.nested_forwards:
-            if not nested.source_forward_id:
-                raise ValueError("本地嵌套转发没有可用的原始 res_id")
-            by_position.setdefault(nested.position, []).append(nested)
-        result: list[Any] = []
-        for index in range(len(node.segments) + 1):
-            result.extend(
-                Comp.Forward(id=nested.source_forward_id or "")
-                for nested in by_position.get(index, [])
-            )
-            if index < len(node.segments):
-                result.extend(
-                    self._segments_to_components(
-                        [node.segments[index]],
-                        native_stickers=native_stickers,
-                    )
-                )
         return result
 
     def _flatten_node(
@@ -849,7 +829,6 @@ class QuoteRenderer:
                         nested.nodes,
                         native_stickers=native_stickers,
                         native_replies=native_replies,
-                        native_nested=False,
                     )
                 )
             if index < len(node.segments):

@@ -93,6 +93,7 @@ class ReplySnapshot:
     source_message_id: str | None = None
     source_message_seq: str | None = None
     incomplete: bool = False
+    reply_missing: bool = False
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> ReplySnapshot:
@@ -117,6 +118,7 @@ class ReplySnapshot:
                 else None
             ),
             incomplete=bool(value.get("incomplete", False)),
+            reply_missing=bool(value.get("reply_missing", False)),
         )
 
 
@@ -153,6 +155,7 @@ class ForwardNode:
     segments: list[QuoteSegment]
     source_sent_at: str | None = None
     reply: ReplySnapshot | None = None
+    reply_missing: bool = False
     nested_forwards: list[NestedForward] = field(default_factory=list)
 
     @classmethod
@@ -170,6 +173,7 @@ class ForwardNode:
                 if isinstance(value.get("reply"), dict)
                 else None
             ),
+            reply_missing=bool(value.get("reply_missing", False)),
             nested_forwards=[
                 NestedForward.from_dict(item)
                 for item in value.get("nested_forwards", [])
@@ -195,6 +199,7 @@ class QuoteRecord:
     recorded_by: AuthorSnapshot = field(default_factory=AuthorSnapshot)
     identity_incomplete: bool = False
     reply: ReplySnapshot | None = None
+    reply_missing: bool = False
     source_forward_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -237,6 +242,7 @@ class QuoteRecord:
                 if isinstance(value.get("reply"), dict)
                 else None
             ),
+            reply_missing=bool(value.get("reply_missing", False)),
             source_forward_id=(
                 str(value["source_forward_id"])
                 if value.get("source_forward_id") not in (None, "")
@@ -371,6 +377,30 @@ class QuoteRecord:
     def has_stickers(self) -> bool:
         """判断正文或回复快照中是否包含商城表情。"""
         return any(segment.type == "sticker" for segment in self._all_segments())
+
+    def has_missing_replies(self) -> bool:
+        """判断当前记录及其递归子结构中是否存在无法追溯的引用。"""
+        if self.reply_missing or self._reply_has_missing(self.reply):
+            return True
+        return any(self._node_has_missing(node) for node in self.nodes)
+
+    @classmethod
+    def _node_has_missing(cls, node: ForwardNode) -> bool:
+        return (
+            node.reply_missing
+            or cls._reply_has_missing(node.reply)
+            or any(
+                cls._node_has_missing(child)
+                for nested in node.nested_forwards
+                for child in nested.nodes
+            )
+        )
+
+    @classmethod
+    def _reply_has_missing(cls, reply: ReplySnapshot | None) -> bool:
+        if reply is None:
+            return False
+        return reply.reply_missing or cls._reply_has_missing(reply.reply)
 
     def has_replies(self) -> bool:
         """判断正文或任意递归转发节点是否包含回复快照。"""

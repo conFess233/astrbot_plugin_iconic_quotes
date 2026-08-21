@@ -34,11 +34,20 @@ from .services.settings import SettingsService
 from .services.storage import DuplicateQuoteError, QuoteStorage, StorageError
 from .services.web_manager import WebManager
 from .utils.hashing import calculate_record_hash
+from .utils.help import is_help_keyword, operation_usage, render_help_template
 from .utils.randomization import resolve_send_count
 from .utils.validation import match_command_syntax
 
 PLUGIN_NAME = "astrbot_plugin_iconic_quotes"
 COMMAND_EVENT_KEY = "iconic_quotes_command_event"
+
+
+def _error_reason(error: BaseException | None) -> str:
+    """生成适合控制台展示的异常摘要，不记录消息正文或完整载荷。"""
+    if error is None:
+        return "未返回具体异常"
+    detail = str(error).strip()
+    return f"{type(error).__name__}: {detail}" if detail else type(error).__name__
 
 
 @dataclass(slots=True)
@@ -47,6 +56,14 @@ class PendingDeletion:
 
     expires_at: float
     record_hashes: dict[str, str]
+
+
+class UsageError(ValueError):
+    """表示已识别插件操作，但调用参数或来源格式不完整。"""
+
+    def __init__(self, message: str, operation: str):
+        super().__init__(message)
+        self.operation = operation
 
 
 class IconicQuotesPlugin(Star):
@@ -170,6 +187,18 @@ class IconicQuotesPlugin(Star):
         """随机发送群典；参数 info 用于查看当前群统计。"""
         event.set_extra(COMMAND_EVENT_KEY, True)
         targets = self._mentioned_users(event)
+        plain_text = self._plain_text(event)
+        command_argument = argument.strip() or self._command_tail(plain_text, "群典")
+        try:
+            group_id = str(event.get_group_id() or "")
+            current_values = (
+                self.settings.for_group(group_id)
+                if group_id
+                else self.settings.global_settings()
+            )
+            help_keywords = current_values["help_keywords"]
+        except Exception:  # noqa: BLE001 - 配置错误由统一分发器给出正式提示。
+            help_keywords = ["help", "帮助"]
         if not targets and (
             argument.strip().casefold() == "info"
             or self._command_tail(
@@ -182,10 +211,17 @@ class IconicQuotesPlugin(Star):
                 event, "info", self._show_info, trigger_source="command"
             )
             return
-        _, search_keyword = self._match_query_syntax(
-            self._plain_text(event),
+        if not targets and is_help_keyword(command_argument, help_keywords):
+            await self._dispatch(
+                event, "help", self._show_help, trigger_source="command"
+            )
+            return
+        syntax_match, search_keyword = self._match_query_syntax(
+            plain_text,
             ["群典"],
         )
+        if not syntax_match and argument.strip():
+            search_keyword = argument.strip()
         await self._dispatch(
             event,
             "query",
@@ -202,7 +238,7 @@ class IconicQuotesPlugin(Star):
         """分页获取当前群中指定成员参与的全部群典记录。"""
         event.set_extra(COMMAND_EVENT_KEY, True)
         _, page_value = self._match_burst_syntax(self._plain_text(event), ["爆典"])
-        if page_value is None and argument.strip().isdigit():
+        if page_value is None and argument.strip():
             page_value = argument.strip()
         await self._dispatch(
             event,
@@ -238,7 +274,6 @@ class IconicQuotesPlugin(Star):
             return
         if self._is_bot_message(event):
             return
-        text = event.message_str.strip()
         plain_text = self._plain_text(event)
         group_id = str(event.get_group_id() or "")
         values = (
@@ -247,21 +282,30 @@ class IconicQuotesPlugin(Star):
             else self.settings.global_settings()
         )
         has_source = self._has_capture_source(event)
-        add_match = values["add_keyword_enabled"] and text in values["add_keywords"]
+        add_match = (
+            values["add_keyword_enabled"] and plain_text in values["add_keywords"]
+        )
         query_syntax_match, search_keyword = self._match_query_syntax(
             plain_text,
             values["query_keywords"],
         )
-        query_match = (
-            values["query_keyword_enabled"]
-            and query_syntax_match
-            and (search_keyword is None or bool(self._mentioned_users(event)))
+        targets = self._mentioned_users(event)
+        help_match = (
+            query_syntax_match
+            and not targets
+            and is_help_keyword(search_keyword, values["help_keywords"])
         )
+        query_match = values["query_keyword_enabled"] and query_syntax_match
         burst_match, burst_page = self._match_burst_syntax(
             plain_text,
             values["burst_keywords"],
         )
-        if values["burst_keyword_enabled"] and burst_match:
+        if help_match:
+            event.stop_event()
+            await self._dispatch(
+                event, "help", self._show_help, trigger_source="keyword"
+            )
+        elif values["burst_keyword_enabled"] and burst_match:
             event.stop_event()
             await self._dispatch(
                 event,
@@ -312,12 +356,14 @@ class IconicQuotesPlugin(Star):
         _ = trigger_source
         self._operation_log_override = None
         self._operation_error_logged = False
+        failure_reason: str | None = None
         operation_label = {
             "add": "添加",
             "query": "查询",
             "burst": "爆典发送",
             "info": "统计查询",
             "delete": "删除",
+            "help": "帮助",
         }.get(operation, "操作")
 
         def log_result(result: str) -> None:
@@ -336,8 +382,17 @@ class IconicQuotesPlugin(Star):
                 "permission_denied": "权限不足",
                 "duplicate": "重复记录",
                 "operation_failed": "失败",
+                "usage_error": "参数错误",
             }.get(result, result)
-            logger.info("群典：%s%s", operation_label, result_label)
+            if failure_reason:
+                logger.warning(
+                    "群典：%s%s，原因=%s",
+                    operation_label,
+                    result_label,
+                    failure_reason,
+                )
+            else:
+                logger.info("群典：%s%s", operation_label, result_label)
 
         if platform != "aiocqhttp" or not group_id:
             try:
@@ -385,8 +440,9 @@ class IconicQuotesPlugin(Star):
         try:
             try:
                 allowed = await self.permissions.allows(event, values, operation)
-            except RoleLookupError:
+            except RoleLookupError as exc:
                 result = "permission_lookup_failed"
+                failure_reason = _error_reason(exc)
                 await self._send_text(event, "暂时无法验证群权限。", values)
                 return
             if not allowed:
@@ -401,12 +457,19 @@ class IconicQuotesPlugin(Star):
                 (f"该群典已存在。\n记录 ID：{exc.record.id[:8]}"),
                 values,
             )
+        except UsageError as exc:
+            result = "usage_error"
+            failure_reason = _error_reason(exc)
+            await self._send_usage_error(event, str(exc), values, exc.operation)
         except (CaptureError, StorageError, ValueError) as exc:
             result = "operation_failed"
+            failure_reason = _error_reason(exc)
             await self._send_text(event, f"操作失败：{exc}", values)
-        except Exception:  # noqa: BLE001 - Handler 边界必须隔离未知插件/适配器异常。
+        except Exception as exc:  # noqa: BLE001 - Handler 边界必须隔离未知插件/适配器异常。
             result = "unexpected_error"
-            logger.exception("群典：%s失败", operation_label)
+            logger.exception(
+                "群典：%s失败，原因=%s", operation_label, _error_reason(exc)
+            )
             with contextlib.suppress(Exception):
                 await self._send_text(event, "操作失败，请稍后重试。", values)
         finally:
@@ -422,6 +485,14 @@ class IconicQuotesPlugin(Star):
         event: AstrMessageEvent,
         values: dict[str, Any],
     ) -> None:
+        source_count = self._capture_source_count(event)
+        if source_count != 1:
+            reason = (
+                "请引用一条消息或携带一个合并转发。"
+                if source_count == 0
+                else "一次只能添加一个引用或合并转发来源。"
+            )
+            raise UsageError(reason, "add")
         record = await self.extractor.extract(event, values)
         # 新收录的转发/回复作者在落盘前完成别名与唯一昵称解析；旧数据仍只读纠正。
         resolution = await self.identities.resolve_records(
@@ -441,6 +512,8 @@ class IconicQuotesPlugin(Star):
         )
         if resolution.incomplete_count:
             warning += f"\n另有 {resolution.incomplete_count} 个作者身份未能确认。"
+        if record.has_missing_replies():
+            warning += "\n该记录存在无法追溯的引用内容。"
         await self._send_text(
             event,
             f"已收录 {author} 的群典，当前共 {info['total']} 条。\n记录 ID：{record.id[:8]}{warning}",
@@ -455,20 +528,16 @@ class IconicQuotesPlugin(Star):
     ) -> None:
         targets = self._mentioned_users(event)
         if len(targets) > 1:
-            await self._send_text(event, "一次只能指定一名用户。", values)
-            return
+            raise UsageError("一次只能指定一名用户。", "query")
         target_id = targets[0] if targets else None
         keyword = (search_keyword or "").strip()
         if keyword and not target_id:
-            await self._send_text(event, "关键词查询必须指定一名用户。", values)
-            return
+            raise UsageError("关键词查询必须指定一名用户。", "query")
         if len(keyword) > values["max_query_keyword_chars"]:
-            await self._send_text(
-                event,
+            raise UsageError(
                 f"查询关键词不能超过 {values['max_query_keyword_chars']} 个字符。",
-                values,
+                "query",
             )
-            return
         requested_count = resolve_send_count(
             values["send_count"],
             values["random_send_count"],
@@ -518,8 +587,12 @@ class IconicQuotesPlugin(Star):
     ) -> None:
         targets = self._mentioned_users(event)
         if len(targets) != 1:
-            await self._send_text(event, "用法：爆典 @某人 [页码]", values)
-            return
+            reason = (
+                "爆典需要指定一名用户。"
+                if not targets
+                else "爆典一次只能指定一名用户。"
+            )
+            raise UsageError(reason, "burst")
         target_id = targets[0]
         group_id = str(event.get_group_id())
         resolution = await self.identities.resolve_records(
@@ -548,97 +621,96 @@ class IconicQuotesPlugin(Star):
         page_size = values["burst_page_size"]
         pages = math.ceil(len(records) / page_size)
         if page_value is None and len(records) > page_size:
-            await self._send_text(
-                event,
+            raise UsageError(
                 f"当前记录数量大于 {page_size} 条，将分页发送。当前共有 {pages} 页，"
-                "请发送“爆典 @某人 {页码}”获取。",
-                values,
+                "请指定要获取的页码。",
+                "burst",
             )
-            return
         try:
             page = int(page_value) if page_value is not None else 1
         except (TypeError, ValueError):
             page = 0
         if page < 1 or page > pages:
-            await self._send_text(event, f"页码无效，有效范围为 1 到 {pages}。", values)
-            return
+            raise UsageError(
+                f"页码无效，有效范围为 1 到 {pages}。",
+                "burst",
+            )
         start = (page - 1) * page_size
         selected = records[start : start + page_size]
         await self._refresh_record_author_names(event, selected)
         target_name = await self._burst_target_name(event, target_id, records)
         configured_time_mode = values["burst_time_mode"]
-        force_flatten = False
-        multilevel = any(record.forward_depth() >= 2 for record in selected)
-        if multilevel:
-            # 爆典会额外包一层“聊天记录存档”，因此按最终 OneBot 树深度预检。
-            payload_depth = max(
-                record.forward_depth() + 1
-                for record in selected
-                if record.type == "forward"
-            )
-            if payload_depth <= 3 and await self._is_napcat(event):
-                raw_time_modes = [configured_time_mode]
-                if configured_time_mode == "native":
-                    raw_time_modes.append("none")
-                last_error: Exception | None = None
-                for raw_time_mode in raw_time_modes:
-                    outcome, last_error = await self._try_raw_forward(
-                        event,
-                        values,
-                        lambda native_replies, native_stickers, mode=raw_time_mode: (
-                            self.renderer.raw_burst_nodes(
-                                selected,
-                                target_name=target_name,
-                                total=len(records),
-                                page=page,
-                                pages=pages,
-                                skipped=broken,
-                                identity_incomplete=any(
-                                    record.identity_incomplete for record in selected
-                                ),
-                                native_stickers=native_stickers,
-                                native_replies=native_replies,
-                                time_mode=mode,
-                            )
-                        ),
-                        has_replies=any(record.has_replies() for record in selected),
-                        has_stickers=any(record.has_stickers() for record in selected),
-                    )
-                    if outcome == "success":
-                        self._operation_log_override = "原生多层嵌套"
-                        return
-                    if outcome == "ambiguous":
-                        await self._send_text(
-                            event, values["nested_forward_unknown_message"], values
+        # 爆典自身会包一层合集，因此按最终 OneBot 节点树深度做本地预检。
+        payload_depth = max(
+            (record.forward_depth() + 1 if record.type == "forward" else 1)
+            for record in selected
+        )
+        if payload_depth <= 3:
+            raw_time_modes = [configured_time_mode]
+            if configured_time_mode == "native":
+                raw_time_modes.append("none")
+            raw_error: Exception | None = None
+            for raw_time_mode in raw_time_modes:
+                outcome, raw_error = await self._try_raw_forward(
+                    event,
+                    values,
+                    lambda native_replies, native_stickers, mode=raw_time_mode: (
+                        self.renderer.raw_burst_nodes(
+                            selected,
+                            target_name=target_name,
+                            total=len(records),
+                            page=page,
+                            pages=pages,
+                            skipped=broken,
+                            identity_incomplete=any(
+                                record.identity_incomplete for record in selected
+                            ),
+                            native_stickers=native_stickers,
+                            native_replies=native_replies,
+                            time_mode=mode,
                         )
-                        self._operation_log_override = "多层嵌套结果未知"
-                        return
-            await self._send_text(
-                event, values["nested_forward_fallback_message"], values
+                    ),
+                    has_replies=any(record.has_replies() for record in selected),
+                    has_stickers=any(record.has_stickers() for record in selected),
+                )
+                if outcome == "success":
+                    self._operation_log_override = "原生合并转发"
+                    return
+                if outcome == "ambiguous":
+                    await self._send_text(
+                        event, values["nested_forward_unknown_message"], values
+                    )
+                    self._operation_log_override = "合并转发结果未知"
+                    return
+            logger.warning(
+                "群典：爆典原生合并转发失败，准备降级；页码=%s/%s，节点树深度=%s，原因=%s",
+                page,
+                pages,
+                payload_depth,
+                _error_reason(raw_error),
             )
-            force_flatten = True
+        else:
+            logger.warning(
+                "群典：爆典原生合并转发未发送，准备降级；节点树深度=%s，原因=超过 OneBot 安全深度 3",
+                payload_depth,
+            )
+        await self._send_text(event, values["nested_forward_fallback_message"], values)
         time_modes = [configured_time_mode]
         if configured_time_mode == "native":
             time_modes.append("none")
-        variants: list[tuple[bool, bool, bool, str]] = []
+        variants: list[tuple[bool, bool, str]] = []
         for time_mode in time_modes:
-            variants.append((not force_flatten, True, True, time_mode))
+            variants.append((True, True, time_mode))
         if any(record.has_replies() for record in selected):
             for time_mode in time_modes:
-                variants.append((not force_flatten, True, False, time_mode))
-        if any(record.type == "forward" for record in selected):
-            for time_mode in time_modes:
-                variants.append((False, True, True, time_mode))
-                variants.append((False, True, False, time_mode))
+                variants.append((True, False, time_mode))
         if any(record.has_stickers() for record in selected):
             variants.extend(
-                (nested, False, native_replies, time_mode)
-                for nested, _, native_replies, time_mode in list(variants)
+                (False, native_replies, time_mode)
+                for _, native_replies, time_mode in list(variants)
             )
         last_error: Exception | None = None
-        for nested, native_stickers, native_replies, time_mode in dict.fromkeys(
-            variants
-        ):
+        for native_stickers, native_replies, time_mode in dict.fromkeys(variants):
             try:
                 nodes = self.renderer.burst_nodes(
                     selected,
@@ -650,29 +722,35 @@ class IconicQuotesPlugin(Star):
                     identity_incomplete=any(
                         record.identity_incomplete for record in selected
                     ),
-                    nested=nested,
                     native_stickers=native_stickers,
                     native_replies=native_replies,
                     time_mode=time_mode,
                 )
                 await self._send_chain(event, [Comp.Nodes(nodes)], values)
                 if (
-                    not nested
-                    or not native_stickers
+                    not native_stickers
                     or not native_replies
                     or time_mode != configured_time_mode
                 ):
-                    self._operation_log_override = (
-                        "多层嵌套失败，已降级" if force_flatten else "已降级发送"
-                    )
+                    self._operation_log_override = "合并转发失败，已降级"
                 return
             except Exception as exc:  # noqa: BLE001 - OneBot 错误类型不统一。
                 last_error = exc
-                logger.debug("群典：爆典发送尝试失败，准备降级")
+                logger.debug(
+                    "群典：爆典降级发送失败；原生回复=%s，原生表情=%s，时间模式=%s，原因=%s",
+                    native_replies,
+                    native_stickers,
+                    time_mode,
+                    _error_reason(exc),
+                )
         if last_error is not None:
             self._operation_error_logged = True
             logger.error(
-                "群典：爆典发送失败",
+                "群典：爆典发送失败；页码=%s/%s，记录数=%s，原因=%s",
+                page,
+                pages,
+                len(selected),
+                _error_reason(last_error),
                 exc_info=(type(last_error), last_error, last_error.__traceback__),
             )
         await self._send_text(
@@ -699,8 +777,12 @@ class IconicQuotesPlugin(Star):
                 name = str(payload.get("card") or payload.get("nickname") or "").strip()
                 if name:
                     return name
-        except Exception:  # noqa: BLE001 - 昵称查询失败应回退存档。
-            logger.debug("群典：读取目标群名片失败")
+        except Exception as exc:  # noqa: BLE001 - 昵称查询失败应回退存档。
+            logger.debug(
+                "群典：读取目标群名片失败；用户=%s，原因=%s",
+                target_id,
+                _error_reason(exc),
+            )
 
         def find_node_name(node: ForwardNode) -> str | None:
             if node.author.user_id == target_id and node.author.nickname:
@@ -740,10 +822,10 @@ class IconicQuotesPlugin(Star):
                         [record],
                         values,
                         replay=True,
-                        allow_native_multilevel=False,
                     ):
                         return False
                 else:
+                    await self._send_missing_reply_warning(event, record, values)
                     await self._send_record_chain(event, record, values)
             return True
         if len(records) > 1 and values["aggregate_multiple"]:
@@ -758,13 +840,25 @@ class IconicQuotesPlugin(Star):
             if record.type == "forward":
                 await self._send_forward(event, [record], values, replay=True)
             elif values["send_mode"] == "card":
+                await self._send_missing_reply_warning(event, record, values)
                 if record.has_native_segments():
                     await self._send_record_chain(event, record, values)
                 else:
                     await self._send_card_with_fallback(event, record, values)
             else:
+                await self._send_missing_reply_warning(event, record, values)
                 await self._send_record_chain(event, record, values)
         return True
+
+    async def _send_missing_reply_warning(
+        self,
+        event: AstrMessageEvent,
+        record: QuoteRecord,
+        values: dict[str, Any],
+    ) -> None:
+        """单条普通消息在正文前独立提示已丢失的引用关系。"""
+        if warning := self.renderer.missing_reply_warning([record]):
+            await self._send_text(event, warning, values)
 
     async def _refresh_record_author_names(
         self,
@@ -814,8 +908,12 @@ class IconicQuotesPlugin(Star):
                 if name:
                     for snapshot in snapshots:
                         snapshot.nickname = name
-            except Exception:  # noqa: BLE001 - 昵称刷新失败应保留存档快照。
-                logger.debug("群典：刷新作者群名片失败")
+            except Exception as exc:  # noqa: BLE001 - 昵称刷新失败应保留存档快照。
+                logger.debug(
+                    "群典：刷新作者群名片失败；用户=%s，原因=%s",
+                    user_id,
+                    _error_reason(exc),
+                )
 
     async def _send_card_with_fallback(
         self,
@@ -831,8 +929,12 @@ class IconicQuotesPlugin(Star):
                 [Comp.Image.fromFileSystem(path) for path in paths],
                 values,
             )
-        except Exception:  # noqa: BLE001 - 渲染端点可抛出第三方异常。
-            logger.debug("群典：卡片生成失败，准备降级")
+        except Exception as exc:  # noqa: BLE001 - 渲染端点可抛出第三方异常。
+            logger.warning(
+                "群典：卡片生成失败，准备降级；记录=%s，原因=%s",
+                record.id,
+                _error_reason(exc),
+            )
             self._operation_log_override = "已降级发送"
             await self._send_record_chain(event, record, values)
             await self._send_text(
@@ -850,79 +952,49 @@ class IconicQuotesPlugin(Star):
         values: dict[str, Any],
         *,
         replay: bool,
-        allow_native_multilevel: bool = True,
     ) -> bool:
-        multilevel = any(record.forward_depth() >= 2 for record in records)
-        if allow_native_multilevel and multilevel:
-            payload_depth = max(record.forward_depth() for record in records)
-            if payload_depth <= 3 and await self._is_napcat(event):
-                outcome, _ = await self._try_raw_forward(
-                    event,
-                    values,
-                    lambda native_replies, native_stickers: (
-                        self.renderer.raw_forward_nodes(
-                            records,
-                            replay=replay,
-                            native_stickers=native_stickers,
-                            native_replies=native_replies,
-                        )
-                    ),
-                    has_replies=any(record.has_replies() for record in records),
-                    has_stickers=any(record.has_stickers() for record in records),
-                )
-                if outcome == "success":
-                    self._operation_log_override = "原生多层嵌套"
-                    return True
-                if outcome == "ambiguous":
-                    await self._send_text(
-                        event, values["nested_forward_unknown_message"], values
-                    )
-                    self._operation_log_override = "多层嵌套结果未知"
-                    return False
-            await self._send_text(
-                event, values["nested_forward_fallback_message"], values
-            )
-            sent = await self._send_forward_flattened(
-                event, records, values, replay=replay
-            )
-            if sent:
-                self._operation_log_override = "多层嵌套失败，已降级"
-                return True
-            return False
-
-        variants: list[tuple[bool, bool, bool]] = [(True, True, True)]
-        if any(record.has_replies() for record in records):
-            variants.append((True, False, True))
-        if any(record.has_nested_forwards() for record in records):
-            variants.extend([(False, True, True), (False, False, True)])
-        if any(record.has_stickers() for record in records):
-            variants.extend(
-                (native_nested, native_replies, False)
-                for native_nested, native_replies, _ in list(variants)
-            )
-        last_error: Exception | None = None
-        for native_nested, native_replies, native_stickers in dict.fromkeys(variants):
-            try:
-                nodes = self.renderer.forward_nodes(
+        # 一层与多层记录都优先从本地 JSON 重建，不再依赖易失的 res_id。
+        payload_depth = max((record.forward_depth() for record in records), default=1)
+        if payload_depth <= 3:
+            outcome, raw_error = await self._try_raw_forward(
+                event,
+                values,
+                lambda native_replies, native_stickers: self.renderer.raw_forward_nodes(
                     records,
                     replay=replay,
                     native_stickers=native_stickers,
                     native_replies=native_replies,
-                    native_nested=native_nested,
-                )
-                await self._send_chain(event, [Comp.Nodes(nodes)], values)
-                if not (native_nested and native_replies and native_stickers):
-                    self._operation_log_override = "已降级发送"
-                return True
-            except Exception as exc:  # noqa: BLE001 - OneBot 错误类型不统一。
-                last_error = exc
-                logger.debug("群典：合并转发尝试失败，准备降级")
-        if last_error is not None:
-            self._operation_error_logged = True
-            logger.error(
-                "群典：合并转发发送失败",
-                exc_info=(type(last_error), last_error, last_error.__traceback__),
+                ),
+                has_replies=any(record.has_replies() for record in records),
+                has_stickers=any(record.has_stickers() for record in records),
             )
+            if outcome == "success":
+                self._operation_log_override = "原生合并转发"
+                return True
+            if outcome == "ambiguous":
+                await self._send_text(
+                    event, values["nested_forward_unknown_message"], values
+                )
+                self._operation_log_override = "合并转发结果未知"
+                return False
+            logger.warning(
+                "群典：原生合并转发失败，准备降级；记录=%s，节点树深度=%s，原因=%s",
+                ",".join(record.id[:8] for record in records),
+                payload_depth,
+                _error_reason(raw_error),
+            )
+        else:
+            logger.warning(
+                "群典：原生合并转发未发送，准备降级；记录=%s，节点树深度=%s，原因=超过 OneBot 安全深度 3",
+                ",".join(record.id[:8] for record in records),
+                payload_depth,
+            )
+
+        await self._send_text(event, values["nested_forward_fallback_message"], values)
+        sent = await self._send_forward_flattened(event, records, values, replay=replay)
+        if sent:
+            self._operation_log_override = "合并转发失败，已降级"
+            return True
         await self._send_text(event, "合并转发发送失败，请稍后重试。", values)
         return False
 
@@ -950,29 +1022,26 @@ class IconicQuotesPlugin(Star):
                     replay=replay,
                     native_stickers=native_stickers,
                     native_replies=native_replies,
-                    native_nested=False,
                 )
                 await self._send_chain(event, [Comp.Nodes(nodes)], values)
                 return True
             except Exception as exc:  # noqa: BLE001 - OneBot 错误类型不统一。
                 last_error = exc
-                logger.debug("群典：多层嵌套降级发送尝试失败")
+                logger.debug(
+                    "群典：多层嵌套降级发送失败；原生回复=%s，原生表情=%s，原因=%s",
+                    native_replies,
+                    native_stickers,
+                    _error_reason(exc),
+                )
         if last_error is not None:
             self._operation_error_logged = True
             logger.error(
-                "群典：多层嵌套降级发送失败",
+                "群典：多层嵌套降级发送失败；记录=%s，原因=%s",
+                ",".join(record.id[:8] for record in records),
+                _error_reason(last_error),
                 exc_info=(type(last_error), last_error, last_error.__traceback__),
             )
         return False
-
-    async def _is_napcat(self, event: AstrMessageEvent) -> bool:
-        """通过 OneBot 版本信息识别 NapCat；查询失败视为不支持增强路径。"""
-        try:
-            payload = await call_onebot_action(event, "get_version_info")
-        except Exception:  # noqa: BLE001 - 版本查询失败不能阻塞普通降级路径。
-            logger.debug("群典：无法识别 OneBot 实现")
-            return False
-        return "napcat" in str(payload).casefold()
 
     async def _try_raw_forward(
         self,
@@ -997,7 +1066,12 @@ class IconicQuotesPlugin(Star):
                 messages = await builder(native_replies, native_stickers)
             except Exception as exc:  # noqa: BLE001 - 本地序列化失败属于明确失败。
                 last_error = exc
-                logger.debug("群典：构造原生多层嵌套失败")
+                logger.debug(
+                    "群典：构造原生多层嵌套失败；原生回复=%s，原生表情=%s，原因=%s",
+                    native_replies,
+                    native_stickers,
+                    _error_reason(exc),
+                )
                 continue
             outcome, error = await self._send_raw_forward_action(
                 event,
@@ -1009,7 +1083,13 @@ class IconicQuotesPlugin(Star):
             last_error = error
             if outcome == "ambiguous":
                 return outcome, error
-            logger.debug("群典：原生多层嵌套发送尝试失败")
+            logger.debug(
+                "群典：原生多层嵌套发送失败；原生回复=%s，原生表情=%s，结果=%s，原因=%s",
+                native_replies,
+                native_stickers,
+                outcome,
+                _error_reason(error),
+            )
         return "explicit", last_error
 
     async def _send_raw_forward_action(
@@ -1051,9 +1131,23 @@ class IconicQuotesPlugin(Star):
                     last_outcome == "ambiguous"
                     and not values["retry_on_ambiguous_failure"]
                 ):
+                    logger.warning(
+                        "群典：原生合并转发结果未知，停止重试；尝试=%s/%s，节点数=%s，原因=%s",
+                        attempt + 1,
+                        attempts,
+                        len(messages),
+                        _error_reason(exc),
+                    )
                     break
             if attempt + 1 < attempts:
-                logger.debug("群典：原生多层嵌套发送重试")
+                logger.debug(
+                    "群典：原生合并转发发送失败，准备重试；尝试=%s/%s，结果=%s，节点数=%s，原因=%s",
+                    attempt + 1,
+                    attempts,
+                    last_outcome,
+                    len(messages),
+                    _error_reason(last_error),
+                )
                 await asyncio.sleep(delay)
         # 任一次结果未知都意味着消息可能已经送达，后续明确失败不能消除重复风险。
         return ("ambiguous" if saw_ambiguous else last_outcome), last_error
@@ -1098,7 +1192,6 @@ class IconicQuotesPlugin(Star):
                         [record],
                         native_stickers=native_stickers,
                         native_replies=False,
-                        native_nested=False,
                     )
                     await self._send_chain(event, [Comp.Nodes(nodes)], values)
                     self._operation_log_override = "已降级发送"
@@ -1134,6 +1227,32 @@ class IconicQuotesPlugin(Star):
             values,
         )
 
+    async def _show_help(
+        self,
+        event: AstrMessageEvent,
+        values: dict[str, Any],
+    ) -> None:
+        """发送当前群配置渲染后的总帮助。"""
+        if not values["help_enabled"]:
+            await self._send_text(event, "群典帮助功能未启用。", values)
+            return
+        overview = render_help_template(values["help_overview_template"], values)
+        if not overview:
+            sections = []
+            for operation, label in (
+                ("add", "添加"),
+                ("query", "查询"),
+                ("burst", "爆典"),
+                ("info", "统计"),
+                ("delete", "删除"),
+                ("help", "帮助"),
+            ):
+                usage = operation_usage(values, operation)
+                if usage:
+                    sections.append(f"{label}：{usage}")
+            overview = "群典帮助" + ("\n" + "\n".join(sections) if sections else "")
+        await self._send_text(event, overview, values)
+
     async def _prepare_delete(
         self,
         event: AstrMessageEvent,
@@ -1141,8 +1260,7 @@ class IconicQuotesPlugin(Star):
         keyword: str,
     ) -> None:
         if not keyword.strip():
-            await self._send_text(event, "请提供要匹配的正文字符串。", values)
-            return
+            raise UsageError("请提供要匹配的正文字符串。", "delete")
         matches = await self.storage.search(str(event.get_group_id()), keyword)
         if not matches:
             await self._send_text(event, "没有找到包含该字符串的群典。", values)
@@ -1199,6 +1317,20 @@ class IconicQuotesPlugin(Star):
     ) -> None:
         await self._send_chain(event, [Comp.Plain(text)], values)
 
+    async def _send_usage_error(
+        self,
+        event: AstrMessageEvent,
+        reason: str,
+        values: dict[str, Any],
+        operation: str,
+    ) -> None:
+        """把参数错误与当前操作用法合并为一条消息。"""
+        usage = operation_usage(values, operation)
+        message = reason
+        if values["help_enabled"] and usage:
+            message += f"\n\n用法：{usage}"
+        await self._send_text(event, message, values)
+
     async def _send_chain(
         self,
         event: AstrMessageEvent,
@@ -1220,7 +1352,13 @@ class IconicQuotesPlugin(Star):
             except Exception as exc:  # noqa: BLE001 - OneBot 适配器异常类型不稳定。
                 last_error = exc
             if attempt + 1 < attempts:
-                logger.debug("群典：消息发送尝试失败，准备重试")
+                logger.debug(
+                    "群典：消息发送失败，准备重试；尝试=%s/%s，消息段数=%s，原因=%s",
+                    attempt + 1,
+                    attempts,
+                    len(chain),
+                    _error_reason(last_error),
+                )
                 await asyncio.sleep(delay)
         assert last_error is not None
         raise last_error
@@ -1236,17 +1374,30 @@ class IconicQuotesPlugin(Star):
 
     @staticmethod
     def _has_capture_source(event: AstrMessageEvent) -> bool:
-        return any(
+        return IconicQuotesPlugin._capture_source_count(event) > 0
+
+    @staticmethod
+    def _capture_source_count(event: AstrMessageEvent) -> int:
+        """统计唯一收录来源，并兼容 AstrBot 未展开的原始 reply 段。"""
+        messages = list(event.get_messages())
+        count = sum(
             isinstance(item, (Comp.Reply, Comp.Forward, Comp.Node, Comp.Nodes))
-            for item in event.get_messages()
+            for item in messages
         )
+        if any(isinstance(item, Comp.Reply) for item in messages):
+            return count
+        raw = getattr(event.message_obj, "raw_message", None)
+        raw_segments = raw.get("message") if isinstance(raw, dict) else None
+        if isinstance(raw_segments, list) and any(
+            isinstance(item, dict) and item.get("type") == "reply"
+            for item in raw_segments
+        ):
+            count += 1
+        return count
 
     def _is_command_event(self, event: AstrMessageEvent) -> bool:
         """识别命令事件，避免去前缀后的正文再次命中关键词监听器。"""
-        if getattr(event, "is_at_or_wake_command", False) or event.get_extra(
-            COMMAND_EVENT_KEY,
-            False,
-        ):
+        if event.get_extra(COMMAND_EVENT_KEY, False):
             return True
         candidates = [str(getattr(event.message_obj, "message_str", "") or "")]
         raw = getattr(event.message_obj, "raw_message", None)
