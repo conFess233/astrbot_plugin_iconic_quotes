@@ -104,6 +104,7 @@ python -m pip install -r requirements.txt
 | `/群典 @某人`        | 随机发送指定成员的群典                   |
 | `/群典 @某人 <关键词>` | 随机发送该成员包含关键词的群典           |
 | `/群典 info`         | 查看当前群的汇总统计，不展示具体内容     |
+| `/群典 help` / `/群典 帮助` | 查看当前群配置对应的插件帮助             |
 | `/爆典 @某人 [页码]` | 按记录时间查看该成员参与的全部群典       |
 | `/删除群典 <文字>`   | 发送完整待删除记录，并创建 60 秒确认窗口 |
 | `/确认删除`          | 删除当前用户最近一次预览并确认的记录     |
@@ -117,8 +118,9 @@ python -m pip install -r requirements.txt
 | `群典 @某人`        | 随机发送指定成员的群典            |
 | `群典 @某人 <关键词>` | 随机发送该成员包含关键词的群典    |
 | `爆典 @某人 [页码]` | 获取指定成员的完整群典合集        |
+| `群典 help` / `群典 帮助` | 查看插件帮助                      |
 
-关键词会在去除首尾空白后按完整语法匹配。关键词开关和列表可以修改，关闭关键词不会禁用对应的斜杠指令；当关键词发生冲突时，爆典语法优先。
+关键词会在去除首尾空白后按完整语法匹配，也支持在消息开头先 `@Bot`。关键词开关和列表可以修改，关闭关键词不会禁用对应的斜杠指令；当关键词发生冲突时，爆典语法优先。调用格式错误时，插件会在失败原因后附带当前操作的可配置用法。
 
 ### 收录内容
 
@@ -178,6 +180,18 @@ python -m pip install -r requirements.txt
 | `burst_time_mode`       | `text`   | `text` 独立节点、实验性 `native` 或 `none` |
 | `burst_roles`           | `member` | 可使用爆典的角色            |
 
+### 帮助消息
+
+| 配置键                     | 默认值           | 作用                                      |
+| -------------------------- | ---------------- | ----------------------------------------- |
+| `help_enabled`             | `true`           | 启用主动帮助和参数错误后的用法提示        |
+| `help_keywords`            | `help`、`帮助`   | `/群典` 与查询关键词后的帮助子关键词      |
+| `help_overview_template`   | 见配置页         | 主动帮助模板；留空时组合各操作模板        |
+| `help_*_template`          | 见配置页         | 各操作用法；留空可单独关闭对应提示        |
+| `help_roles`               | `everyone`       | 主动调用帮助的权限                        |
+
+帮助模板支持 `{add_keywords}`、`{query_keywords}`、`{burst_keywords}`、`{burst_page_size}` 和 `{max_query_keyword_chars}`。这些配置均支持群级覆盖；关闭某类关键词后，总帮助会隐藏对应的关键词说明。
+
 ### 权限与名单
 
 每项操作可选择 `bot_admin`、`owner`、`admin`、`member` 或 `everyone`。
@@ -189,6 +203,7 @@ python -m pip install -r requirements.txt
 | `burst_roles`                         | `member`    | 爆典权限                     |
 | `info_roles`                          | `everyone`  | 查看统计权限                 |
 | `delete_roles`                        | `bot_admin` | 删除权限                     |
+| `help_roles`                          | `everyone`  | 主动查看帮助的权限           |
 | `group_blacklist` / `group_whitelist` | 空          | 限制可使用插件的群           |
 | `user_blacklist` / `user_whitelist`   | 空          | 限制可调用插件的用户         |
 | `excluded_author_ids`                 | 空          | 禁止指定 QQ 用户的消息被收录 |
