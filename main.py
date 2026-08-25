@@ -185,10 +185,18 @@ class IconicQuotesPlugin(Star):
     @filter.command("群典")
     async def query_quote(self, event: AstrMessageEvent, argument: str = ""):
         """随机发送群典；参数 info 用于查看当前群统计。"""
+        plain_text = self._plain_text(event)
+        syntax_match, search_keyword = self._match_query_syntax(
+            plain_text,
+            ["群典"],
+        )
+        # AstrBot 可能把“@用户 + 普通文本”交给命令过滤器；只有正文完整匹配
+        # 群典调用语法时才接管事件，避免将普通群聊误判成带关键词的查询。
+        if not syntax_match:
+            return
         event.set_extra(COMMAND_EVENT_KEY, True)
         targets = self._mentioned_users(event)
-        plain_text = self._plain_text(event)
-        command_argument = argument.strip() or self._command_tail(plain_text, "群典")
+        command_argument = search_keyword or ""
         try:
             group_id = str(event.get_group_id() or "")
             current_values = (
@@ -199,14 +207,7 @@ class IconicQuotesPlugin(Star):
             help_keywords = current_values["help_keywords"]
         except Exception:  # noqa: BLE001 - 配置错误由统一分发器给出正式提示。
             help_keywords = ["help", "帮助"]
-        if not targets and (
-            argument.strip().casefold() == "info"
-            or self._command_tail(
-                event.message_str,
-                "群典",
-            ).casefold()
-            == "info"
-        ):
+        if not targets and command_argument.casefold() == "info":
             await self._dispatch(
                 event, "info", self._show_info, trigger_source="command"
             )
@@ -216,12 +217,6 @@ class IconicQuotesPlugin(Star):
                 event, "help", self._show_help, trigger_source="command"
             )
             return
-        syntax_match, search_keyword = self._match_query_syntax(
-            plain_text,
-            ["群典"],
-        )
-        if not syntax_match and argument.strip():
-            search_keyword = argument.strip()
         await self._dispatch(
             event,
             "query",
