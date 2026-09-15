@@ -154,6 +154,9 @@ const CONFIG_SECTIONS = [
     { key: "burst_keywords", label: "爆典关键词", type: "list", hint: "每行一个关键词；用法：爆典 @某人 [页码]。" },
     { key: "burst_page_size", label: "爆典每页条数", type: "number", min: 1, max: 100 },
     { key: "burst_time_mode", label: "爆典时间显示", type: "select", options: [["text", "独立文字节点"], ["native", "原生时间（实验）"], ["none", "不显示"]] },
+    { key: "poke_enabled", label: "启用戳一戳群典", type: "boolean", hint: "群成员戳机器人时触发，沿用查询权限、名单和全局冷却。" },
+    { key: "poke_send_count", label: "戳一戳发送条数", type: "number", min: 1, max: 10 },
+    { key: "poke_send_mode", label: "戳一戳发送方式", type: "select", options: [["text", "正常"], ["card", "图片"]] },
     { key: "send_count", label: "最大发送条数", type: "number", min: 1, max: 10 },
     { key: "random_send_count", label: "随机发送条数", type: "boolean", hint: "开启后每次从 1 到最大发送条数中随机。" },
     { key: "send_mode", label: "单条发送方式", type: "select", options: [["text", "文字"], ["card", "图片卡片"]] },
@@ -221,6 +224,7 @@ const CONFIG_SECTIONS = [
 
 const ALL_FIELDS = CONFIG_SECTIONS.flatMap((section) => section.fields);
 const OVERRIDE_KEYS = new Set(["add_keyword_enabled", "add_keywords", "query_keyword_enabled", "query_keywords", "burst_keyword_enabled", "burst_keywords", "burst_page_size", "burst_time_mode", "help_enabled", "help_keywords", "help_overview_template", "help_add_template", "help_query_template", "help_burst_template", "help_info_template", "help_delete_template", "help_help_template", "send_count", "random_send_count", "send_mode", "aggregate_multiple", "allow_bot_authors", "max_records_per_group", "add_roles", "query_roles", "burst_roles", "info_roles", "delete_roles", "help_roles", "user_blacklist", "user_whitelist", "excluded_author_ids", "nested_forward_fallback_message", "nested_forward_unknown_message"]);
+["poke_enabled", "poke_send_count", "poke_send_mode"].forEach((key) => OVERRIDE_KEYS.add(key));
 const OVERRIDE_FIELDS = ALL_FIELDS.filter((field) => OVERRIDE_KEYS.has(field.key));
 
 function normalizeList(value) { return Array.isArray(value) ? value : []; }

@@ -27,6 +27,9 @@ HELP_TEMPLATE_KEYS = {
     "help_help_template",
 }
 GROUP_OVERRIDE_KEYS = {
+    "poke_enabled",
+    "poke_send_count",
+    "poke_send_mode",
     "add_keyword_enabled",
     "add_keywords",
     "query_keyword_enabled",
@@ -60,6 +63,9 @@ GROUP_OVERRIDE_KEYS = {
 
 
 DEFAULTS: dict[str, Any] = {
+    "poke_enabled": False,
+    "poke_send_count": 1,
+    "poke_send_mode": "text",
     "storage_subdir": "iconic_quotes",
     "add_keyword_enabled": True,
     "add_keywords": ["添加群典"],
@@ -257,6 +263,7 @@ class SettingsService:
     ) -> dict[str, Any]:
         result = copy.deepcopy(value)
         integer_ranges = {
+            "poke_send_count": (1, 10),
             "max_records_per_group": (1, 100_000),
             "max_media_mb": (1, 102_400),
             "max_image_mb": (1, 100),
@@ -291,10 +298,13 @@ class SettingsService:
             raise ValueError("卡片最小高度不能大于最大高度")
         if result.get("send_mode") not in {"text", "card"}:
             raise ValueError("send_mode 只能是 text 或 card")
+        if result.get("poke_send_mode") not in {"text", "card"}:
+            raise ValueError("poke_send_mode 只能是 text 或 card")
         if result.get("burst_time_mode") not in {"text", "native", "none"}:
             raise ValueError("burst_time_mode 只能是 text、native 或 none")
         for key in (
             "add_keyword_enabled",
+            "poke_enabled",
             "query_keyword_enabled",
             "burst_keyword_enabled",
             "help_enabled",

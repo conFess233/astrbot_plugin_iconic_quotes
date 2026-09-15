@@ -1,4 +1,23 @@
 {
+  "poke_enabled": {
+    "description": "启用戳一戳群典",
+    "type": "bool",
+    "default": false,
+    "hint": "仅群成员戳机器人时随机发送当前群的记录，沿用查询权限、名单与全局冷却；支持群级覆盖。"
+  },
+  "poke_send_count": {
+    "description": "戳一戳发送条数",
+    "type": "int",
+    "default": 1,
+    "hint": "范围 1 到 10；随机抽取不重复记录，不足时发送已有记录。"
+  },
+  "poke_send_mode": {
+    "description": "戳一戳发送方式",
+    "type": "string",
+    "options": ["text", "card"],
+    "default": "text",
+    "hint": "text：正常发送，沿用合并转发配置；card：逐条图片卡片，聊天记录保持合并转发，卡片失败发送原消息。"
+  },
   "storage_subdir": {
     "description": "存储相对目录",
     "type": "string",

@@ -273,6 +273,10 @@ class IconicQuotesPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def keyword_listener(self, event: AstrMessageEvent):
         """处理无需命令前缀的精确关键词和 @用户 群典。"""
+        raw = getattr(event.message_obj, "raw_message", None)
+        if isinstance(raw, dict) and raw.get("post_type") == "notice":
+            await self._handle_poke(event, raw)
+            return
         if self._is_command_event(event):
             return
         if self._is_bot_message(event):
@@ -343,6 +347,38 @@ class IconicQuotesPlugin(Star):
                 event, "add", self._add_quote, trigger_source="keyword"
             )
 
+    async def _handle_poke(self, event: AstrMessageEvent, raw: dict) -> None:
+        """只消费当前群成员戳机器人的通知，复用查询权限和全局冷却。"""
+        if (
+            event.get_platform_name() != "aiocqhttp"
+            or raw.get("notice_type") != "notify"
+            or raw.get("sub_type") != "poke"
+            or not event.get_group_id()
+            or str(raw.get("target_id", "")) != str(event.get_self_id())
+            or not raw.get("user_id")
+            or str(raw["user_id"]) == str(event.get_self_id())
+        ):
+            return
+        values = self.settings.for_group(str(event.get_group_id()))
+        if not values["poke_enabled"]:
+            return
+        event.stop_event()
+        await self._dispatch(
+            event, "query", self._send_poke_quotes, trigger_source="poke"
+        )
+
+    async def _send_poke_quotes(self, event: AstrMessageEvent, values: dict) -> None:
+        """使用本次发送配置快照，避免戳一戳设置影响普通查询。"""
+        current = dict(values)
+        current.update(
+            send_count=values["poke_send_count"],
+            random_send_count=False,
+            send_mode=values["poke_send_mode"],
+        )
+        if current["send_mode"] == "card":
+            current["aggregate_multiple"] = False
+        await self._send_random_quote(event, current)
+
     async def _dispatch(
         self,
         event: AstrMessageEvent,
@@ -368,6 +404,8 @@ class IconicQuotesPlugin(Star):
             "delete": "删除",
             "help": "帮助",
         }.get(operation, "操作")
+        if trigger_source == "poke":
+            operation_label = "戳一戳发送"
 
         def log_result(result: str) -> None:
             if result == "success" and self._operation_error_logged:
