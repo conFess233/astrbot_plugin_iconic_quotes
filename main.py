@@ -179,6 +179,8 @@ class IconicQuotesPlugin(Star):
     @filter.command("添加群典")
     async def add_quote(self, event: AstrMessageEvent):
         """收录当前消息引用的一条消息或合并转发。"""
+        if self._plain_text(event).lstrip("/") != "添加群典":
+            return
         event.set_extra(COMMAND_EVENT_KEY, True)
         await self._dispatch(event, "add", self._add_quote, trigger_source="command")
 
@@ -231,6 +233,8 @@ class IconicQuotesPlugin(Star):
     @filter.command("爆典")
     async def burst_quote(self, event: AstrMessageEvent, argument: str = ""):
         """分页获取当前群中指定成员参与的全部群典记录。"""
+        if not match_command_syntax(self._plain_text(event), ["爆典"])[0]:
+            return
         event.set_extra(COMMAND_EVENT_KEY, True)
         _, page_value = self._match_burst_syntax(self._plain_text(event), ["爆典"])
         if page_value is None and argument.strip():
@@ -245,6 +249,8 @@ class IconicQuotesPlugin(Star):
     @filter.command("删除群典")
     async def delete_quote(self, event: AstrMessageEvent, keyword: str = ""):
         """预览正文包含指定字符串的记录，并创建删除确认。"""
+        if not match_command_syntax(self._plain_text(event), ["删除群典"])[0]:
+            return
         event.set_extra(COMMAND_EVENT_KEY, True)
         search = self._command_tail(event.message_str, "删除群典") or keyword
         await self._dispatch(
@@ -257,6 +263,8 @@ class IconicQuotesPlugin(Star):
     @filter.command("确认删除")
     async def confirm_delete(self, event: AstrMessageEvent):
         """在 60 秒内确认当前用户最近一次删除预览。"""
+        if self._plain_text(event).lstrip("/") != "确认删除":
+            return
         event.set_extra(COMMAND_EVENT_KEY, True)
         await self._dispatch(
             event, "delete", self._confirm_delete, trigger_source="command"
@@ -1431,6 +1439,16 @@ class IconicQuotesPlugin(Star):
 
     @staticmethod
     def _plain_text(event: AstrMessageEvent) -> str:
+        # 原始文本段是用户实际输入；不匹配 @ 昵称、引用快照和其他消息段。
+        raw = getattr(event.message_obj, "raw_message", None)
+        if isinstance(raw, dict) and isinstance(raw.get("message"), list):
+            return " ".join(
+                str(item.get("data", {}).get("text", "")).strip()
+                for item in raw["message"]
+                if isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("data"), dict)
+            ).strip()
         return " ".join(
             str(item.text).strip()
             for item in event.get_messages()
