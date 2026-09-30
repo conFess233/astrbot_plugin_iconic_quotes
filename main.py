@@ -1487,6 +1487,21 @@ class IconicQuotesPlugin(Star):
                 and item.get("type") == "text"
                 and isinstance(item.get("data"), dict)
             ).strip()
+        if isinstance(raw, dict):
+            raw_text = raw.get("message")
+            if not isinstance(raw_text, str):
+                raw_text = raw.get("raw_message")
+            if isinstance(raw_text, str):
+                # OneBot 也可能使用 CQ 字符串；同样只读取原始正文，
+                # 不能退回框架加工后的 Plain，否则 @ 昵称可能变成命令。
+                messages = OneBotQuoteExtractor._payload_components(
+                    {"message": raw_text}
+                )
+                return " ".join(
+                    str(item.text).strip()
+                    for item in messages
+                    if isinstance(item, Comp.Plain) and str(item.text).strip()
+                ).strip()
         return " ".join(
             str(item.text).strip()
             for item in event.get_messages()
