@@ -3,7 +3,7 @@
 <p align="center">让群友的抽象发言变成经典罢！😋</p>
 
 <p align="center">
-  <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.1.4-blue" alt="Version 1.1.4"></a>
+  <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.1.9-blue" alt="Version 1.1.9"></a>
   <a href="https://github.com/AstrBotDevs/AstrBot"><img src="https://img.shields.io/badge/AstrBot-%3E%3D4.24.2%20%3C5-blue" alt="AstrBot >=4.24.2 <5"></a>
   <img src="https://img.shields.io/badge/platform-OneBot%2011%20%7C%20QQ-blue" alt="OneBot 11 / QQ">
   <a href="./LICENSE.txt"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="AGPL-3.0"></a>
