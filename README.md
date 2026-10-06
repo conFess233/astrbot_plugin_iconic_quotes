@@ -3,7 +3,7 @@
 <p align="center">让群友的抽象发言变成经典罢！😋</p>
 
 <p align="center">
-  <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.1.9-blue" alt="Version 1.1.9"></a>
+  <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.1.10-blue" alt="Version 1.1.10"></a>
   <a href="https://github.com/AstrBotDevs/AstrBot"><img src="https://img.shields.io/badge/AstrBot-%3E%3D4.24.2%20%3C5-blue" alt="AstrBot >=4.24.2 <5"></a>
   <img src="https://img.shields.io/badge/platform-OneBot%2011%20%7C%20QQ-blue" alt="OneBot 11 / QQ">
   <a href="./LICENSE.txt"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="AGPL-3.0"></a>
@@ -32,7 +32,7 @@
 开关默认关闭，三个配置均可通过插件配置和管理页面修改，也支持群级覆盖。
 戳一戳沿用查询权限、黑白名单和全局冷却，仅戳机器人有效。
 
-普通聊天中的多个 @ 不构成群典调用，必须在正文中包含符合调用语法的关键词。
+普通聊天中的多个 @ 不构成群典调用。调用关键词必须位于正文开头，前面只允许空白、引用和一个 `@Bot`；目标成员的 @ 放在关键词之后。`@甲 @乙 群典 消息` 会作为普通聊天处理，不回复或拦截。
 
 | 能力     | 说明                                                       |
 | -------- | ---------------------------------------------------------- |
@@ -132,7 +132,7 @@ python -m pip install -r requirements.txt
 | `爆典 @某人 [页码]` | 获取指定成员的完整群典合集        |
 | `群典 help` / `群典 帮助` | 查看插件帮助                      |
 
-关键词会在去除首尾空白后按完整语法匹配，也支持在消息开头先 `@Bot`。关键词开关和列表可以修改，关闭关键词不会禁用对应的斜杠指令；当关键词发生冲突时，爆典语法优先。调用格式错误时，插件会在失败原因后附带当前操作的可配置用法。
+关键词会在去除首尾空白后按完整语法匹配，也支持在消息开头先引用消息或 `@Bot`。成员 @ 不得位于关键词前；`群典 @甲 @乙` 会提示只能指定一名成员，`群典 @甲 @甲` 按同一名成员处理。关键词开关和列表可以修改，关闭关键词不会禁用对应的斜杠指令；当关键词发生冲突时，爆典语法优先。调用格式错误时，插件会在失败原因后附带当前操作的可配置用法。
 
 ### 收录内容
 
@@ -167,7 +167,7 @@ python -m pip install -r requirements.txt
 
 ## 配置
 
-所有配置都可以在 AstrBot 插件配置或“群典管理”Plugin Page 中修改。以下是最常用的配置。
+所有配置都可以在 AstrBot 插件配置或“群典管理”Plugin Page 中修改。管理页保存成功后立即生效；保存失败保留草稿并继续使用旧配置。宿主插件配置页面保存后由 AstrBot 重载插件。以下是最常用的配置。
 
 ### 触发与发送
 
@@ -283,6 +283,10 @@ python -m pip install -r requirements.txt
 - 预检并确认导入备份，查看新增、重复、冲突和缺失资源统计
 - 显式迁移存储目录，并保留迁移前备份
 - 查看头像缓存数量与占用，清理无引用头像或二次确认后清空缓存
+
+管理页保存期间暂时禁用配置编辑和重复写入；刷新数据或恢复备份配置会替换未保存草稿，必须先确认。取消后保留草稿。备份记录已导入但配置恢复失败时，会明确提示部分完成，原配置继续有效。
+
+发送超时或断线意味着结果可能未知。`retry_on_ambiguous_failure` 默认关闭，此时停止重试及格式降级，请先检查群聊是否已经收到消息；显式开启后允许按次数重试，但最终仍未知时不会换格式补发。开启此选项可能造成重复消息。
 
 <a id="data-security"></a>
 

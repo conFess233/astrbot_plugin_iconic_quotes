@@ -22,7 +22,7 @@ from .models import AuthorSnapshot, ForwardNode, QuoteRecord, ReplySnapshot
 from .services.avatar_cache import AvatarCacheService
 from .services.cooldown import GlobalCooldown
 from .services.identity import AuthorIdentityService
-from .services.onebot import CaptureError, OneBotQuoteExtractor
+from .services.onebot import CaptureError, OneBotQuoteExtractor, _RawReply
 from .services.permissions import (
     PermissionService,
     RoleLookupError,
@@ -36,7 +36,7 @@ from .services.web_manager import WebManager
 from .utils.hashing import calculate_record_hash
 from .utils.help import is_help_keyword, operation_usage, render_help_template
 from .utils.randomization import resolve_send_count
-from .utils.validation import match_command_syntax
+from .utils.validation import match_command_syntax, parse_command_segments
 
 PLUGIN_NAME = "astrbot_plugin_iconic_quotes"
 COMMAND_EVENT_KEY = "iconic_quotes_command_event"
@@ -64,6 +64,10 @@ class UsageError(ValueError):
     def __init__(self, message: str, operation: str):
         super().__init__(message)
         self.operation = operation
+
+
+class AmbiguousSendError(RuntimeError):
+    """发送可能已经送达，不能继续切换格式或创建删除确认。"""
 
 
 class IconicQuotesPlugin(Star):
@@ -179,7 +183,7 @@ class IconicQuotesPlugin(Star):
     @filter.command("添加群典")
     async def add_quote(self, event: AstrMessageEvent):
         """收录当前消息引用的一条消息或合并转发。"""
-        if self._plain_text(event).lstrip("/") != "添加群典":
+        if self._plain_text(event) not in {"添加群典", "/添加群典"}:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
         await self._dispatch(event, "add", self._add_quote, trigger_source="command")
@@ -188,7 +192,7 @@ class IconicQuotesPlugin(Star):
     async def query_quote(self, event: AstrMessageEvent, argument: str = ""):
         """随机发送群典；参数 info 用于查看当前群统计。"""
         plain_text = self._plain_text(event)
-        syntax_match, search_keyword = self._match_query_syntax(
+        syntax_match, search_keyword = match_command_syntax(
             plain_text,
             ["群典"],
         )
@@ -233,12 +237,10 @@ class IconicQuotesPlugin(Star):
     @filter.command("爆典")
     async def burst_quote(self, event: AstrMessageEvent, argument: str = ""):
         """分页获取当前群中指定成员参与的全部群典记录。"""
-        if not match_command_syntax(self._plain_text(event), ["爆典"])[0]:
+        matched, page_value = match_command_syntax(self._plain_text(event), ["爆典"])
+        if not matched:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
-        _, page_value = self._match_burst_syntax(self._plain_text(event), ["爆典"])
-        if page_value is None and argument.strip():
-            page_value = argument.strip()
         await self._dispatch(
             event,
             "burst",
@@ -249,10 +251,11 @@ class IconicQuotesPlugin(Star):
     @filter.command("删除群典")
     async def delete_quote(self, event: AstrMessageEvent, keyword: str = ""):
         """预览正文包含指定字符串的记录，并创建删除确认。"""
-        if not match_command_syntax(self._plain_text(event), ["删除群典"])[0]:
+        matched, search = match_command_syntax(self._plain_text(event), ["删除群典"])
+        if not matched:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
-        search = self._command_tail(event.message_str, "删除群典") or keyword
+        search = search or ""
         await self._dispatch(
             event,
             "delete",
@@ -263,7 +266,7 @@ class IconicQuotesPlugin(Star):
     @filter.command("确认删除")
     async def confirm_delete(self, event: AstrMessageEvent):
         """在 60 秒内确认当前用户最近一次删除预览。"""
-        if self._plain_text(event).lstrip("/") != "确认删除":
+        if self._plain_text(event) not in {"确认删除", "/确认删除"}:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
         await self._dispatch(
@@ -272,7 +275,7 @@ class IconicQuotesPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def keyword_listener(self, event: AstrMessageEvent):
-        """处理无需命令前缀的精确关键词和 @用户 群典。"""
+        """处理关键词在前、目标 @ 在后的调用与机器人戳一戳。"""
         raw = getattr(event.message_obj, "raw_message", None)
         if isinstance(raw, dict) and raw.get("post_type") == "notice":
             await self._handle_poke(event, raw)
@@ -282,6 +285,8 @@ class IconicQuotesPlugin(Star):
         if self._is_bot_message(event):
             return
         plain_text = self._plain_text(event)
+        if not plain_text:
+            return
         group_id = str(event.get_group_id() or "")
         values = (
             self.settings.for_group(group_id)
@@ -292,18 +297,19 @@ class IconicQuotesPlugin(Star):
         add_match = (
             values["add_keyword_enabled"] and plain_text in values["add_keywords"]
         )
-        query_syntax_match, search_keyword = self._match_query_syntax(
+        query_syntax_match, search_keyword = match_command_syntax(
             plain_text,
             values["query_keywords"],
         )
         targets = self._mentioned_users(event)
         help_match = (
-            query_syntax_match
+            values["query_keyword_enabled"]
+            and query_syntax_match
             and not targets
             and is_help_keyword(search_keyword, values["help_keywords"])
         )
         query_match = values["query_keyword_enabled"] and query_syntax_match
-        burst_match, burst_page = self._match_burst_syntax(
+        burst_match, burst_page = match_command_syntax(
             plain_text,
             values["burst_keywords"],
         )
@@ -392,9 +398,6 @@ class IconicQuotesPlugin(Star):
         platform = event.get_platform_name()
         group_id = str(event.get_group_id() or "")
         user_id = str(event.get_sender_id() or "")
-        _ = trigger_source
-        self._operation_log_override = None
-        self._operation_error_logged = False
         failure_reason: str | None = None
         operation_label = {
             "add": "添加",
@@ -477,6 +480,8 @@ class IconicQuotesPlugin(Star):
             log_result("cooldown")
             return
         self._sent_in_operation = False
+        self._operation_log_override = None
+        self._operation_error_logged = False
         result = "success"
         try:
             try:
@@ -490,7 +495,8 @@ class IconicQuotesPlugin(Star):
                 result = "permission_denied"
                 await self._send_text(event, "你没有执行此操作的权限。", values)
                 return
-            await action(event, values)
+            with self.storage.media_checks():
+                await action(event, values)
         except DuplicateQuoteError as exc:
             result = "duplicate"
             await self._send_text(
@@ -498,6 +504,13 @@ class IconicQuotesPlugin(Star):
                 (f"该群典已存在。\n记录 ID：{exc.record.id[:8]}"),
                 values,
             )
+        except AmbiguousSendError as exc:
+            result = "operation_failed"
+            failure_reason = _error_reason(exc)
+            with contextlib.suppress(Exception):
+                await self._send_text(
+                    event, "消息发送结果未知，已停止重试和降级，请先检查群聊。", values
+                )
         except UsageError as exc:
             result = "usage_error"
             failure_reason = _error_reason(exc)
@@ -753,7 +766,8 @@ class IconicQuotesPlugin(Star):
         last_error: Exception | None = None
         for native_stickers, native_replies, time_mode in dict.fromkeys(variants):
             try:
-                nodes = self.renderer.burst_nodes(
+                nodes = await asyncio.to_thread(
+                    self.renderer.burst_nodes,
                     selected,
                     target_name=target_name,
                     total=len(records),
@@ -775,8 +789,10 @@ class IconicQuotesPlugin(Star):
                 ):
                     self._operation_log_override = "合并转发失败，已降级"
                 return
-            except Exception as exc:  # noqa: BLE001 - OneBot 错误类型不统一。
+            except Exception as exc:
                 last_error = exc
+                if isinstance(exc, AmbiguousSendError):
+                    raise
                 logger.debug(
                     "群典：爆典降级发送失败；原生回复=%s，原生表情=%s，时间模式=%s，原因=%s",
                     native_replies,
@@ -872,14 +888,18 @@ class IconicQuotesPlugin(Star):
         if len(records) > 1 and values["aggregate_multiple"]:
             ordinary = [record for record in records if record.type == "message"]
             forwarded = [record for record in records if record.type == "forward"]
-            if ordinary:
-                await self._send_forward(event, ordinary, values, replay=False)
+            if ordinary and not await self._send_forward(
+                event, ordinary, values, replay=False
+            ):
+                return False
             for record in forwarded:
-                await self._send_forward(event, [record], values, replay=True)
+                if not await self._send_forward(event, [record], values, replay=True):
+                    return False
             return True
         for record in records:
             if record.type == "forward":
-                await self._send_forward(event, [record], values, replay=True)
+                if not await self._send_forward(event, [record], values, replay=True):
+                    return False
             elif values["send_mode"] == "card":
                 await self._send_missing_reply_warning(event, record, values)
                 if record.has_native_segments():
@@ -970,7 +990,9 @@ class IconicQuotesPlugin(Star):
                 [Comp.Image.fromFileSystem(path) for path in paths],
                 values,
             )
-        except Exception as exc:  # noqa: BLE001 - 渲染端点可抛出第三方异常。
+        except Exception as exc:
+            if isinstance(exc, AmbiguousSendError):
+                raise
             logger.warning(
                 "群典：卡片生成失败，准备降级；记录=%s，原因=%s",
                 record.id,
@@ -1058,7 +1080,8 @@ class IconicQuotesPlugin(Star):
         last_error: Exception | None = None
         for native_replies, native_stickers in dict.fromkeys(variants):
             try:
-                nodes = self.renderer.forward_nodes(
+                nodes = await asyncio.to_thread(
+                    self.renderer.forward_nodes,
                     records,
                     replay=replay,
                     native_stickers=native_stickers,
@@ -1066,8 +1089,10 @@ class IconicQuotesPlugin(Star):
                 )
                 await self._send_chain(event, [Comp.Nodes(nodes)], values)
                 return True
-            except Exception as exc:  # noqa: BLE001 - OneBot 错误类型不统一。
+            except Exception as exc:
                 last_error = exc
+                if isinstance(exc, AmbiguousSendError):
+                    raise
                 logger.debug(
                     "群典：多层嵌套降级发送失败；原生回复=%s，原生表情=%s，原因=%s",
                     native_replies,
@@ -1213,7 +1238,8 @@ class IconicQuotesPlugin(Star):
             try:
                 await self._send_chain(
                     event,
-                    self.renderer.text_chain(
+                    await asyncio.to_thread(
+                        self.renderer.text_chain,
                         record,
                         native_stickers=native_stickers,
                         native_replies=True,
@@ -1221,15 +1247,18 @@ class IconicQuotesPlugin(Star):
                     values,
                 )
                 return
-            except Exception as exc:  # noqa: BLE001 - OneBot 回复与贴纸异常不统一。
+            except Exception as exc:
                 last_error = exc
+                if isinstance(exc, AmbiguousSendError):
+                    raise
                 if not record.reply:
                     continue
                 break
         if record.reply:
             for native_stickers in sticker_modes:
                 try:
-                    nodes = self.renderer.forward_nodes(
+                    nodes = await asyncio.to_thread(
+                        self.renderer.forward_nodes,
                         [record],
                         native_stickers=native_stickers,
                         native_replies=False,
@@ -1237,8 +1266,10 @@ class IconicQuotesPlugin(Star):
                     await self._send_chain(event, [Comp.Nodes(nodes)], values)
                     self._operation_log_override = "已降级发送"
                     return
-                except Exception as exc:  # noqa: BLE001 - OneBot 错误类型不统一。
+                except Exception as exc:
                     last_error = exc
+                    if isinstance(exc, AmbiguousSendError):
+                        raise
         if last_error:
             raise last_error
 
@@ -1292,6 +1323,9 @@ class IconicQuotesPlugin(Star):
                 if usage:
                     sections.append(f"{label}：{usage}")
             overview = "群典帮助" + ("\n" + "\n".join(sections) if sections else "")
+        overview += (
+            "\n调用关键词需在前；可先引用消息或 @Bot，目标成员 @ 放在关键词之后。"
+        )
         await self._send_text(event, overview, values)
 
     async def _prepare_delete(
@@ -1381,17 +1415,20 @@ class IconicQuotesPlugin(Star):
         attempts = values["send_retry_count"] + 1
         delay = values["send_retry_delay_ms"] / 1000
         last_error: Exception | None = None
+        saw_ambiguous = False
         for attempt in range(attempts):
             try:
                 await event.send(MessageChain(chain))
                 self._sent_in_operation = True
                 return
-            except (asyncio.TimeoutError, TimeoutError) as exc:
-                last_error = exc
-                if not values["retry_on_ambiguous_failure"]:
-                    break
             except Exception as exc:  # noqa: BLE001 - OneBot 适配器异常类型不稳定。
                 last_error = exc
+                saw_ambiguous = saw_ambiguous or self._is_ambiguous_send_error(exc)
+                if (
+                    self._is_ambiguous_send_error(exc)
+                    and not values["retry_on_ambiguous_failure"]
+                ):
+                    break
             if attempt + 1 < attempts:
                 logger.debug(
                     "群典：消息发送失败，准备重试；尝试=%s/%s，消息段数=%s，原因=%s",
@@ -1402,6 +1439,8 @@ class IconicQuotesPlugin(Star):
                 )
                 await asyncio.sleep(delay)
         assert last_error is not None
+        if saw_ambiguous:
+            raise AmbiguousSendError("消息可能已送达") from last_error
         raise last_error
 
     @staticmethod
@@ -1464,63 +1503,45 @@ class IconicQuotesPlugin(Star):
         )
 
     @staticmethod
-    def _mentioned_users(event: AstrMessageEvent) -> list[str]:
-        self_id = str(event.get_self_id() or "")
-        result = []
-        for item in event.get_messages():
-            if not isinstance(item, Comp.At):
-                continue
-            target = str(item.qq)
-            if target not in {"", "all", self_id} and target not in result:
-                result.append(target)
-        return result
-
-    @staticmethod
-    def _plain_text(event: AstrMessageEvent) -> str:
-        # 原始文本段是用户实际输入；不匹配 @ 昵称、引用快照和其他消息段。
+    def _call_input(event: AstrMessageEvent) -> tuple[str, list[str]]:
+        """优先解析原始消息，避免框架加工的昵称与正文改变调用边界。"""
         raw = getattr(event.message_obj, "raw_message", None)
         if isinstance(raw, dict) and isinstance(raw.get("message"), list):
-            return " ".join(
-                str(item.get("data", {}).get("text", "")).strip()
-                for item in raw["message"]
-                if isinstance(item, dict)
-                and item.get("type") == "text"
-                and isinstance(item.get("data"), dict)
-            ).strip()
+            segments = raw["message"]
+            if any(not isinstance(item, dict) for item in segments):
+                return "", []
+            return parse_command_segments(segments, str(event.get_self_id() or ""))
         if isinstance(raw, dict):
             raw_text = raw.get("message")
             if not isinstance(raw_text, str):
                 raw_text = raw.get("raw_message")
             if isinstance(raw_text, str):
-                # OneBot 也可能使用 CQ 字符串；同样只读取原始正文，
-                # 不能退回框架加工后的 Plain，否则 @ 昵称可能变成命令。
                 messages = OneBotQuoteExtractor._payload_components(
                     {"message": raw_text}
                 )
-                return " ".join(
-                    str(item.text).strip()
-                    for item in messages
-                    if isinstance(item, Comp.Plain) and str(item.text).strip()
-                ).strip()
-        return " ".join(
-            str(item.text).strip()
-            for item in event.get_messages()
-            if isinstance(item, Comp.Plain) and str(item.text).strip()
-        ).strip()
+            else:
+                return "", []
+        else:
+            messages = event.get_messages()
+        segments = []
+        for item in messages:
+            if isinstance(item, Comp.Plain):
+                segments.append({"type": "text", "data": {"text": item.text}})
+            elif isinstance(item, Comp.At):
+                segments.append({"type": "at", "data": {"qq": item.qq}})
+            elif isinstance(item, (Comp.Reply, _RawReply)):
+                segments.append({"type": "reply"})
+            else:
+                segments.append({"type": "other"})
+        return parse_command_segments(segments, str(event.get_self_id() or ""))
 
     @staticmethod
-    def _match_burst_syntax(
-        plain_text: str,
-        keywords: list[str],
-    ) -> tuple[bool, str | None]:
-        return match_command_syntax(plain_text, keywords)
+    def _mentioned_users(event: AstrMessageEvent) -> list[str]:
+        return IconicQuotesPlugin._call_input(event)[1]
 
     @staticmethod
-    def _match_query_syntax(
-        plain_text: str,
-        keywords: list[str],
-    ) -> tuple[bool, str | None]:
-        return match_command_syntax(plain_text, keywords)
+    def _plain_text(event: AstrMessageEvent) -> str:
+        return IconicQuotesPlugin._call_input(event)[0]
 
     @staticmethod
     def _is_bot_message(event: AstrMessageEvent) -> bool:
@@ -1529,13 +1550,6 @@ class IconicQuotesPlugin(Star):
         raw = getattr(event.message_obj, "raw_message", None)
         sender = raw.get("sender", {}) if isinstance(raw, dict) else {}
         return bool(sender.get("is_bot") or sender.get("is_robot"))
-
-    @staticmethod
-    def _command_tail(text: str, command: str) -> str:
-        index = text.find(command)
-        if index < 0:
-            return ""
-        return text[index + len(command) :].strip()
 
     @staticmethod
     def _record_author_name(record: QuoteRecord) -> str:

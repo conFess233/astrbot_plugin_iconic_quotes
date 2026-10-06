@@ -168,3 +168,16 @@ dialog { width: min(430px, calc(100% - 28px)); padding: 0; border: 1px solid var
 .alias-row { display: grid; grid-template-columns: minmax(130px, .8fr) minmax(130px, .8fr) minmax(220px, 2fr) auto; gap: 10px; align-items: start; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); }
 .alias-row textarea { min-height: 76px; resize: vertical; }
 @media (max-width: 780px) { .alias-row { grid-template-columns: 1fr; } }
+
+:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}

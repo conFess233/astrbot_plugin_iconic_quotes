@@ -7,6 +7,7 @@ import base64
 import html
 import inspect
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import astrbot.api.message_components as Comp
@@ -173,11 +174,13 @@ class QuoteRenderer:
         text = "".join(
             segment.text or "" for segment in record.segments if segment.type == "text"
         )
-        image_urls = [
-            self._media_data_url(segment)
-            for segment in record.segments
-            if segment.type == "image"
-        ]
+        image_urls = await asyncio.to_thread(
+            lambda: [
+                self._media_data_url(segment)
+                for segment in record.segments
+                if segment.type == "image"
+            ]
+        )
         text_chunks = [
             text[index : index + 1200] for index in range(0, len(text), 1200)
         ] or [""]
@@ -187,34 +190,41 @@ class QuoteRenderer:
         page_count = max(len(text_chunks), len(image_chunks))
         avatar = await self.avatar_data_url(record.author.user_id, settings)
         paths: list[str] = []
-        for index in range(page_count):
-            data = {
-                "width": settings["card_width"],
-                "min_height": (
-                    0 if settings["card_auto_height"] else settings["card_min_height"]
-                ),
-                "max_height": settings["card_max_height"],
-                "custom_css": settings["card_custom_css"],
-                "avatar": avatar,
-                "text": html.escape(
-                    text_chunks[index] if index < len(text_chunks) else ""
-                ),
-                "images": image_chunks[index] if index < len(image_chunks) else [],
-                "nickname": html.escape(
-                    record.author.nickname or record.author.user_id or "未知用户"
-                ),
-                "recorded_at": self._display_time(record.recorded_at),
-                "page": index + 1,
-                "pages": page_count,
-            }
-            path = await self.plugin.html_render(
-                CARD_TEMPLATE,
-                data,
-                return_url=False,
-                options={"full_page": True, "type": "png"},
-            )
-            await asyncio.to_thread(trim_card_canvas, path)
-            paths.append(path)
+        try:
+            for index in range(page_count):
+                data = {
+                    "width": settings["card_width"],
+                    "min_height": (
+                        0
+                        if settings["card_auto_height"]
+                        else settings["card_min_height"]
+                    ),
+                    "max_height": settings["card_max_height"],
+                    "custom_css": settings["card_custom_css"],
+                    "avatar": avatar,
+                    "text": html.escape(
+                        text_chunks[index] if index < len(text_chunks) else ""
+                    ),
+                    "images": image_chunks[index] if index < len(image_chunks) else [],
+                    "nickname": html.escape(
+                        record.author.nickname or record.author.user_id or "未知用户"
+                    ),
+                    "recorded_at": self._display_time(record.recorded_at),
+                    "page": index + 1,
+                    "pages": page_count,
+                }
+                path = await self.plugin.html_render(
+                    CARD_TEMPLATE,
+                    data,
+                    return_url=False,
+                    options={"full_page": True, "type": "png"},
+                )
+                paths.append(path)
+                await asyncio.to_thread(trim_card_canvas, path)
+        except BaseException:
+            for path in paths:
+                await asyncio.to_thread(Path(path).unlink, missing_ok=True)
+            raise
         return paths
 
     def _media_data_url(self, segment: QuoteSegment) -> str:
@@ -299,53 +309,58 @@ class QuoteRenderer:
         native_replies: bool = True,
     ) -> list[dict[str, Any]]:
         """递归构造 NapCat 可识别的 OneBot 原始合并转发节点。"""
-        result: list[dict[str, Any]] = []
-        if replay:
-            result.append(
-                self._raw_node(
-                    uin="0",
-                    name="群典",
-                    content=[{"type": "text", "data": {"text": "群典存档回放"}}],
-                )
-            )
-        if warning := self.missing_reply_warning(records):
-            result.append(
-                self._raw_node(
-                    uin="0",
-                    name="引用丢失提示",
-                    content=[{"type": "text", "data": {"text": warning}}],
-                )
-            )
-        for record in records:
-            if record.type == "forward":
-                result.extend(
-                    await self._raw_forward_level_nodes(
-                        record.nodes,
-                        native_stickers=native_stickers,
-                        native_replies=native_replies,
+        with self.storage.media_checks():
+            await self.storage.record_health(records)
+            result: list[dict[str, Any]] = []
+            if replay:
+                result.append(
+                    self._raw_node(
+                        uin="0",
+                        name="群典",
+                        content=[{"type": "text", "data": {"text": "群典存档回放"}}],
                     )
                 )
-                continue
-            assert record.author is not None
-            content = self._reply_to_components(
-                record.reply,
-                native_stickers=native_stickers,
-                native_replies=native_replies,
-            )
-            content.extend(
-                self._segments_to_components(
-                    record.segments,
+            if warning := self.missing_reply_warning(records):
+                result.append(
+                    self._raw_node(
+                        uin="0",
+                        name="引用丢失提示",
+                        content=[{"type": "text", "data": {"text": warning}}],
+                    )
+                )
+            for record in records:
+                if record.type == "forward":
+                    result.extend(
+                        await self._raw_forward_level_nodes(
+                            record.nodes,
+                            native_stickers=native_stickers,
+                            native_replies=native_replies,
+                        )
+                    )
+                    continue
+                assert record.author is not None
+                content = self._reply_to_components(
+                    record.reply,
                     native_stickers=native_stickers,
+                    native_replies=native_replies,
                 )
-            )
-            result.append(
-                self._raw_node(
-                    uin=record.author.user_id or "0",
-                    name=record.author.nickname or record.author.user_id or "未知用户",
-                    content=await self._components_to_payload(content),
+                content.extend(
+                    await asyncio.to_thread(
+                        self._segments_to_components,
+                        record.segments,
+                        native_stickers=native_stickers,
+                    )
                 )
-            )
-        return result
+                result.append(
+                    self._raw_node(
+                        uin=record.author.user_id or "0",
+                        name=record.author.nickname
+                        or record.author.user_id
+                        or "未知用户",
+                        content=await self._components_to_payload(content),
+                    )
+                )
+            return result
 
     async def raw_burst_nodes(
         self,
@@ -362,86 +377,95 @@ class QuoteRenderer:
         identity_incomplete: bool = False,
     ) -> list[dict[str, Any]]:
         """把整页爆典构造成一次原子发送的原始节点树。"""
-        title = f"聊天记录：{target_name}\n"
-        title += (
-            f"共 {total} 条｜第 {page} / {pages} 页" if pages > 1 else f"共 {total} 条"
-        )
-        if skipped:
-            title += f"\n另有 {skipped} 条记录完全损坏，无法展示"
-        if identity_incomplete:
-            title += "\n部分历史节点的作者身份尚未确认"
-        missing_media = sum(
-            self.storage.missing_media_count(record) for record in records
-        )
-        if missing_media:
-            title += f"\n本页有 {missing_media} 处媒体资源缺失"
-        result = [
-            self._raw_node(
-                uin="0",
-                name="群典",
-                content=[{"type": "text", "data": {"text": title}}],
+        with self.storage.media_checks():
+            await self.storage.record_health(records)
+            title = f"聊天记录：{target_name}\n"
+            title += (
+                f"共 {total} 条｜第 {page} / {pages} 页"
+                if pages > 1
+                else f"共 {total} 条"
             )
-        ]
-        if warning := self.missing_reply_warning(records):
-            result.append(
+            if skipped:
+                title += f"\n另有 {skipped} 条记录完全损坏，无法展示"
+            if identity_incomplete:
+                title += "\n部分历史节点的作者身份尚未确认"
+            missing_media = sum(
+                self.storage.missing_media_count(record) for record in records
+            )
+            if missing_media:
+                title += f"\n本页有 {missing_media} 处媒体资源缺失"
+            result = [
                 self._raw_node(
                     uin="0",
-                    name="引用丢失提示",
-                    content=[{"type": "text", "data": {"text": warning}}],
+                    name="群典",
+                    content=[{"type": "text", "data": {"text": title}}],
                 )
-            )
-        for record in records:
-            native_time = self._native_time(record.recorded_at)
-            if time_mode == "text":
+            ]
+            if warning := self.missing_reply_warning(records):
                 result.append(
                     self._raw_node(
                         uin="0",
-                        name="记录时间",
-                        content=[
-                            {
-                                "type": "text",
-                                "data": {"text": self._record_time(record.recorded_at)},
-                            }
-                        ],
+                        name="引用丢失提示",
+                        content=[{"type": "text", "data": {"text": warning}}],
                     )
                 )
-            if record.type == "forward":
-                children = await self._raw_forward_level_nodes(
-                    record.nodes,
+            for record in records:
+                native_time = self._native_time(record.recorded_at)
+                if time_mode == "text":
+                    result.append(
+                        self._raw_node(
+                            uin="0",
+                            name="记录时间",
+                            content=[
+                                {
+                                    "type": "text",
+                                    "data": {
+                                        "text": self._record_time(record.recorded_at)
+                                    },
+                                }
+                            ],
+                        )
+                    )
+                if record.type == "forward":
+                    children = await self._raw_forward_level_nodes(
+                        record.nodes,
+                        native_stickers=native_stickers,
+                        native_replies=native_replies,
+                    )
+                    result.append(
+                        self._raw_node(
+                            uin="0",
+                            name="聊天记录存档",
+                            content=children,
+                            timestamp=native_time if time_mode == "native" else 0,
+                            shell_count=len(children),
+                        )
+                    )
+                    continue
+                assert record.author is not None
+                components = self._reply_to_components(
+                    record.reply,
                     native_stickers=native_stickers,
                     native_replies=native_replies,
                 )
-                result.append(
-                    self._raw_node(
-                        uin="0",
-                        name="聊天记录存档",
-                        content=children,
-                        timestamp=native_time if time_mode == "native" else 0,
-                        shell_count=len(children),
+                components.extend(
+                    await asyncio.to_thread(
+                        self._segments_to_components,
+                        record.segments,
+                        native_stickers=native_stickers,
                     )
                 )
-                continue
-            assert record.author is not None
-            components = self._reply_to_components(
-                record.reply,
-                native_stickers=native_stickers,
-                native_replies=native_replies,
-            )
-            components.extend(
-                self._segments_to_components(
-                    record.segments,
-                    native_stickers=native_stickers,
+                result.append(
+                    self._raw_node(
+                        uin=record.author.user_id or "0",
+                        name=record.author.nickname
+                        or record.author.user_id
+                        or "未知用户",
+                        content=await self._components_to_payload(components),
+                        timestamp=native_time if time_mode == "native" else 0,
+                    )
                 )
-            )
-            result.append(
-                self._raw_node(
-                    uin=record.author.user_id or "0",
-                    name=record.author.nickname or record.author.user_id or "未知用户",
-                    content=await self._components_to_payload(components),
-                    timestamp=native_time if time_mode == "native" else 0,
-                )
-            )
-        return result
+            return result
 
     async def _raw_forward_level_nodes(
         self,
@@ -456,7 +480,8 @@ class QuoteRenderer:
             if node.reply and not native_replies:
                 result.extend(
                     await self._components_to_payload(
-                        self._reply_fallback_nodes(
+                        await asyncio.to_thread(
+                            self._reply_fallback_nodes,
                             node.reply,
                             native_stickers=native_stickers,
                         )
@@ -469,7 +494,8 @@ class QuoteRenderer:
                     native_replies=native_replies,
                 )
                 components.extend(
-                    self._segments_to_components(
+                    await asyncio.to_thread(
+                        self._segments_to_components,
                         node.segments,
                         native_stickers=native_stickers,
                     )
@@ -504,7 +530,8 @@ class QuoteRenderer:
                     )
                     reply_pending = False
                 components.extend(
-                    self._segments_to_components(
+                    await asyncio.to_thread(
+                        self._segments_to_components,
                         current_chunk,
                         native_stickers=native_stickers,
                     )

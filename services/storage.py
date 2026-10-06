@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import uuid
 import zipfile
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,29 @@ class QuoteStorage:
         self._locks: dict[str, asyncio.Lock] = {}
         self._maintenance_lock = asyncio.Lock()
         self._broken_groups: set[str] = set()
+        self._media_checks: ContextVar[dict | None] = ContextVar(
+            "quote_media_checks", default=None
+        )
+
+    @contextlib.contextmanager
+    def media_checks(self):
+        """仅在当前操作内复用校验结果，结束后不保留媒体缓存。"""
+        if self._media_checks.get() is not None:
+            yield
+            return
+        token = self._media_checks.set({})
+        try:
+            yield
+        finally:
+            self._media_checks.reset(token)
+
+    async def record_health(self, records: list[QuoteRecord]) -> list[bool]:
+        """一次线程调用完成整批媒体校验，保留逐条健康状态。"""
+        return await asyncio.to_thread(self._record_health_sync, records)
+
+    def _record_health_sync(self, records: list[QuoteRecord]) -> list[bool]:
+        with self.media_checks():
+            return [self._record_images_valid(record) for record in records]
 
     async def initialize(self) -> Path | None:
         """迁移旧版插件数据并创建所需目录，返回旧目录备份路径。"""
@@ -467,13 +491,9 @@ class QuoteStorage:
             candidates = [
                 record for record in candidates if record.involves_user(author_id)
             ]
-        healthy: list[QuoteRecord] = []
-        broken = 0
-        for record in candidates:
-            if await asyncio.to_thread(self._record_images_valid, record):
-                healthy.append(record)
-            else:
-                broken += 1
+        health = await self.record_health(candidates)
+        healthy = [record for record, valid in zip(candidates, health) if valid]
+        broken = health.count(False)
         if not healthy:
             return [], broken
         return random.sample(healthy, min(count, len(healthy))), broken
@@ -521,6 +541,16 @@ class QuoteStorage:
         """验证单个媒体段的路径、文件与内容哈希。"""
         if not segment.path or not segment.sha256:
             return False
+        cache = self._media_checks.get()
+        key = (str(self.root), segment.path, segment.sha256)
+        if cache is not None and key in cache:
+            return cache[key]
+        valid = self._media_segment_valid_sync(segment)
+        if cache is not None:
+            cache[key] = valid
+        return valid
+
+    def _media_segment_valid_sync(self, segment: Any) -> bool:
         path = (self.root / segment.path).resolve()
         if self.root not in path.parents or not path.is_file():
             return False
@@ -530,9 +560,10 @@ class QuoteStorage:
             return False
 
     def _record_images_valid(self, record: QuoteRecord) -> bool:
-        return all(
+        validity = [
             self.media_segment_valid(segment) for segment in record.image_segments()
-        )
+        ]
+        return all(validity)
 
     async def record_is_healthy(self, record: QuoteRecord) -> bool:
         """供管理页检查单条记录引用的图片是否仍完整。"""
@@ -541,21 +572,14 @@ class QuoteStorage:
     async def info(self, group_id: str, max_records: int) -> dict[str, Any]:
         """汇总当前群统计，不返回正文。"""
         records = await self.records(group_id)
-        broken = 0
-        for record in records:
-            if not await asyncio.to_thread(self._record_images_valid, record):
-                broken += 1
+        broken = (await self.record_health(records)).count(False)
         image_paths = {
             segment.path
             for record in records
             for segment in record.image_segments()
             if segment.path
         }
-        image_bytes = sum(
-            (self.root / path).stat().st_size
-            for path in image_paths
-            if (self.root / path).is_file()
-        )
+        image_bytes = await asyncio.to_thread(self._image_usage_bytes, image_paths)
         times = sorted(record.recorded_at for record in records if record.recorded_at)
         return {
             "total": len(records),
@@ -568,6 +592,16 @@ class QuoteStorage:
             "earliest": times[0] if times else None,
             "latest": times[-1] if times else None,
         }
+
+    def _image_usage_bytes(self, paths: set[str]) -> int:
+        total = 0
+        for path in paths:
+            try:
+                total += self.resolve_media_path(path).stat().st_size
+            except (OSError, StorageError):
+                # 损坏或越界媒体已计入 broken，不读取数据根目录之外的文件。
+                continue
+        return total
 
     async def media_usage_bytes(self) -> int:
         """计算群典图片与本地头像缓存的合计占用。"""

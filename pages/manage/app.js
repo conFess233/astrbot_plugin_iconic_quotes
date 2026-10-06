@@ -7,6 +7,7 @@ const state = {
   groups: [], records: [], audit: [], page: 1,
   pageSize: 20,
   total: 0, selected: new Set(), config: null, draft: null,
+  writing: false, writeControls: new Map(), drawerFocus: null, lightboxFocus: null,
   dirty: false, activeRecord: null, overrideGroup: "",
   media: new Map(), avatars: new Map(), lightboxItems: [], lightboxIndex: 0, loading: 0,
 };
@@ -30,6 +31,7 @@ function icon(name, className = "") {
   const key = name.replace(/-([a-z])/g, (_, value) => value.toUpperCase());
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
   if (className) svg.setAttribute("class", className);
   svg.innerHTML = ICONS[key] || ICONS.info;
   return svg;
@@ -61,6 +63,68 @@ async function task(callback) {
   setLoading(true);
   try { return await callback(); } finally { setLoading(false); }
 }
+
+function lockWriteControls() {
+  const controls = $$("#config-panel input, #config-panel select, #config-panel textarea, #config-panel button, #dirty-bar button, #refresh, #import, #migrate, #cleanup-avatars, #clear-avatars, #delete-selected, #drawer-delete, .node-delete, .row-menu button");
+  controls.forEach((node) => {
+    if (!state.writeControls.has(node)) state.writeControls.set(node, node.disabled);
+    node.disabled = true;
+  });
+}
+
+async function writeTask(callback) {
+  if (state.writing) return;
+  state.writing = true;
+  lockWriteControls();
+  $("#config-panel").inert = true;
+  try { return await callback(); }
+  catch (error) { notify(error.message, true); }
+  finally {
+    state.writing = false;
+    $("#config-panel").inert = false;
+    state.writeControls.forEach((disabled, node) => { if (node.isConnected) node.disabled = disabled; });
+    state.writeControls.clear();
+    selectionChanged();
+  }
+}
+
+async function refreshData() {
+  if (state.dirty && !await confirmAction("放弃未保存修改？", "刷新会重新载入已保存配置。取消后保留当前草稿。")) return;
+  await task(() => Promise.all([loadStats(), loadConfig()]));
+  notify("数据已刷新。");
+}
+
+function restoreFocus(node) {
+  if (node?.isConnected && node.getClientRects().length && !node.disabled && !node.closest('[aria-hidden="true"], [inert]')) node.focus();
+  else $("#refresh").focus();
+}
+
+function closeLightbox() {
+  $("#lightbox").hidden = true;
+  restoreFocus(state.lightboxFocus);
+}
+
+// 原生 dialog 负责确认框；抽屉和灯箱采用同样的焦点约束。
+document.addEventListener("keydown", (event) => {
+  if ($("#confirm-dialog").open) return;
+  const modal = !$("#lightbox").hidden ? $("#lightbox") : $("#record-drawer").classList.contains("open") ? $("#record-drawer") : null;
+  if (!modal) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    if (modal.id === "lightbox") closeLightbox(); else closeDrawer();
+  } else if (event.key === "Tab") {
+    const controls = [...modal.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]')].filter((node) => node.getClientRects().length);
+    const first = controls[0]; const last = controls.at(-1);
+    if (!first) { event.preventDefault(); return; }
+    if (!modal.contains(document.activeElement) || (event.shiftKey && document.activeElement === first) || (!event.shiftKey && document.activeElement === last)) {
+      event.preventDefault(); (event.shiftKey ? last : first).focus();
+    }
+  }
+});
+
+window.addEventListener("beforeunload", (event) => {
+  if (state.dirty) { event.preventDefault(); event.returnValue = ""; }
+});
 
 function notify(message, error = false) {
   const toast = element("div", `toast${error ? " error" : ""}`);
@@ -315,10 +379,11 @@ function renderConfig() {
     const titleRow = element("div", "section-title-row"); const heading = element("div"); heading.append(element("h2", "", section.title), element("p", "", section.description)); titleRow.append(heading);
     if (section.reset) { const reset = element("button", "btn btn-tonal", "恢复默认样式"); reset.type = "button"; reset.prepend(icon("refresh")); reset.addEventListener("click", resetCardStyle); titleRow.append(reset); }
     card.append(titleRow); const grid = element("div", "field-grid");
-    section.fields.forEach((field) => { const wrapper = element("div", `field-card${field.full ? " full" : ""}`); wrapper.append(element("label", "", field.label), renderControl(field, state.draft[field.key], (value) => updateDraft(field.key, value))); if (field.hint && field.type !== "boolean") wrapper.append(element("small", "", field.hint)); grid.append(wrapper); });
+    section.fields.forEach((field) => { const wrapper = element("div", `field-card${field.full ? " full" : ""}`); const label = element("label", "", field.label); const control = renderControl(field, state.draft[field.key], (value) => updateDraft(field.key, value)); if (control.id) label.htmlFor = control.id; wrapper.append(label, control); if (field.hint && field.type !== "boolean") wrapper.append(element("small", "", field.hint)); grid.append(wrapper); });
     card.append(grid); sections.append(card);
   });
   renderOverrideFields(); syncEditor(); hydrateIcons(sections);
+  if (state.writing) lockWriteControls();
 }
 
 function resetCardStyle() {
@@ -393,6 +458,7 @@ function selectionChanged() {
   $("#select-page").checked = state.records.length > 0 && state.records.every((record) => state.selected.has(record.id));
   $$("[data-record-id]").forEach((node) => node.classList.toggle("selected", state.selected.has(node.dataset.recordId)));
   $$("input[data-select-id]").forEach((input) => { input.checked = state.selected.has(input.dataset.selectId); });
+  if (state.writing) lockWriteControls();
 }
 
 function recordCheckbox(record) { const input = document.createElement("input"); input.type = "checkbox"; input.dataset.selectId = record.id; input.setAttribute("aria-label", `选择记录 ${record.id}`); input.checked = state.selected.has(record.id); input.addEventListener("click", (event) => event.stopPropagation()); input.addEventListener("change", () => { if (input.checked && state.selected.size >= 100) { input.checked = false; notify("后台每次最多删除 100 条记录。", true); } else if (input.checked) state.selected.add(record.id); else state.selected.delete(record.id); selectionChanged(); }); return input; }
@@ -401,9 +467,9 @@ function makeChip(record) { return element("span", `type-chip${record.type === "
 function makeStatus(record) { return element("span", `status-chip${record.broken ? " broken" : ""}`, record.broken ? "异常" : "正常"); }
 
 function rowMenu(record) {
-  const wrap = element("div", "row-menu"); const button = element("button", "icon-btn"); button.type = "button"; button.append(icon("more"));
+  const wrap = element("div", "row-menu"); const button = element("button", "icon-btn"); button.type = "button"; button.setAttribute("aria-label", "记录操作"); button.append(icon("more"));
   button.addEventListener("click", (event) => { event.stopPropagation(); $$(".row-menu-pop").forEach((menu) => { if (menu !== pop) menu.hidden = true; }); pop.hidden = !pop.hidden; });
-  const pop = element("div", "row-menu-pop"); pop.hidden = true; const detail = element("button", "btn btn-text", "查看详情"); detail.type = "button"; detail.prepend(icon("info")); detail.addEventListener("click", (event) => { event.stopPropagation(); openDrawer(record); pop.hidden = true; }); const remove = element("button", "btn btn-text", "删除记录"); remove.type = "button"; remove.prepend(icon("delete")); remove.addEventListener("click", async (event) => { event.stopPropagation(); pop.hidden = true; await deleteRecords([record.id]); }); pop.append(detail, remove); wrap.append(button, pop); return wrap;
+  const pop = element("div", "row-menu-pop"); pop.hidden = true; const detail = element("button", "btn btn-text", "查看详情"); detail.type = "button"; detail.prepend(icon("info")); detail.addEventListener("click", (event) => { event.stopPropagation(); openDrawer(record); pop.hidden = true; }); const remove = element("button", "btn btn-text", "删除记录"); remove.type = "button"; remove.prepend(icon("delete")); remove.addEventListener("click", async (event) => { event.stopPropagation(); pop.hidden = true; await writeTask(() => deleteRecords([record.id])); }); pop.append(detail, remove); wrap.append(button, pop); return wrap;
 }
 
 function renderRecordRow(record) {
@@ -450,7 +516,7 @@ function appendReplyContent(parent, reply, depth = 1) {
 function appendForwardNode(parent, node, label, path) {
   const nodeBox = element("section", "forward-node"); const head = element("div", "forward-node-head"); const heading = element("h3");
   heading.append(document.createTextNode(node.author?.nickname || "未知发送者"), element("small", "", node.author?.user_id || label));
-  const remove = element("button", "btn btn-danger-tonal node-delete", "删除此条"); remove.type = "button"; remove.prepend(icon("delete")); remove.addEventListener("click", async (event) => { event.stopPropagation(); await deleteForwardNode(state.activeRecord, node, path); });
+  const remove = element("button", "btn btn-danger-tonal node-delete", "删除此条"); remove.type = "button"; remove.prepend(icon("delete")); remove.addEventListener("click", async (event) => { event.stopPropagation(); await writeTask(() => deleteForwardNode(state.activeRecord, node, path)); });
   head.append(heading, remove); nodeBox.append(head); appendReplyContent(nodeBox, node.reply); appendSegmentContent(nodeBox, node.segments || []);
   (node.nested_forwards || []).forEach((nested, nestedIndex) => {
     const nestedBox = element("section", "forward-node");
@@ -462,16 +528,19 @@ function appendForwardNode(parent, node, label, path) {
 }
 
 function openDrawer(record) {
+  if (!$("#record-drawer").classList.contains("open")) { const trigger = document.activeElement; state.drawerFocus = trigger.closest(".row-menu")?.querySelector("button") || trigger; }
+  $("#record-drawer").inert = false;
   state.activeRecord = record; const author = authorOf(record); $("#drawer-title").textContent = author.nickname || (record.type === "forward" ? "合并转发" : "未知发送者"); const content = $("#drawer-content"); content.replaceChildren();
   const meta = element("div", "detail-meta"); [["群号", record.group_id], ["记录时间", dateParts(record.recorded_at).join(" ")], ["记录 ID", record.id], ["状态", record.broken ? "异常" : "正常"]].forEach(([label, value]) => { const item = element("div"); item.append(element("span", "", label), element("strong", "", String(value || "—"))); meta.append(item); }); content.append(meta);
   if (record.type === "message") { const identity = element("div", "drawer-author"); identity.append(avatarElement(author.user_id), element("strong", "", author.nickname || author.user_id || "未知发送者")); content.append(identity); appendReplyContent(content, record.reply); appendSegmentContent(content, record.segments || []); } else (record.nodes || []).forEach((node, index) => appendForwardNode(content, node, `节点 ${index + 1}`, [index]));
-  $("#drawer-preview").hidden = record.type !== "message" || segmentsOf(record).some((segment) => ["face", "sticker"].includes(segment.type)) || Boolean(record.reply); $("#drawer-backdrop").hidden = false; $("#record-drawer").classList.add("open"); $("#record-drawer").setAttribute("aria-hidden", "false");
+  $("#drawer-preview").hidden = record.type !== "message" || segmentsOf(record).some((segment) => ["face", "sticker"].includes(segment.type)) || Boolean(record.reply); $("#drawer-backdrop").hidden = false; $("#record-drawer").classList.add("open"); $("#record-drawer").setAttribute("aria-hidden", "false"); $("#close-drawer").focus();
 }
 
-function closeDrawer() { $("#record-drawer").classList.remove("open"); $("#record-drawer").setAttribute("aria-hidden", "true"); window.setTimeout(() => { $("#drawer-backdrop").hidden = true; }, 270); }
+function closeDrawer() { if (!$("#record-drawer").classList.contains("open")) return; $("#record-drawer").classList.remove("open"); $("#record-drawer").inert = true; restoreFocus(state.drawerFocus); $("#record-drawer").setAttribute("aria-hidden", "true"); window.setTimeout(() => { if (!$("#record-drawer").classList.contains("open")) $("#drawer-backdrop").hidden = true; }, 270); }
 
 async function openLightbox(segments, index) {
-  state.lightboxItems = segments; state.lightboxIndex = index; $("#lightbox").hidden = false; await showLightboxItem();
+  state.lightboxFocus = document.activeElement; $("#lightbox-close").focus();
+  state.lightboxItems = segments; state.lightboxIndex = index; $("#lightbox").hidden = false; $("#lightbox-close").focus(); await showLightboxItem();
 }
 async function showLightboxItem() { const item = state.lightboxItems[state.lightboxIndex]; if (!item) return; try { $("#lightbox-image").src = await mediaData(item.path); $("#lightbox-caption").textContent = `${state.lightboxIndex + 1} / ${state.lightboxItems.length}`; } catch (error) { notify(error.message, true); } $("#lightbox-prev").disabled = state.lightboxIndex <= 0; $("#lightbox-next").disabled = state.lightboxIndex >= state.lightboxItems.length - 1; }
 
@@ -516,7 +585,7 @@ function activateTab(name) {
   if (name === "audit" && !state.audit.length) task(loadAudit).catch((error) => notify(error.message, true));
 }
 
-function confirmAction(title, message) { const dialog = $("#confirm-dialog"); $("#dialog-title").textContent = title; $("#dialog-message").textContent = message; dialog.showModal(); return new Promise((resolve) => dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true })); }
+function confirmAction(title, message) { const dialog = $("#confirm-dialog"); $("#dialog-title").textContent = title; $("#dialog-message").textContent = message; dialog.returnValue = "cancel"; dialog.showModal(); return new Promise((resolve) => dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true })); }
 
 async function deleteRecords(ids) {
   if (!ids.length) return; if (!await confirmAction("删除群典", `确定永久删除所选 ${ids.length} 条记录吗？此操作会写入删除审计。`)) return;
@@ -542,36 +611,37 @@ async function deleteForwardNode(record, node, path) {
 function showImportInspection(inspection) { const fields = [["新增记录", inspection.added], ["重复跳过", inspection.duplicates], ["ID 冲突", inspection.conflicts], ["新增图片", formatBytes(inspection.image_bytes)], ["备份作者别名（未恢复配置时跳过）", inspection.alias_count]]; const box = $("#import-inspection"); box.hidden = false; box.replaceChildren(...fields.map(([label, value]) => { const item = element("div", "inspection-item"); item.append(element("span", "", label), element("strong", "", String(value ?? 0))); return item; })); }
 
 async function inspectAndImport() {
+  if ($("#restore-settings").checked && state.dirty && !await confirmAction("放弃未保存修改？", "恢复备份配置会替换当前草稿。")) return;
   const file = $("#import-file").files[0]; if (!file) return notify("请先选择 ZIP 备份。", true);
   try { const inspection = await task(() => bridge.upload("backup/import", file)); showImportInspection(inspection); if (inspection.missing_images) return notify(`预检失败：缺少 ${inspection.missing_images} 张被记录引用的图片。`, true);
     const summary = `将新增 ${inspection.added} 条，跳过重复 ${inspection.duplicates} 条，跳过 ID 冲突 ${inspection.conflicts} 条，新增图片 ${formatBytes(inspection.image_bytes)}。`;
     if (!await confirmAction("确认导入备份", `${summary} 确认执行合并吗？`)) return;
-    const result = await task(() => bridge.apiPost("backup/import/commit", { token: inspection.token, restore_settings: $("#restore-settings").checked })); const skipped = result.aliases_skipped ? `，未恢复 ${result.aliases_skipped} 个作者别名` : ""; notify(`导入完成：新增 ${result.added} 条，跳过重复 ${result.duplicates} 条${skipped}。`); await task(() => Promise.all([loadStats(), loadConfig()]));
+    const result = await task(() => bridge.apiPost("backup/import/commit", { token: inspection.token, restore_settings: $("#restore-settings").checked })); const skipped = result.aliases_skipped ? `，未恢复 ${result.aliases_skipped} 个作者别名` : ""; notify(result.settings_warning || `导入完成：新增 ${result.added} 条，跳过重复 ${result.duplicates} 条${skipped}。`, Boolean(result.settings_restore_failed)); await task(loadStats); if ($("#restore-settings").checked && !result.settings_restore_failed) await task(loadConfig);
   } catch (error) { notify(error.message, true); }
 }
 
-async function migrateStorage() { const target = $("#migration-path").value.trim(); if (!target) return notify("请输入目标相对目录。", true); if (!await confirmAction("迁移存储目录", `确定将全部数据迁移到 ${target} 吗？迁移期间请勿操作群典。`)) return; try { const result = await task(() => bridge.apiPost("storage/migrate", { storage_subdir: target })); notify(`迁移完成，旧目录备份位于：${result.backup_root}`); await task(loadConfig); } catch (error) { notify(error.message, true); } }
+async function migrateStorage() { if (state.dirty && !await confirmAction("放弃未保存修改？", "迁移完成后会重新载入配置。")) return; const target = $("#migration-path").value.trim(); if (!target) return notify("请输入目标相对目录。", true); if (!await confirmAction("迁移存储目录", `确定将全部数据迁移到 ${target} 吗？迁移期间请勿操作群典。`)) return; try { const result = await task(() => bridge.apiPost("storage/migrate", { storage_subdir: target })); notify(`迁移完成，旧目录备份位于：${result.backup_root}`); await task(loadConfig); } catch (error) { notify(error.message, true); } }
 
 async function cleanupAvatars() { try { const result = await task(() => bridge.apiPost("avatars/cleanup", {})); state.avatars.clear(); notify(`已清理 ${result.deleted} 个无引用头像，释放 ${formatBytes(result.freed_bytes)}。`); await task(loadStats); } catch (error) { notify(error.message, true); } }
 async function clearAvatars() { if (!await confirmAction("清空头像缓存", "确定清空全部本地头像吗？金句记录和图片不会被删除，头像会在后续使用时重新缓存。")) return; try { const result = await task(() => bridge.apiPost("avatars/clear", {})); state.avatars.clear(); notify(`已清空 ${result.deleted} 个头像，释放 ${formatBytes(result.freed_bytes)}。`); await task(loadStats); } catch (error) { notify(error.message, true); } }
 
 hydrateIcons(); $("#page-size").value = String(state.pageSize);
 $$('.tab').forEach((tab) => tab.addEventListener("click", () => activateTab(tab.dataset.tab)));
-$("#refresh").addEventListener("click", () => task(() => Promise.all([loadStats(), loadConfig()])).then(() => notify("数据已刷新。")).catch((error) => notify(error.message, true)));
+$("#refresh").addEventListener("click", () => writeTask(refreshData));
 $("#search-button").addEventListener("click", () => { state.page = 1; task(loadRecords).catch((error) => notify(error.message, true)); });
 $("#search").addEventListener("keydown", (event) => { if (event.key === "Enter") $("#search-button").click(); });
 $("#group").addEventListener("change", () => { state.page = 1; state.selected.clear(); task(loadRecords).catch((error) => notify(error.message, true)); });
 $("#previous").addEventListener("click", () => { state.page -= 1; task(loadRecords).catch((error) => notify(error.message, true)); }); $("#next").addEventListener("click", () => { state.page += 1; task(loadRecords).catch((error) => notify(error.message, true)); });
 $("#page-size").addEventListener("change", () => { state.pageSize = Number($("#page-size").value); state.page = 1; task(loadRecords).catch((error) => notify(error.message, true)); });
 $("#select-page").addEventListener("change", () => { let skipped = false; state.records.forEach((record) => { if (!$("#select-page").checked) state.selected.delete(record.id); else if (state.selected.size < 100) state.selected.add(record.id); else skipped = true; }); if (skipped) notify("已达到每次 100 条的批量删除上限。", true); selectionChanged(); });
-$("#delete-selected").addEventListener("click", () => deleteRecords([...state.selected])); $("#filter-toggle").addEventListener("click", () => $("#record-filters").classList.toggle("open"));
-$("#close-drawer").addEventListener("click", closeDrawer); $("#drawer-backdrop").addEventListener("click", closeDrawer); $("#drawer-delete").addEventListener("click", () => state.activeRecord && deleteRecords([state.activeRecord.id])); $("#drawer-preview").addEventListener("click", () => state.activeRecord && previewCard(state.activeRecord));
-$("#lightbox-close").addEventListener("click", () => { $("#lightbox").hidden = true; }); $("#lightbox-prev").addEventListener("click", () => { state.lightboxIndex -= 1; showLightboxItem(); }); $("#lightbox-next").addEventListener("click", () => { state.lightboxIndex += 1; showLightboxItem(); });
+$("#delete-selected").addEventListener("click", () => writeTask(() => deleteRecords([...state.selected]))); $("#filter-toggle").addEventListener("click", () => $("#record-filters").classList.toggle("open"));
+$("#close-drawer").addEventListener("click", closeDrawer); $("#drawer-backdrop").addEventListener("click", closeDrawer); $("#drawer-delete").addEventListener("click", () => state.activeRecord && writeTask(() => deleteRecords([state.activeRecord.id]))); $("#drawer-preview").addEventListener("click", () => state.activeRecord && previewCard(state.activeRecord));
+$("#lightbox-close").addEventListener("click", closeLightbox); $("#lightbox-prev").addEventListener("click", () => { state.lightboxIndex -= 1; showLightboxItem(); }); $("#lightbox-next").addEventListener("click", () => { state.lightboxIndex += 1; showLightboxItem(); });
 $("#open-group-override").addEventListener("click", openOverrideGroup); $("#override-group-select").addEventListener("change", () => { if ($("#override-group-select").value) { $("#override-group-input").value = ""; openOverrideGroup(); } }); $("#clear-group-override").addEventListener("click", clearOverride);
 $("#apply-json").addEventListener("click", applyAdvancedJson); $("#format-json").addEventListener("click", () => { try { $("#config-editor").value = JSON.stringify(JSON.parse($("#config-editor").value), null, 2); $("#json-error").hidden = true; } catch (error) { $("#json-error").textContent = `JSON 无效：${error.message}`; $("#json-error").hidden = false; } });
-$("#save-config").addEventListener("click", saveConfig); $("#discard-config").addEventListener("click", () => { state.draft = structuredClone(state.config); setDirty(false); renderConfig(); notify("已放弃未保存的配置修改。"); });
-$("#export").addEventListener("click", () => task(() => bridge.download("backup/export", {}, "iconic-quotes-backup.zip")).catch((error) => notify(error.message, true))); $("#import").addEventListener("click", inspectAndImport); $("#migrate").addEventListener("click", migrateStorage);
-$("#cleanup-avatars").addEventListener("click", cleanupAvatars); $("#clear-avatars").addEventListener("click", clearAvatars);
+$("#save-config").addEventListener("click", () => writeTask(saveConfig)); $("#discard-config").addEventListener("click", () => { state.draft = structuredClone(state.config); setDirty(false); renderConfig(); notify("已放弃未保存的配置修改。"); });
+$("#export").addEventListener("click", () => task(() => bridge.download("backup/export", {}, "iconic-quotes-backup.zip")).catch((error) => notify(error.message, true))); $("#import").addEventListener("click", () => writeTask(inspectAndImport)); $("#migrate").addEventListener("click", () => writeTask(migrateStorage));
+$("#cleanup-avatars").addEventListener("click", () => writeTask(cleanupAvatars)); $("#clear-avatars").addEventListener("click", () => writeTask(clearAvatars));
 function updateImportFileLabel() { const file = $("#import-file").files[0]; $("#file-name").textContent = file ? `${file.name} · ${formatBytes(file.size)}` : "最大 1 GB，仅支持 ZIP"; }
 $("#import-file").addEventListener("change", updateImportFileLabel);
 ["dragenter", "dragover"].forEach((name) => $("#drop-zone").addEventListener(name, (event) => { event.preventDefault(); $("#drop-zone").classList.add("dragging"); })); ["dragleave", "drop"].forEach((name) => $("#drop-zone").addEventListener(name, () => $("#drop-zone").classList.remove("dragging")));

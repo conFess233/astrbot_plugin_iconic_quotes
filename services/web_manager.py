@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import copy
 import mimetypes
 import os
 import tempfile
@@ -13,6 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from astrbot.api import logger
 from astrbot.api.web import (
     PluginUploadFile,
     error_response,
@@ -46,6 +48,8 @@ class WebManager:
         self.avatars = avatars
         self.config = config
         self._pending_imports: dict[str, dict[str, Any]] = {}
+        self._config_lock = asyncio.Lock()
+        self._migration_lock = asyncio.Lock()
 
     @staticmethod
     def _authenticated() -> bool:
@@ -133,18 +137,27 @@ class WebManager:
                 ]
             if health in {"healthy", "broken"}:
                 expected = health == "healthy"
-                checked = []
-                for record in records:
-                    if await self.storage.record_is_healthy(record) == expected:
-                        checked.append(record)
-                records = checked
+                health_values = await self.storage.record_health(records)
+                health_by_id = {
+                    record.id: valid for record, valid in zip(records, health_values)
+                }
+                records = [
+                    record for record in records if health_by_id[record.id] == expected
+                ]
             records.sort(key=lambda item: item.recorded_at, reverse=True)
             start = (page - 1) * page_size
             page_records = records[start : start + page_size]
+            if health not in {"healthy", "broken"}:
+                health_by_id = dict(
+                    zip(
+                        (record.id for record in page_records),
+                        await self.storage.record_health(page_records),
+                    )
+                )
             items = []
             for record in page_records:
                 item = record.to_dict()
-                item["broken"] = not await self.storage.record_is_healthy(record)
+                item["broken"] = not health_by_id[record.id]
                 items.append(item)
             return json_response(
                 {
@@ -258,14 +271,9 @@ class WebManager:
         try:
             if not isinstance(payload, dict):
                 raise TypeError("请求格式无效")
-            if "storage_subdir" in payload and payload[
-                "storage_subdir"
-            ] != self.config.get("storage_subdir"):
-                raise ValueError("存储路径只能通过迁移操作修改")
-            values = self.settings.update_from_page(payload)
-            await self._save_config()
+            values = await self._commit_config(payload)
             return json_response(values)
-        except (TypeError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
             return error_response(str(exc))
 
     async def preview_aliases(self):
@@ -440,8 +448,15 @@ class WebManager:
                 max_image_bytes=settings["max_image_mb"] * 1024 * 1024,
             )
             if bool(payload.get("restore_settings")) and result.get("settings"):
-                self.settings.update_from_page(result["settings"])
-                await self._save_config()
+                try:
+                    await self._commit_config(result["settings"])
+                except Exception:  # noqa: BLE001 - 记录已导入，配置失败须反馈部分完成。
+                    logger.exception("群典：记录已导入，配置恢复失败")
+                    result["settings_restore_failed"] = True
+                    result["settings_warning"] = (
+                        "记录已导入，配置恢复失败，原配置仍然有效。"
+                    )
+                    return json_response(result)
                 result["aliases_skipped"] = 0
             else:
                 aliases = result.get("settings", {}).get("author_aliases", {})
@@ -488,24 +503,26 @@ class WebManager:
             if not isinstance(payload, dict):
                 raise TypeError("请求格式无效")
             new_subdir = str(payload.get("storage_subdir") or "").strip()
-            new_root, backup_root, old_root = await self.storage.migrate_to(new_subdir)
-            await self.avatars.rebind_storage_root()
-            old_value = self.config.get("storage_subdir")
-            try:
-                self.config["storage_subdir"] = new_subdir
-                await self._save_config()
-            except Exception:
-                self.config["storage_subdir"] = old_value
-                await self.storage.rollback_migration(
-                    old_root,
-                    new_root,
-                    backup_root,
+            async with self._migration_lock:
+                new_root, backup_root, old_root = await self.storage.migrate_to(
+                    new_subdir
                 )
                 await self.avatars.rebind_storage_root()
-                raise
-            return json_response(
-                {"storage_root": str(new_root), "backup_root": str(backup_root)}
-            )
+                try:
+                    await self._commit_config(
+                        {"storage_subdir": new_subdir}, allow_storage_change=True
+                    )
+                except Exception:
+                    await self.storage.rollback_migration(
+                        old_root,
+                        new_root,
+                        backup_root,
+                    )
+                    await self.avatars.rebind_storage_root()
+                    raise
+                return json_response(
+                    {"storage_root": str(new_root), "backup_root": str(backup_root)}
+                )
         except (OSError, TypeError, ValueError, StorageError) as exc:
             return error_response(str(exc))
 
@@ -589,4 +606,36 @@ class WebManager:
         if callable(saver):
             await saver()
             return
-        self.config.save_config()
+        await asyncio.to_thread(self.config.save_config)
+
+    async def _commit_config(
+        self, payload: dict[str, Any], *, allow_storage_change: bool = False
+    ) -> dict[str, Any]:
+        """串行保存候选配置；失败恢复内存，成功才发布业务快照。"""
+        async with self._config_lock:
+            if not allow_storage_change and payload.get(
+                "storage_subdir", self.config.get("storage_subdir")
+            ) != self.config.get("storage_subdir"):
+                raise ValueError("存储路径只能通过迁移操作修改")
+            values = self.settings.validate_update(payload)
+            previous = copy.deepcopy(dict(self.config))
+            cancelled = False
+            try:
+                self.config.update({key: values[key] for key in DEFAULTS})
+                saving = asyncio.create_task(self._save_config())
+                # 线程写盘不能取消：等待它结束再发布或回滚，避免释放锁后交叉写入。
+                while not saving.done():
+                    try:
+                        await asyncio.shield(saving)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                saving.result()
+            except BaseException:
+                # 包括取消：保存尚未确认时，业务继续使用旧快照。
+                self.config.clear()
+                self.config.update(previous)
+                raise
+            self.settings.publish(values)
+            if cancelled:
+                raise asyncio.CancelledError
+            return values

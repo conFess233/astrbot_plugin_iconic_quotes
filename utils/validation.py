@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
 
 IMAGE_SIGNATURES: tuple[tuple[bytes, str, str], ...] = (
@@ -58,6 +59,42 @@ def match_command_syntax(
             tail = (match.group(1) or "").strip()
             return True, tail or None
     return False, None
+
+
+def parse_command_segments(
+    segments: Iterable[dict], bot_id: str
+) -> tuple[str, list[str]]:
+    """保留消息顺序，仅允许引用和一个机器人 @ 位于调用正文之前。"""
+    parts: list[str] = []
+    targets: list[str] = []
+    started = False
+    addressed_bot = False
+    for segment in segments:
+        data = segment.get("data", {})
+        if not isinstance(data, dict):
+            return "", []
+        kind = segment.get("type")
+        if kind == "text":
+            text = data.get("text", "")
+            if not isinstance(text, str):
+                return "", []
+            started = started or bool(text.strip())
+            parts.append(text)
+        elif kind == "at":
+            target = str(data.get("qq", ""))
+            if not started:
+                if not bot_id or target != bot_id or addressed_bot:
+                    return "", []
+                addressed_bot = True
+            elif target not in {"", "all", bot_id} and target not in targets:
+                targets.append(target)
+            parts.append(" ")
+        elif not started and kind != "reply":
+            return "", []
+        else:
+            # 非文本段分隔两侧正文，不能把碎片拼成新的关键词。
+            parts.append(" ")
+    return "".join(parts).strip(), targets
 
 
 def sanitize_custom_css(value: str) -> str:

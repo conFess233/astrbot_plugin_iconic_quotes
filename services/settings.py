@@ -149,36 +149,39 @@ class SettingsService:
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
+        self._snapshot = self._validate({**DEFAULTS, **dict(config)})
 
     def global_settings(self) -> dict[str, Any]:
-        """返回带默认值且完成校验的全局配置。"""
-        merged = copy.deepcopy(DEFAULTS)
-        merged.update(dict(self.config))
-        return self._validate(merged)
+        """返回已校验全局配置的独立副本，供管理页面及导出使用。"""
+        return copy.deepcopy(self._snapshot)
 
     def for_group(self, group_id: str) -> dict[str, Any]:
-        """在全局默认之上应用当前群覆盖。"""
-        merged = self.global_settings()
-        overrides = merged.get("group_overrides")
-        if isinstance(overrides, dict):
-            override = overrides.get(str(group_id))
-            if isinstance(override, dict):
-                merged.update(
-                    {
-                        key: value
-                        for key, value in override.items()
-                        if key in GROUP_OVERRIDE_KEYS
-                    }
-                )
-        return self._validate(merged)
+        """只复制当前群需要的配置，不重新验证全部群覆盖。"""
+        values = {
+            key: value
+            for key, value in self._snapshot.items()
+            if key not in {"group_overrides", "author_aliases"}
+        }
+        values.update(self._snapshot["group_overrides"].get(str(group_id), {}))
+        values["author_aliases"] = {
+            str(group_id): self._snapshot["author_aliases"].get(str(group_id), {})
+        }
+        return copy.deepcopy(values)
+
+    def validate_update(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """校验候选配置，尚不更新业务快照或宿主配置。"""
+        return self._validate({**DEFAULTS, **dict(self.config), **payload})
+
+    def publish(self, values: dict[str, Any]) -> None:
+        """保存成功后一次性发布已校验快照。"""
+        self._snapshot = copy.deepcopy(values)
 
     def update_from_page(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """校验页面提交的完整或部分配置并写回内存对象。"""
-        candidate = copy.deepcopy(dict(self.config))
-        candidate.update(payload)
-        validated = self._validate({**DEFAULTS, **candidate})
-        self.config.update({key: validated[key] for key in DEFAULTS})
-        return validated
+        """仅供隔离预检对象使用；真实保存通过管理 API 统一提交。"""
+        values = self.validate_update(payload)
+        self.config.update({key: values[key] for key in DEFAULTS})
+        self.publish(values)
+        return values
 
     @staticmethod
     def _id_list(value: Any, label: str) -> list[str]:
