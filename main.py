@@ -275,7 +275,7 @@ class IconicQuotesPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def keyword_listener(self, event: AstrMessageEvent):
-        """处理关键词在前、目标 @ 在后的调用与机器人戳一戳。"""
+        """处理单目标 @ 查询、精确关键词调用与机器人戳一戳。"""
         raw = getattr(event.message_obj, "raw_message", None)
         if isinstance(raw, dict) and raw.get("post_type") == "notice":
             await self._handle_poke(event, raw)
@@ -1323,9 +1323,7 @@ class IconicQuotesPlugin(Star):
                 if usage:
                     sections.append(f"{label}：{usage}")
             overview = "群典帮助" + ("\n" + "\n".join(sections) if sections else "")
-        overview += (
-            "\n调用关键词需在前；可先引用消息或 @Bot，目标成员 @ 放在关键词之后。"
-        )
+        overview += "\n支持 @成员 群典 或 群典 @成员；关键词前最多一个成员 @，也可引用消息或 @Bot。"
         await self._send_text(event, overview, values)
 
     async def _prepare_delete(

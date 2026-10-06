@@ -64,11 +64,23 @@ def match_command_syntax(
 def parse_command_segments(
     segments: Iterable[dict], bot_id: str
 ) -> tuple[str, list[str]]:
-    """保留消息顺序，仅允许引用和一个机器人 @ 位于调用正文之前。"""
+    """允许单个目标 @ 位于关键词前，多个成员 @ 不组成调用前缀。
+
+    >>> target = {"type": "at", "data": {"qq": "123"}}
+    >>> command = {"type": "text", "data": {"text": "群典"}}
+    >>> parse_command_segments([target, command], "999")
+    ('群典', ['123'])
+    >>> parse_command_segments([target, target, command], "999")
+    ('', [])
+    >>> chat = {"type": "text", "data": {"text": "普通消息"}}
+    >>> match_command_syntax(parse_command_segments([target, chat], "999")[0], ["群典"])
+    (False, None)
+    """
     parts: list[str] = []
     targets: list[str] = []
     started = False
     addressed_bot = False
+    prefixed_target = False
     for segment in segments:
         data = segment.get("data", {})
         if not isinstance(data, dict):
@@ -83,9 +95,17 @@ def parse_command_segments(
         elif kind == "at":
             target = str(data.get("qq", ""))
             if not started:
-                if not bot_id or target != bot_id or addressed_bot:
+                if not bot_id or target in {"", "all"}:
                     return "", []
-                addressed_bot = True
+                if target == bot_id:
+                    if addressed_bot:
+                        return "", []
+                    addressed_bot = True
+                else:
+                    if prefixed_target:
+                        return "", []
+                    prefixed_target = True
+                    targets.append(target)
             elif target not in {"", "all", bot_id} and target not in targets:
                 targets.append(target)
             parts.append(" ")
