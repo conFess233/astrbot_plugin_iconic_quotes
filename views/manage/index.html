@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>群典管理</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div id="topline" class="topline" aria-hidden="true"></div>
+    <div class="shell">
+      <header class="titlebar">
+        <div class="brand">
+          <span class="brand-mark" data-i="quote" aria-hidden="true"></span>
+          <div>
+            <h1>群典管理</h1>
+            <p id="header-status" role="status">正在连接插件数据…</p>
+          </div>
+        </div>
+        <nav id="island" class="island" aria-label="管理模块">
+          <span class="pill" aria-hidden="true"></span>
+          <button type="button" class="on" data-view="records" aria-current="page" data-i="archive">记录</button>
+          <button type="button" data-view="config" data-i="settings">配置<span id="config-badge" class="badge" hidden></span></button>
+          <button type="button" data-view="backup" data-i="backup">备份</button>
+          <button type="button" data-view="audit" data-i="history">审计</button>
+        </nav>
+        <div class="title-actions">
+          <button id="refresh" class="icon-btn" type="button" aria-label="刷新数据" title="刷新数据" data-i="refresh"></button>
+        </div>
+      </header>
+
+      <!-- 记录 -->
+      <main id="view-records" class="view on">
+        <section id="stats" class="stats" aria-label="当前群统计"></section>
+        <div class="section-head">
+          <h2>记录</h2>
+          <label class="field inline">群聊<select id="group" class="input"></select></label>
+        </div>
+        <div class="ruler" aria-hidden="true"></div>
+        <div id="records-layout" class="layout">
+          <div class="main">
+            <form id="filters" class="card card-pad filters" role="search">
+              <label class="field search-field">搜索<input id="search" class="input" type="search" placeholder="正文、昵称、QQ 或记录 ID" /></label>
+              <button id="filter-toggle" class="btn btn-ghost filter-toggle" type="button" aria-expanded="false" aria-controls="filters">筛选</button>
+              <label class="field filter-extra">类型<select id="filter-type" class="input"><option value="">全部</option><option value="message">普通消息</option><option value="forward">合并转发</option></select></label>
+              <label class="field filter-extra">图片<select id="filter-image" class="input"><option value="">不限</option><option value="true">包含图片</option><option value="false">不含图片</option></select></label>
+              <label class="field filter-extra">状态<select id="filter-health" class="input"><option value="">不限</option><option value="healthy">正常</option><option value="broken">缺少媒体</option></select></label>
+              <button id="query" class="btn btn-primary" type="submit" data-i="search">查询</button>
+            </form>
+            <section class="card table-card">
+              <div class="table-tools">
+                <div><strong id="total">0 条结果</strong><span id="selinfo">点击一行查看详情</span></div>
+                <button id="delete-selected" class="btn btn-danger btn-sm" type="button" data-i="trash" disabled>删除所选</button>
+              </div>
+              <div class="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th class="check"><button id="check-page" class="cb" type="button" role="checkbox" aria-checked="false" aria-label="选择本页全部记录"></button></th>
+                      <th>发送者</th>
+                      <th>内容摘要</th>
+                      <th class="col-opt">类型</th>
+                      <th class="col-opt">记录时间</th>
+                      <th class="col-opt">状态</th>
+                    </tr>
+                  </thead>
+                  <tbody id="rows"></tbody>
+                </table>
+              </div>
+              <div id="record-cards" class="m-cards"></div>
+              <div class="table-foot">
+                <label class="field inline">每页<select id="page-size" class="input input-sm"><option>20</option><option>50</option><option>100</option></select>条</label>
+                <span id="range" class="mono">0–0 / 0</span>
+                <div class="pager">
+                  <button id="prev" class="icon-btn" type="button" aria-label="上一页" data-i="left"></button>
+                  <span id="page-label">第 1 页</span>
+                  <button id="next" class="icon-btn" type="button" aria-label="下一页" data-i="right"></button>
+                </div>
+              </div>
+            </section>
+          </div>
+          <aside class="side" aria-label="记录详情">
+            <div id="side" class="card side-card"></div>
+          </aside>
+        </div>
+      </main>
+
+      <!-- 配置 -->
+      <main id="view-config" class="view">
+        <div class="section-head">
+          <h2>配置</h2>
+          <div id="scope" class="segmented" role="radiogroup" aria-label="编辑范围">
+            <button type="button" role="radio" class="on" aria-checked="true" data-scope="global">全局</button>
+            <button type="button" role="radio" aria-checked="false" data-scope="override">群聊覆盖</button>
+            <button type="button" role="radio" aria-checked="false" data-scope="json">高级 JSON</button>
+          </div>
+        </div>
+        <div class="ruler" aria-hidden="true"></div>
+        <div class="layout">
+          <div class="main">
+            <nav id="anchors" class="anchors" aria-label="配置分区"></nav>
+            <div id="config-body" class="stack"></div>
+          </div>
+          <aside class="side" aria-label="未保存的改动">
+            <div id="config-side" class="card side-card"></div>
+          </aside>
+        </div>
+      </main>
+
+      <!-- 备份 -->
+      <main id="view-backup" class="view">
+        <div class="section-head"><h2>备份与维护</h2></div>
+        <div class="ruler" aria-hidden="true"></div>
+        <div class="layout">
+          <div class="main tasks">
+            <article class="card task">
+              <div class="head"><span class="ico" data-i="download" aria-hidden="true"></span>
+                <div><h3>导出备份</h3><p>全部群聊的记录、被引用的图片、校验清单与可迁移配置。</p></div></div>
+              <dl class="kv"><dt>范围</dt><dd>全部群聊</dd><dt>不含</dt><dd>头像缓存、宿主登录信息</dd></dl>
+              <div class="foot"><span class="muted">导出文件为明文，请妥善保管。</span><button id="export" class="btn btn-primary" type="button" data-i="download">导出 ZIP</button></div>
+            </article>
+            <article class="card task">
+              <div class="head"><span class="ico" data-i="shield" aria-hidden="true"></span>
+                <div><h3>完整性检查</h3><p>逐个重新计算媒体文件哈希，标记缺失或被改动的图片；恢复的文件会重新参与随机群典。</p></div></div>
+              <div id="integrity-result"><p class="muted">日常发送只检查文件是否存在与大小；内容被改动需要在这里检查。</p></div>
+              <div class="foot"><span></span><button id="integrity" class="btn btn-tonal" type="button" data-i="shield">开始检查</button></div>
+            </article>
+            <article class="card task wide-task">
+              <div class="head"><span class="ico" data-i="upload" aria-hidden="true"></span>
+                <div><h3>合并导入</h3><p>按群内内容哈希去重，只新增记录，不修改现有记录。支持 2.0 与 1.x 旧版备份。</p></div></div>
+              <div id="import-steps" class="steps" aria-label="导入步骤"></div>
+              <label id="drop" class="drop">
+                <input id="import-file" class="sr-only" type="file" accept=".zip,application/zip" />
+                <span data-i="upload" aria-hidden="true"></span>
+                <span><strong>拖放备份到这里，或点击选择文件</strong><small id="file-name"></small></span>
+              </label>
+              <div class="switch-row">
+                <button id="restore-settings" class="switch" type="button" role="switch" aria-checked="false" aria-labelledby="restore-label"></button>
+                <span id="restore-label"><strong>同时恢复可迁移配置</strong><small>用备份中的配置覆盖当前配置（含群聊覆盖与作者别名）</small></span>
+              </div>
+              <div id="import-inspection" class="inspection" hidden></div>
+              <div class="foot">
+                <button id="import-inspect" class="btn btn-ghost" type="button" disabled>上传并预检</button>
+                <button id="import-commit" class="btn btn-primary" type="button" hidden>确认导入</button>
+              </div>
+            </article>
+            <article class="card task">
+              <div class="head"><span class="ico" data-i="user" aria-hidden="true"></span>
+                <div><h3>头像缓存</h3><p>只用于图片卡片与后台展示；空间不足时优先清理无引用、最久未使用的头像。</p></div></div>
+              <dl class="kv"><dt>当前缓存</dt><dd id="avatar-stats">—</dd></dl>
+              <div class="foot"><button id="avatars-cleanup" class="btn btn-ghost" type="button" data-i="broom">清理无引用</button><button id="avatars-clear" class="btn btn-danger" type="button" data-i="trash">清空头像缓存</button></div>
+            </article>
+          </div>
+          <aside class="side" aria-label="操作记录">
+            <div class="card side-card"><div class="side-body"><h3>操作记录</h3><ul id="backup-log" class="timeline"></ul></div></div>
+          </aside>
+        </div>
+      </main>
+
+      <!-- 审计 -->
+      <main id="view-audit" class="view">
+        <div class="section-head">
+          <h2>删除审计</h2>
+          <button id="audit-refresh" class="btn btn-ghost btn-sm" type="button" data-i="refresh">刷新</button>
+        </div>
+        <div class="ruler" aria-hidden="true"></div>
+        <div class="layout">
+          <div class="main">
+            <div class="card card-pad filters audit-filters">
+              <label class="field">群号<input id="audit-group" class="input" inputmode="numeric" placeholder="筛选群号" /></label>
+              <label class="field">操作者<input id="audit-operator" class="input" placeholder="QQ 或 dashboard 用户" /></label>
+              <label class="field">来源<select id="audit-source" class="input"><option value="">全部来源</option><option value="command">群聊指令</option><option value="page">管理页</option><option value="page_node">管理页 · 节点</option></select></label>
+            </div>
+            <section class="card table-card">
+              <div class="table-tools"><div><strong id="audit-total">0 条</strong><span>按删除时间从新到旧</span></div></div>
+              <div class="table-scroll">
+                <table>
+                  <thead><tr><th>删除时间</th><th>群号</th><th>记录</th><th>操作者</th><th>来源</th><th>范围</th></tr></thead>
+                  <tbody id="audit-rows"></tbody>
+                </table>
+              </div>
+              <div id="audit-cards" class="m-cards"></div>
+            </section>
+          </div>
+          <aside class="side" aria-label="审计概览"><div id="audit-side" class="card side-card"></div></aside>
+        </div>
+      </main>
+    </div>
+
+    <!-- 右下悬浮按钮 -->
+    <div class="fab-wrap">
+      <div id="save-error" class="save-error" role="alert" hidden></div>
+      <div id="fab-menu" class="fab-menu" inert>
+        <button type="button" data-act="refresh" style="--k: 3" data-i="refresh">刷新数据</button>
+        <button type="button" data-act="search" style="--k: 2" data-i="search">搜索记录</button>
+        <button type="button" data-act="export" style="--k: 1" data-i="download">导出备份</button>
+        <button type="button" data-act="integrity" style="--k: 0" data-i="shield">完整性检查</button>
+      </div>
+      <button id="fab" class="fab" type="button" aria-label="快捷操作" aria-expanded="false" aria-controls="fab-menu" data-i="bolt"></button>
+      <div id="pill" class="fab-pill" hidden>
+        <span class="txt">
+          <button id="discard" class="discard" type="button">放弃</button>
+          <span id="pill-count" aria-live="polite">0 项未保存</span>
+          <button id="save" class="save" type="button" data-i="check">保存</button>
+        </span>
+      </div>
+    </div>
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+
+    <!-- 全屏面板 -->
+    <div id="scrim" class="scrim"></div>
+    <section id="sheet" class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title" aria-hidden="true" inert>
+      <header><h3 id="sheet-title"></h3><button id="sheet-close" class="icon-btn" type="button" aria-label="关闭全屏" data-i="x"></button></header>
+      <div id="sheet-body" class="body"></div>
+    </section>
+
+    <!-- 灯箱 -->
+    <div id="lightbox" class="lightbox" role="dialog" aria-modal="true" aria-label="图片查看" aria-hidden="true" inert>
+      <div id="lb-bg" class="bg"></div>
+      <img id="lb-img" alt="" />
+      <div class="lb-bar">
+        <button id="lb-prev" type="button" aria-label="上一张" data-i="left"></button>
+        <span id="lb-index">1 / 1</span>
+        <button id="lb-next" type="button" aria-label="下一张" data-i="right"></button>
+        <button id="lb-close" type="button" aria-label="关闭图片" data-i="x"></button>
+      </div>
+    </div>
+
+    <dialog id="confirm" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+      <form method="dialog">
+        <h3 id="confirm-title"></h3>
+        <p id="confirm-message"></p>
+        <div class="dialog-actions">
+          <button id="confirm-cancel" value="cancel" class="btn btn-ghost">取消</button>
+          <button id="confirm-ok" value="confirm" class="btn btn-danger">确认</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
