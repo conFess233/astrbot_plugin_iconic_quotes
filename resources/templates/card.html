@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN" class="theme-{{ theme }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width={{ width }}">
+<style>
+/* 群典默认卡片：纸面 / 墨色两种主题；尺寸随 width 等比缩放（1em = width / 40）。 */
+:root {
+  --paper: #f5efe4;
+  --paper-edge: #e9e0cf;
+  --ink: #2b2620;
+  --ink-soft: #6f6556;
+  --ink-faint: #a69a86;
+  --accent: #b5532d;
+  --accent-soft: rgba(181, 83, 45, .10);
+  --rule: rgba(43, 38, 32, .14);
+  --frame: rgba(43, 38, 32, .06);
+}
+.theme-dark {
+  --paper: #1d1b19;
+  --paper-edge: #2a2724;
+  --ink: #efe7da;
+  --ink-soft: #b3a894;
+  --ink-faint: #7d7465;
+  --accent: #e3895e;
+  --accent-soft: rgba(227, 137, 94, .12);
+  --rule: rgba(239, 231, 218, .14);
+  --frame: rgba(239, 231, 218, .05);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: {{ width }}px; background: var(--paper); }
+html { font-size: calc({{ width }}px / 40); }
+body {
+  color: var(--ink);
+  font-family: "Noto Sans CJK SC", "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.card {
+  position: relative;
+  width: {{ width }}px;
+  {% if min_height %}min-height: {{ min_height }}px;{% endif %}
+  max-height: {{ max_height }}px;
+  overflow: hidden;
+  padding: 3.4rem 3.4rem 2.6rem;
+  background: var(--paper);
+}
+/* 内框细线：只做克制的装饰 */
+.card::before {
+  content: "";
+  position: absolute;
+  inset: 1.1em;
+  border: 1px solid var(--frame);
+  border-radius: .6em;
+  pointer-events: none;
+}
+.mark {
+  position: absolute;
+  top: 1.5rem;
+  left: 3.05rem;
+  font-family: "Noto Serif CJK SC", "Source Han Serif SC", "Songti SC", Georgia, serif;
+  font-size: 6rem;
+  line-height: 1;
+  color: var(--accent);
+  opacity: .2;
+  user-select: none;
+}
+/* 撑满内容区宽度，避免部分文转图环境把文字块收窄到一半 */
+.quote {
+  position: relative;
+  display: block;
+  width: 100%;
+  margin-top: 1.6rem;
+  font-family: "Noto Serif CJK SC", "Source Han Serif SC", "Songti SC", "STSong", Georgia, serif;
+  white-space: pre-wrap;
+  word-break: normal;
+  overflow-wrap: break-word;
+  line-break: loose;
+  letter-spacing: .02em;
+  color: var(--ink);
+}
+.size-xl .quote { font-size: 2.15em; line-height: 1.55; font-weight: 600; }
+.size-lg .quote { font-size: 1.6em; line-height: 1.7; font-weight: 600; }
+.size-md .quote { font-size: 1.22em; line-height: 1.8; font-weight: 500; }
+.size-sm .quote { font-size: 1.02em; line-height: 1.85; }
+.images {
+  display: grid;
+  gap: .55em;
+  margin-top: 1.5em;
+}
+.images.n1 { grid-template-columns: 1fr; }
+.images.n2, .images.n4 { grid-template-columns: repeat(2, 1fr); }
+.images.n3 { grid-template-columns: repeat(3, 1fr); }
+.images img {
+  display: block;
+  width: 100%;
+  border-radius: .55em;
+  border: 1px solid var(--rule);
+  background: var(--paper-edge);
+  object-fit: cover;
+}
+.images.n1 img { max-height: 30em; object-fit: contain; }
+.images.n2 img, .images.n3 img, .images.n4 img { aspect-ratio: 1; }
+.only-images .images { margin-top: 0; }
+.footer {
+  display: flex;
+  align-items: center;
+  gap: .85em;
+  margin-top: 2.1em;
+  padding-top: 1.25em;
+  border-top: 1px solid var(--rule);
+}
+.avatar {
+  width: 2.9em;
+  height: 2.9em;
+  flex: none;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--paper-edge);
+  box-shadow: 0 0 0 .14em var(--paper), 0 0 0 .2em var(--rule);
+}
+.who { min-width: 0; flex: 1; }
+.name {
+  font-size: 1.02em;
+  font-weight: 700;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.time { margin-top: .15em; font-size: .72em; color: var(--ink-soft); letter-spacing: .03em; }
+.badge {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: .45em;
+  font-size: .72em;
+  color: var(--ink-faint);
+  letter-spacing: .12em;
+}
+.badge b {
+  display: inline-block;
+  padding: .3em .7em;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 700;
+  letter-spacing: .2em;
+}
+{{ custom_css }}
+</style>
+</head>
+<body>
+<article class="card size-{{ size }}{% if not text %} only-images{% endif %}">
+  {% if text %}<div class="mark">“</div>
+  <div class="quote">{{ text }}</div>{% endif %}
+  {% if images %}<div class="images n{{ images|length if images|length < 4 else 4 }}">{% for image in images %}<img src="{{ image }}">{% endfor %}</div>{% endif %}
+  <footer class="footer">
+    {% if avatar %}<img class="avatar" src="{{ avatar }}">{% endif %}
+    <div class="who">
+      <div class="name">{{ nickname }}</div>
+      <div class="time">{{ recorded_at }}</div>
+    </div>
+    <div class="badge">{% if pages > 1 %}<span>{{ page }} / {{ pages }}</span>{% endif %}<b>群典</b></div>
+  </footer>
+</article>
+</body>
+</html>

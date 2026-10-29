@@ -1,4 +1,8 @@
-"""按群隔离的 JSON 与图片持久化服务。"""
+"""SQLite 持久化：连接、迁移、记录、媒体引用、头像索引、审计与群级设置。
+
+所有方法在线程中执行（``asyncio.to_thread``），单连接由线程锁串行化；
+写操作使用短 ``BEGIN IMMEDIATE`` 事务，网络、渲染和文件下载都在事务外完成。
+"""
 
 from __future__ import annotations
 
@@ -6,346 +10,355 @@ import asyncio
 import contextlib
 import hashlib
 import json
-import os
-import random
-import shutil
-import tempfile
-import uuid
-import zipfile
-from contextvars import ContextVar
-from datetime import UTC, datetime
+import sqlite3
+import threading
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from ..models import QuoteRecord
-from ..utils.hashing import calculate_record_hash, normalize_search
-from ..utils.validation import identify_image, safe_storage_path
+from ..utils.hashing import normalize_search
+from ..utils.timefmt import now_iso
+from .media import MediaInfo
 
-SCHEMA_VERSION = 3
-SUPPORTED_SCHEMA_VERSIONS = {1, 2, SCHEMA_VERSION}
+T = TypeVar("T")
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "resources" / "migrations"
+_HEALTHY = """NOT EXISTS (
+    SELECT 1 FROM record_media rm JOIN media m ON m.sha256 = rm.sha256
+    WHERE rm.record_id = r.id AND m.missing = 1)"""
 
 
 class StorageError(RuntimeError):
-    """表示可向用户归类说明的存储错误。"""
+    """可向用户归类说明的存储错误。"""
 
 
 class DuplicateQuoteError(StorageError):
-    """表示当前群已经存在相同内容哈希。"""
+    """当前群已经存在相同内容哈希。"""
 
     def __init__(self, record: QuoteRecord):
         super().__init__("该群典已存在")
         self.record = record
 
 
-class QuoteStorage:
-    """管理群 JSON、内容寻址图片、审计和备份。"""
+def record_index(record: QuoteRecord) -> dict[str, Any]:
+    """计算记录的查询索引：参与者、可纠正昵称与正文。"""
+    involved: set[str] = set()
+    if record.type == "message" and record.author and record.author.user_id:
+        involved.add(record.author.user_id)
+    involved.update(
+        node.author.user_id for node in record.iter_nodes() if node.author.user_id
+    )
+    users = {author.user_id for author in record.iter_authors() if author.user_id}
+    names = {
+        normalize_search(author.nickname)
+        for author in record.iter_authors()
+        if author is not record.author and author.nickname
+    }
+    names.discard("")
+    return {
+        "participants": [
+            (
+                user_id,
+                int(user_id in involved),
+                normalize_search(record.authored_text(user_id)),
+            )
+            for user_id in sorted(users)
+        ],
+        "names": sorted(names),
+        "search_text": normalize_search(record.searchable_text()),
+    }
 
-    def __init__(
-        self,
-        data_root: Path,
-        storage_subdir: str,
-        *,
-        legacy_root: Path | None = None,
-    ):
-        self.data_root = data_root.resolve()
-        self.root = safe_storage_path(self.data_root, storage_subdir)
-        self.legacy_root = legacy_root.resolve() if legacy_root else None
-        self.groups_dir = self.root / "groups"
-        self.images_dir = self.root / "images"
-        self.avatars_dir = self.root / "avatars"
-        self.backups_dir = self.root / "backups"
-        self.audit_path = self.root / "audit.json"
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._maintenance_lock = asyncio.Lock()
-        self._broken_groups: set[str] = set()
-        self._media_checks: ContextVar[dict | None] = ContextVar(
-            "quote_media_checks", default=None
+
+class QuoteStorage:
+    """群典 SQLite 仓储。"""
+
+    def __init__(self, database_path: Path):
+        self.database_path = database_path
+        self._connection: sqlite3.Connection | None = None
+        self._lock = threading.RLock()
+
+    # 生命周期 ---------------------------------------------------------
+
+    async def open(self) -> None:
+        await asyncio.to_thread(self._open_sync)
+
+    def _open_sync(self) -> None:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(
+            self.database_path,
+            timeout=5,
+            isolation_level=None,
+            check_same_thread=False,
         )
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute("PRAGMA journal_mode=WAL")
+            # WAL 下 NORMAL 不会损坏数据库；只有断电时可能丢失最后几次提交。
+            connection.execute("PRAGMA synchronous=NORMAL")
+            problems = connection.execute("PRAGMA quick_check").fetchall()
+            if len(problems) != 1 or problems[0][0] != "ok":
+                raise StorageError("群典数据库完整性检查未通过，已停止初始化")
+            self._connection = connection
+            self._migrate()
+        except Exception:
+            connection.close()
+            self._connection = None
+            raise
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._close_sync)
+
+    def _close_sync(self) -> None:
+        with self._lock:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
+
+    def _db(self) -> sqlite3.Connection:
+        if self._connection is None:
+            raise StorageError("群典数据库尚未打开")
+        return self._connection
 
     @contextlib.contextmanager
-    def media_checks(self):
-        """仅在当前操作内复用校验结果，结束后不保留媒体缓存。"""
-        if self._media_checks.get() is not None:
-            yield
-            return
-        token = self._media_checks.set({})
-        try:
-            yield
-        finally:
-            self._media_checks.reset(token)
-
-    async def record_health(self, records: list[QuoteRecord]) -> list[bool]:
-        """一次线程调用完成整批媒体校验，保留逐条健康状态。"""
-        return await asyncio.to_thread(self._record_health_sync, records)
-
-    def _record_health_sync(self, records: list[QuoteRecord]) -> list[bool]:
-        with self.media_checks():
-            return [self._record_images_valid(record) for record in records]
-
-    async def initialize(self) -> Path | None:
-        """迁移旧版插件数据并创建所需目录，返回旧目录备份路径。"""
-        return await asyncio.to_thread(self._initialize_sync)
-
-    def _initialize_sync(self) -> Path | None:
-        backup_root = None
-        legacy_root = self.legacy_root
-        if (
-            legacy_root
-            and legacy_root != self.root
-            and legacy_root.is_dir()
-            and any(legacy_root.iterdir())
-            and (not self.root.exists() or not any(self.root.iterdir()))
-        ):
-            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            backup_root = legacy_root.with_name(
-                f"{legacy_root.name}.backup-{stamp}-{uuid.uuid4().hex[:6]}"
-            )
-            self._migrate_sync(legacy_root, self.root, backup_root)
-        self._ensure_directories()
-        return backup_root
-
-    def _ensure_directories(self) -> None:
-        for directory in (
-            self.root,
-            self.groups_dir,
-            self.images_dir,
-            self.avatars_dir,
-            self.backups_dir,
-        ):
-            directory.mkdir(parents=True, exist_ok=True)
-
-    def _lock(self, group_id: str) -> asyncio.Lock:
-        return self._locks.setdefault(str(group_id), asyncio.Lock())
-
-    def _group_path(self, group_id: str) -> Path:
-        if not str(group_id).isdigit():
-            raise StorageError("群号格式无效")
-        return self.groups_dir / f"{group_id}.json"
-
-    @staticmethod
-    def _new_document(group_id: str) -> dict[str, Any]:
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "group_id": str(group_id),
-            "records": [],
-        }
-
-    @staticmethod
-    def _atomic_json_write(path: Path, value: Any, *, keep_backup: bool = True) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if keep_backup and path.exists():
-            shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
-        fd, temporary = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(value, stream, ensure_ascii=False, indent=2)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
-
-    def _validate_document(self, document: Any, group_id: str) -> dict[str, Any]:
-        if not isinstance(document, dict):
-            raise StorageError("群典 JSON 根节点不是对象")
-        version = document.get("schema_version")
-        if version not in SUPPORTED_SCHEMA_VERSIONS:
-            if isinstance(version, int) and version > SCHEMA_VERSION:
-                raise StorageError("数据由更高版本插件创建，请先升级插件")
-            raise StorageError(f"不支持的数据版本: {version}")
-        if str(document.get("group_id")) != str(group_id):
-            raise StorageError("群典 JSON 的群号与文件名不一致")
-        if not isinstance(document.get("records"), list):
-            raise StorageError("群典 JSON 缺少记录列表")
-        seen_ids: set[str] = set()
-        for raw in document["records"]:
-            if not isinstance(raw, dict):
-                raise StorageError("群典记录格式无效")
-            record = QuoteRecord.from_dict(raw)
-            if record.group_id != str(group_id):
-                raise StorageError("记录群号与所在文件不一致")
-            if not record.id or record.id in seen_ids:
-                raise StorageError("记录 ID 为空或重复")
-            seen_ids.add(record.id)
-            if len(record.content_hash) != 64 or any(
-                ch not in "0123456789abcdef" for ch in record.content_hash.lower()
-            ):
-                raise StorageError("记录内容哈希无效")
-            if (
-                calculate_record_hash(record, schema_version=version)
-                != record.content_hash
-            ):
-                raise StorageError("记录内容与哈希不一致")
-            if record.type == "message" and (
-                record.author is None or (not record.segments and record.reply is None)
-            ):
-                raise StorageError("普通群典缺少作者或内容")
-            if record.type == "forward" and (
-                not record.nodes
-                or any(not self._node_has_content(node) for node in record.nodes)
-            ):
-                raise StorageError("合并转发缺少节点内容")
-        return document
-
-    @classmethod
-    def _node_has_content(cls, node: Any) -> bool:
-        return bool(node.segments or node.reply or node.nested_forwards) and all(
-            nested.nodes and all(cls._node_has_content(child) for child in nested.nodes)
-            for nested in node.nested_forwards
-        )
-
-    @staticmethod
-    def _upgrade_document(document: dict[str, Any]) -> None:
-        """在下一次业务写入时把旧内容哈希惰性升级到当前版本。"""
-        if document.get("schema_version") == SCHEMA_VERSION:
-            return
-        records = [QuoteRecord.from_dict(raw) for raw in document["records"]]
-        for record in records:
-            record.content_hash = calculate_record_hash(record)
-        document["records"] = [record.to_dict() for record in records]
-        document["schema_version"] = SCHEMA_VERSION
-
-    def _load_document_sync(self, group_id: str) -> dict[str, Any]:
-        if group_id in self._broken_groups:
-            raise StorageError("当前群存储处于只读故障状态")
-        path = self._group_path(group_id)
-        if not path.exists():
-            return self._new_document(group_id)
-        try:
-            with path.open(encoding="utf-8-sig") as stream:
-                return self._validate_document(json.load(stream), group_id)
-        except Exception as primary_error:
-            backup = path.with_suffix(path.suffix + ".bak")
-            if backup.exists():
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            db = self._db()
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                yield db
+            except BaseException:
+                db.rollback()
+                raise
+            else:
                 try:
-                    with backup.open(encoding="utf-8-sig") as stream:
-                        recovered = self._validate_document(json.load(stream), group_id)
-                    self._atomic_json_write(path, recovered, keep_backup=False)
-                    return recovered
-                except (
-                    OSError,
-                    UnicodeError,
-                    json.JSONDecodeError,
-                    KeyError,
-                    TypeError,
-                    ValueError,
-                ):
-                    # 备份也无效，下面统一进入只读故障状态。
-                    ...
-            self._broken_groups.add(group_id)
-            raise StorageError("群典数据损坏且无法从备份恢复") from primary_error
+                    db.commit()
+                except sqlite3.Error as exc:
+                    db.rollback()
+                    raise StorageError(f"数据库提交失败：{exc}") from exc
 
-    async def records(self, group_id: str) -> list[QuoteRecord]:
-        """读取当前群的全部记录。"""
-        async with self._lock(group_id):
-            document = await asyncio.to_thread(self._load_document_sync, group_id)
-            return [QuoteRecord.from_dict(raw) for raw in document["records"]]
+    @contextlib.contextmanager
+    def _read(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            yield self._db()
 
-    async def save_image(
-        self,
-        group_id: str,
-        data: bytes,
-        *,
-        max_image_bytes: int,
-        max_media_bytes: int,
-    ) -> dict[str, Any]:
-        """校验并按内容哈希保存一张图片。"""
-        if not data:
-            raise StorageError("图片内容为空")
-        if len(data) > max_image_bytes:
-            raise StorageError("图片超过单张大小限制")
-        extension, mime = identify_image(data)
-        digest = hashlib.sha256(data).hexdigest()
-        relative = Path("images") / str(group_id) / f"{digest}{extension}"
-        destination = self.root / relative
-        async with self._maintenance_lock:
-            if not destination.exists():
-                usage = await self.media_usage_bytes()
-                if usage + len(data) > max_media_bytes:
-                    await asyncio.to_thread(
-                        self._prune_avatar_cache_for_space_sync,
-                        len(data),
-                        max_media_bytes,
-                    )
-                    usage = await self.media_usage_bytes()
-                    if usage + len(data) > max_media_bytes:
-                        raise StorageError("全局媒体存储容量已满")
-                await asyncio.to_thread(self._write_bytes_once, destination, data)
-        return {
-            "type": "image",
-            "path": relative.as_posix(),
-            "sha256": digest,
-            "mime": mime,
-            "size": len(data),
+    async def _run(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        try:
+            return await asyncio.to_thread(func, *args, **kwargs)
+        except sqlite3.Error as exc:
+            raise StorageError(f"数据库操作失败：{exc}") from exc
+
+    def _migrate(self) -> None:
+        db = self._db()
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations("
+            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, checksum TEXT NOT NULL)"
+        )
+        applied = {
+            int(row["version"]): row["checksum"]
+            for row in db.execute("SELECT version, checksum FROM schema_migrations")
         }
+        scripts = sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9]_*.sql"))
+        known = {int(path.name[:3]) for path in scripts}
+        if applied and max(applied) > max(known, default=0):
+            raise StorageError("数据库由更高版本插件创建，请先升级插件")
+        for path in scripts:
+            version = int(path.name[:3])
+            sql = path.read_text("utf-8")
+            checksum = hashlib.sha256(sql.encode()).hexdigest()
+            if version in applied:
+                if applied[version] != checksum:
+                    raise StorageError(f"迁移脚本 {path.name} 已被修改")
+                continue
+            # executescript 会先提交，迁移脚本自身不含事务语句，这里显式包裹。
+            with self._lock:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _split_sql(sql):
+                        db.execute(statement)
+                    db.execute(
+                        "INSERT INTO schema_migrations VALUES (?, ?, ?)",
+                        (version, now_iso(), checksum),
+                    )
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    raise
+
+    async def backup_to(self, target: Path) -> None:
+        """使用 SQLite backup API 生成一致性快照。"""
+
+        def run() -> None:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with self._read() as db, contextlib.closing(sqlite3.connect(target)) as out:
+                db.backup(out)
+
+        await self._run(run)
+
+    # 元数据 -----------------------------------------------------------
+
+    async def meta(self, key: str) -> str | None:
+        def run() -> str | None:
+            with self._read() as db:
+                row = db.execute(
+                    "SELECT value FROM meta WHERE key = ?", (key,)
+                ).fetchone()
+            return row["value"] if row else None
+
+        return await self._run(run)
+
+    async def set_meta(self, key: str, value: str) -> None:
+        def run() -> None:
+            with self._tx() as db:
+                db.execute(
+                    "INSERT INTO meta VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+
+        await self._run(run)
+
+    # 记录写入 ---------------------------------------------------------
 
     @staticmethod
-    def _write_bytes_once(path: Path, data: bytes) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            return
-        fd, temporary = tempfile.mkstemp(
-            dir=path.parent, prefix=".image-", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            if not path.exists():
-                os.replace(temporary, path)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
-
-    async def add(self, record: QuoteRecord, max_records: int) -> QuoteRecord:
-        """原子添加记录，并在当前群内按内容哈希去重。"""
-        async with self._maintenance_lock, self._lock(record.group_id):
-            document = await asyncio.to_thread(
-                self._load_document_sync,
+    def _insert_record(
+        db: sqlite3.Connection, record: QuoteRecord, media: dict[str, MediaInfo]
+    ) -> None:
+        index = record_index(record)
+        db.execute(
+            "INSERT INTO records (id, group_id, type, content_hash, author_id, recorded_at,"
+            " search_text, has_media, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record.id,
                 record.group_id,
-            )
-            self._upgrade_document(document)
-            records = [QuoteRecord.from_dict(raw) for raw in document["records"]]
-            duplicate = next(
-                (item for item in records if item.content_hash == record.content_hash),
-                None,
-            )
-            if duplicate:
-                await self._cleanup_unreferenced_images_unlocked(
-                    record.group_id, records
+                record.type,
+                record.content_hash,
+                record.author.user_id if record.author else None,
+                record.recorded_at,
+                index["search_text"],
+                int(bool(record.media_hashes())),
+                json.dumps(record.to_dict(), ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+        db.executemany(
+            "INSERT INTO record_participants VALUES (?, ?, ?, ?)",
+            [(record.id, *row) for row in index["participants"]],
+        )
+        db.executemany(
+            "INSERT INTO record_names VALUES (?, ?)",
+            [(record.id, name) for name in index["names"]],
+        )
+        now = now_iso()
+        for sha256 in record.media_hashes():
+            info = media.get(sha256)
+            if info is not None:
+                db.execute(
+                    "INSERT INTO media (sha256, mime, size, created_at, verified_at)"
+                    " VALUES (?, ?, ?, ?, ?) ON CONFLICT(sha256) DO UPDATE SET missing = 0,"
+                    " verified_at = excluded.verified_at",
+                    (sha256, info.mime, info.size, now, now),
                 )
-                raise DuplicateQuoteError(duplicate)
-            if len(records) >= max_records:
-                await self._cleanup_unreferenced_images_unlocked(
-                    record.group_id, records
-                )
-                raise StorageError("当前群的群典条数已达到上限")
-            document["records"].append(record.to_dict())
-            await asyncio.to_thread(
-                self._atomic_json_write,
-                self._group_path(record.group_id),
-                document,
-            )
-            return record
+            elif not db.execute(
+                "SELECT 1 FROM media WHERE sha256 = ?", (sha256,)
+            ).fetchone():
+                raise StorageError("记录引用了未登记的媒体")
+            db.execute("INSERT INTO record_media VALUES (?, ?)", (record.id, sha256))
 
-    async def search(self, group_id: str, text: str) -> list[QuoteRecord]:
-        """按规范化正文子串检索待删除记录。"""
-        needle = normalize_search(text)
-        if not needle:
-            raise StorageError("删除关键词不能为空")
-        return [
-            record
-            for record in await self.records(group_id)
-            if needle in normalize_search(record.searchable_text())
-        ]
+    def _row_record(self, row: sqlite3.Row) -> QuoteRecord:
+        return QuoteRecord.from_dict(json.loads(row["payload"]))
 
-    async def delete_ids(
+    async def add(
+        self,
+        record: QuoteRecord,
+        max_records: int,
+        media: Iterable[MediaInfo] = (),
+    ) -> None:
+        """原子添加记录；同群内容哈希重复或达到条数上限时拒绝。"""
+        media_map = {info.sha256: info for info in media}
+
+        def run() -> None:
+            with self._tx() as db:
+                existing = db.execute(
+                    "SELECT payload FROM records WHERE group_id = ? AND content_hash = ?",
+                    (record.group_id, record.content_hash),
+                ).fetchone()
+                if existing:
+                    raise DuplicateQuoteError(self._row_record(existing))
+                (count,) = db.execute(
+                    "SELECT COUNT(*) FROM records WHERE group_id = ?",
+                    (record.group_id,),
+                ).fetchone()
+                if count >= max_records:
+                    raise StorageError("当前群的群典条数已达到上限")
+                self._insert_record(db, record, media_map)
+
+        await self._run(run)
+
+    async def import_records(
+        self,
+        records: list[QuoteRecord],
+        media: Iterable[MediaInfo],
+        limits: Callable[[str], int],
+    ) -> None:
+        """单事务写入已预检的导入记录；任一冲突则整体回滚。"""
+        media_map = {info.sha256: info for info in media}
+
+        def run() -> None:
+            try:
+                with self._tx() as db:
+                    counts: dict[str, int] = {}
+                    for record in records:
+                        if record.group_id not in counts:
+                            (counts[record.group_id],) = db.execute(
+                                "SELECT COUNT(*) FROM records WHERE group_id = ?",
+                                (record.group_id,),
+                            ).fetchone()
+                        if counts[record.group_id] >= limits(record.group_id):
+                            raise StorageError(
+                                f"群 {record.group_id} 导入后会超过记录上限"
+                            )
+                        self._insert_record(db, record, media_map)
+                        counts[record.group_id] += 1
+            except sqlite3.IntegrityError as exc:
+                raise StorageError("导入期间数据已发生变化，请重新预检") from exc
+
+        await self._run(run)
+
+    @staticmethod
+    def _audit(
+        db: sqlite3.Connection, limit: int, entries: list[tuple[Any, ...]]
+    ) -> None:
+        db.executemany(
+            "INSERT INTO audit_log (group_id, record_id, content_hash, deleted_by,"
+            " deleted_at, source, node_path, removed_nodes, record_deleted)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            entries,
+        )
+        db.execute(
+            "DELETE FROM audit_log WHERE id <= (SELECT MAX(id) FROM audit_log) - ?",
+            (limit,),
+        )
+
+    @staticmethod
+    def _orphan_media(
+        db: sqlite3.Connection, candidates: set[str]
+    ) -> list[tuple[str, str]]:
+        """删除不再被引用的媒体行，返回需删除文件的 (sha256, mime)。"""
+        result: list[tuple[str, str]] = []
+        for sha256 in candidates:
+            if db.execute(
+                "SELECT 1 FROM record_media WHERE sha256 = ?", (sha256,)
+            ).fetchone():
+                continue
+            row = db.execute(
+                "SELECT mime FROM media WHERE sha256 = ?", (sha256,)
+            ).fetchone()
+            if row:
+                db.execute("DELETE FROM media WHERE sha256 = ?", (sha256,))
+                result.append((sha256, row["mime"]))
+        return result
+
+    async def delete_records(
         self,
         group_id: str,
         record_ids: set[str],
@@ -354,857 +367,650 @@ class QuoteStorage:
         source: str,
         expected_hashes: dict[str, str] | None = None,
         audit_limit: int = 10_000,
-    ) -> int:
-        """按已锁定的 ID 删除记录并清理无引用图片。"""
-        async with self._maintenance_lock, self._lock(group_id):
-            document = await asyncio.to_thread(self._load_document_sync, group_id)
-            self._upgrade_document(document)
-            current = [QuoteRecord.from_dict(raw) for raw in document["records"]]
-            selected = [record for record in current if record.id in record_ids]
-            if len(selected) != len(record_ids):
-                raise StorageError("待删除记录已发生变化，请重新执行删除命令")
-            if expected_hashes and any(
-                expected_hashes.get(record.id) != record.content_hash
-                for record in selected
-            ):
-                raise StorageError("待删除记录已发生变化，请重新执行删除命令")
-            remaining = [record for record in current if record.id not in record_ids]
-            document["records"] = [record.to_dict() for record in remaining]
-            await asyncio.to_thread(
-                self._atomic_json_write,
-                self._group_path(group_id),
-                document,
-            )
-            await self._append_audit(
-                group_id, selected, deleted_by, source, audit_limit
-            )
-            await self._cleanup_unreferenced_images_unlocked(group_id, remaining)
-            return len(selected)
+    ) -> tuple[int, list[tuple[str, str]]]:
+        """按 ID 删除并写审计；返回删除数量与待删除的孤儿媒体文件。"""
 
-    async def delete_forward_node(
+        def run() -> tuple[int, list[tuple[str, str]]]:
+            with self._tx() as db:
+                marks = ",".join("?" * len(record_ids))
+                rows = db.execute(
+                    f"SELECT id, content_hash FROM records WHERE group_id = ? AND id IN ({marks})",
+                    (group_id, *record_ids),
+                ).fetchall()
+                if len(rows) != len(record_ids) or (
+                    expected_hashes
+                    and any(
+                        expected_hashes.get(row["id"]) != row["content_hash"]
+                        for row in rows
+                    )
+                ):
+                    raise StorageError("待删除记录已发生变化，请重新执行删除命令")
+                shas = {
+                    row["sha256"]
+                    for row in db.execute(
+                        f"SELECT sha256 FROM record_media WHERE record_id IN ({marks})",
+                        tuple(record_ids),
+                    )
+                }
+                db.execute(
+                    f"DELETE FROM records WHERE id IN ({marks})", tuple(record_ids)
+                )
+                now = now_iso()
+                self._audit(
+                    db,
+                    audit_limit,
+                    [
+                        (
+                            group_id,
+                            row["id"],
+                            row["content_hash"],
+                            deleted_by,
+                            now,
+                            source,
+                            None,
+                            None,
+                            None,
+                        )
+                        for row in rows
+                    ],
+                )
+                return len(rows), self._orphan_media(db, shas)
+
+        if not record_ids:
+            return 0, []
+        return await self._run(run)
+
+    async def replace_record(
         self,
+        record: QuoteRecord | None,
+        *,
         group_id: str,
         record_id: str,
         expected_hash: str,
-        node_path: list[int],
-        *,
-        deleted_by: str,
-        audit_limit: int = 10_000,
-    ) -> tuple[QuoteRecord | None, int]:
-        """按稳定路径删除合并转发节点，并清理空容器与无引用媒体。"""
-        if (
-            not node_path
-            or len(node_path) % 2 == 0
-            or any(
-                not isinstance(index, int) or isinstance(index, bool) or index < 0
-                for index in node_path
-            )
-        ):
-            raise StorageError("节点路径无效，请刷新页面后重试")
-        async with self._maintenance_lock, self._lock(group_id):
-            document = await asyncio.to_thread(self._load_document_sync, group_id)
-            self._upgrade_document(document)
-            records = [QuoteRecord.from_dict(raw) for raw in document["records"]]
-            record = next((item for item in records if item.id == record_id), None)
-            if record is None or record.type != "forward":
-                raise StorageError("合并转发记录不存在，请刷新页面后重试")
-            if record.content_hash != expected_hash:
-                raise StorageError("记录内容已发生变化，请刷新页面后重试")
-            removed_nodes = self._delete_node_at_path(record.nodes, node_path)
-            record.source_forward_id = None
-            record_deleted = not record.nodes
-            if record_deleted:
-                records = [item for item in records if item.id != record_id]
-                updated = None
-            else:
-                record.content_hash = calculate_record_hash(record)
-                updated = record
-            document["records"] = [item.to_dict() for item in records]
-            await asyncio.to_thread(
-                self._atomic_json_write,
-                self._group_path(group_id),
-                document,
-            )
-            await self._append_node_audit(
-                group_id=group_id,
-                record_id=record_id,
-                content_hash=expected_hash,
-                deleted_by=deleted_by,
-                node_path=node_path,
-                removed_nodes=removed_nodes,
-                record_deleted=record_deleted,
-                limit=audit_limit,
-            )
-            await self._cleanup_unreferenced_images_unlocked(group_id, records)
-            return updated, removed_nodes
-
-    @classmethod
-    def _delete_node_at_path(cls, nodes: list[Any], path: list[int]) -> int:
-        node_index = path[0]
-        if node_index >= len(nodes):
-            raise StorageError("节点路径已失效，请刷新页面后重试")
-        if len(path) == 1:
-            removed = nodes.pop(node_index)
-            return cls._node_count(removed)
-        node = nodes[node_index]
-        nested_index = path[1]
-        if nested_index >= len(node.nested_forwards):
-            raise StorageError("嵌套节点路径已失效，请刷新页面后重试")
-        nested = node.nested_forwards[nested_index]
-        removed_count = cls._delete_node_at_path(nested.nodes, path[2:])
-        nested.source_forward_id = None
-        if not nested.nodes:
-            node.nested_forwards.pop(nested_index)
-        return removed_count
-
-    @classmethod
-    def _node_count(cls, node: Any) -> int:
-        return 1 + sum(
-            cls._node_count(child)
-            for nested in node.nested_forwards
-            for child in nested.nodes
-        )
-
-    async def select_random(
-        self,
-        group_id: str,
-        count: int,
-        author_id: str | None = None,
-        keyword: str | None = None,
-        *,
-        candidate_records: list[QuoteRecord] | None = None,
-    ) -> tuple[list[QuoteRecord], int]:
-        """从有效记录中等概率无放回抽取。"""
-        candidates = (
-            list(candidate_records)
-            if candidate_records is not None
-            else await self.records(group_id)
-        )
-        needle = normalize_search(keyword or "")
-        if author_id and needle:
-            candidates = [
-                record
-                for record in candidates
-                if needle in normalize_search(record.authored_text(author_id))
-            ]
-        elif author_id:
-            candidates = [
-                record for record in candidates if record.involves_user(author_id)
-            ]
-        health = await self.record_health(candidates)
-        healthy = [record for record, valid in zip(candidates, health) if valid]
-        broken = health.count(False)
-        if not healthy:
-            return [], broken
-        return random.sample(healthy, min(count, len(healthy))), broken
-
-    async def records_for_user(
-        self,
-        group_id: str,
-        user_id: str,
-        *,
-        candidate_records: list[QuoteRecord] | None = None,
-    ) -> tuple[list[QuoteRecord], int]:
-        """按添加时间返回用户参与的可展示记录及完全损坏数量。"""
-        candidates = [
-            record
-            for record in (
-                candidate_records
-                if candidate_records is not None
-                else await self.records(group_id)
-            )
-            if record.involves_user(user_id)
-        ]
-        usable: list[QuoteRecord] = []
-        broken = 0
-        for record in candidates:
-            if self._record_has_displayable_content(record):
-                usable.append(record)
-            else:
-                broken += 1
-        usable.sort(key=lambda record: record.recorded_at)
-        return usable, broken
-
-    @classmethod
-    def _record_has_displayable_content(cls, record: QuoteRecord) -> bool:
-        if record.type == "message":
-            return bool(record.segments or record.reply)
-        return any(cls._node_has_content(node) for node in record.nodes)
-
-    def missing_media_count(self, record: QuoteRecord) -> int:
-        """返回记录中缺失、越界或哈希不匹配的媒体数量。"""
-        return sum(
-            not self.media_segment_valid(segment) for segment in record.image_segments()
-        )
-
-    def media_segment_valid(self, segment: Any) -> bool:
-        """验证单个媒体段的路径、文件与内容哈希。"""
-        if not segment.path or not segment.sha256:
-            return False
-        cache = self._media_checks.get()
-        key = (str(self.root), segment.path, segment.sha256)
-        if cache is not None and key in cache:
-            return cache[key]
-        valid = self._media_segment_valid_sync(segment)
-        if cache is not None:
-            cache[key] = valid
-        return valid
-
-    def _media_segment_valid_sync(self, segment: Any) -> bool:
-        path = (self.root / segment.path).resolve()
-        if self.root not in path.parents or not path.is_file():
-            return False
-        try:
-            return hashlib.sha256(path.read_bytes()).hexdigest() == segment.sha256
-        except OSError:
-            return False
-
-    def _record_images_valid(self, record: QuoteRecord) -> bool:
-        validity = [
-            self.media_segment_valid(segment) for segment in record.image_segments()
-        ]
-        return all(validity)
-
-    async def record_is_healthy(self, record: QuoteRecord) -> bool:
-        """供管理页检查单条记录引用的图片是否仍完整。"""
-        return await asyncio.to_thread(self._record_images_valid, record)
-
-    async def info(self, group_id: str, max_records: int) -> dict[str, Any]:
-        """汇总当前群统计，不返回正文。"""
-        records = await self.records(group_id)
-        broken = (await self.record_health(records)).count(False)
-        image_paths = {
-            segment.path
-            for record in records
-            for segment in record.image_segments()
-            if segment.path
-        }
-        image_bytes = await asyncio.to_thread(self._image_usage_bytes, image_paths)
-        times = sorted(record.recorded_at for record in records if record.recorded_at)
-        return {
-            "total": len(records),
-            "limit": max_records,
-            "messages": sum(record.type == "message" for record in records),
-            "forwards": sum(record.type == "forward" for record in records),
-            "with_images": sum(bool(record.image_segments()) for record in records),
-            "broken": broken,
-            "image_bytes": image_bytes,
-            "earliest": times[0] if times else None,
-            "latest": times[-1] if times else None,
-        }
-
-    def _image_usage_bytes(self, paths: set[str]) -> int:
-        total = 0
-        for path in paths:
-            try:
-                total += self.resolve_media_path(path).stat().st_size
-            except (OSError, StorageError):
-                # 损坏或越界媒体已计入 broken，不读取数据根目录之外的文件。
-                continue
-        return total
-
-    async def media_usage_bytes(self) -> int:
-        """计算群典图片与本地头像缓存的合计占用。"""
-        return await asyncio.to_thread(self._media_usage_bytes_sync)
-
-    def _media_usage_bytes_sync(self) -> int:
-        return sum(
-            path.stat().st_size
-            for directory in (self.images_dir, self.avatars_dir)
-            for path in directory.rglob("*")
-            if path.is_file()
-        )
-
-    def _prune_avatar_cache_for_space_sync(self, incoming: int, limit: int) -> None:
-        """为不可再生的群典图片腾出空间，头像按无引用和 LRU 顺序淘汰。"""
-        if self._media_usage_bytes_sync() + incoming <= limit:
-            return
-        index_path = self.avatars_dir / "index.json"
-        try:
-            index = json.loads(index_path.read_text(encoding="utf-8"))
-            if not isinstance(index, dict):
-                index = {}
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            index = {}
-        referenced = self._referenced_author_ids_sync()
-        candidates = sorted(
-            (path for path in self.avatars_dir.glob("*.jpg") if path.is_file()),
-            key=lambda path: (
-                path.stem in referenced,
-                self._avatar_last_used(index.get(path.stem)),
-            ),
-        )
-        changed = False
-        for path in candidates:
-            path.unlink(missing_ok=True)
-            index.pop(path.stem, None)
-            changed = True
-            if self._media_usage_bytes_sync() + incoming <= limit:
-                break
-        if changed:
-            self._atomic_json_write(index_path, index, keep_backup=False)
-
-    def _referenced_author_ids_sync(self) -> set[str]:
-        result: set[str] = set()
-        for path in self.groups_dir.glob("*.json"):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                records = [
-                    QuoteRecord.from_dict(raw) for raw in payload.get("records", [])
-                ]
-            except (
-                OSError,
-                UnicodeError,
-                json.JSONDecodeError,
-                TypeError,
-                ValueError,
-            ):
-                continue
-            for record in records:
-                if record.author and record.author.user_id:
-                    result.add(record.author.user_id)
-                self._collect_reply_author_ids(record.reply, result)
-                for node in record.nodes:
-                    self._collect_node_author_ids(node, result)
-        return result
-
-    @staticmethod
-    def _avatar_last_used(value: Any) -> float:
-        if not isinstance(value, dict):
-            return 0
-        try:
-            return float(value.get("last_used", 0))
-        except (TypeError, ValueError):
-            return 0
-
-    async def referenced_author_ids(self) -> set[str]:
-        """汇总全部记录及回复快照中仍被引用的 QQ 号。"""
-        result: set[str] = set()
-        for group_id in await self.list_groups():
-            for record in await self.records(group_id):
-                if record.author and record.author.user_id:
-                    result.add(record.author.user_id)
-                self._collect_reply_author_ids(record.reply, result)
-                for node in record.nodes:
-                    self._collect_node_author_ids(node, result)
-        return result
-
-    @classmethod
-    def _collect_node_author_ids(cls, node: Any, result: set[str]) -> None:
-        if node.author.user_id:
-            result.add(node.author.user_id)
-        cls._collect_reply_author_ids(node.reply, result)
-        for nested in node.nested_forwards:
-            for child in nested.nodes:
-                cls._collect_node_author_ids(child, result)
-
-    @classmethod
-    def _collect_reply_author_ids(cls, reply: Any, result: set[str]) -> None:
-        if reply is None:
-            return
-        if reply.author.user_id:
-            result.add(reply.author.user_id)
-        cls._collect_reply_author_ids(reply.reply, result)
-
-    async def cleanup_group_orphans(self, group_id: str) -> None:
-        """清理一次失败收录可能留下的未引用图片。"""
-        async with self._maintenance_lock, self._lock(group_id):
-            document = await asyncio.to_thread(self._load_document_sync, group_id)
-            records = [QuoteRecord.from_dict(raw) for raw in document["records"]]
-            await self._cleanup_unreferenced_images_unlocked(group_id, records)
-
-    async def _cleanup_unreferenced_images_unlocked(
-        self,
-        group_id: str,
-        records: list[QuoteRecord],
-    ) -> None:
-        referenced = {
-            (self.root / segment.path).resolve()
-            for record in records
-            for segment in record.image_segments()
-            if segment.path
-        }
-        directory = self.images_dir / str(group_id)
-
-        def cleanup() -> None:
-            if not directory.exists():
-                return
-            for path in directory.iterdir():
-                if path.is_file() and path.resolve() not in referenced:
-                    path.unlink(missing_ok=True)
-
-        await asyncio.to_thread(cleanup)
-
-    async def _append_audit(
-        self,
-        group_id: str,
-        records: list[QuoteRecord],
-        deleted_by: str,
-        source: str,
-        limit: int,
-    ) -> None:
-        def append() -> None:
-            entries: list[dict[str, Any]] = []
-            if self.audit_path.exists():
-                try:
-                    loaded = json.loads(self.audit_path.read_text(encoding="utf-8-sig"))
-                    if isinstance(loaded, list):
-                        entries = loaded
-                except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
-                    entries = []
-            timestamp = datetime.now(UTC).isoformat()
-            entries.extend(
-                {
-                    "group_id": group_id,
-                    "record_id": record.id,
-                    "content_hash": record.content_hash,
-                    "deleted_by": deleted_by,
-                    "deleted_at": timestamp,
-                    "source": source,
-                }
-                for record in records
-            )
-            self._atomic_json_write(
-                self.audit_path,
-                entries[-limit:],
-                keep_backup=True,
-            )
-
-        await asyncio.to_thread(append)
-
-    async def _append_node_audit(
-        self,
-        *,
-        group_id: str,
-        record_id: str,
-        content_hash: str,
         deleted_by: str,
         node_path: list[int],
         removed_nodes: int,
-        record_deleted: bool,
-        limit: int,
-    ) -> None:
-        """追加不包含被删正文的节点级删除审计。"""
+        audit_limit: int,
+    ) -> list[tuple[str, str]]:
+        """节点删除：用新内容替换记录（record 为 None 表示整条删除）。"""
 
-        def append() -> None:
-            entries: list[dict[str, Any]] = []
-            if self.audit_path.exists():
-                try:
-                    loaded = json.loads(self.audit_path.read_text(encoding="utf-8-sig"))
-                    if isinstance(loaded, list):
-                        entries = loaded
-                except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
-                    entries = []
-            entries.append(
-                {
-                    "group_id": group_id,
-                    "record_id": record_id,
-                    "content_hash": content_hash,
-                    "deleted_by": deleted_by,
-                    "deleted_at": datetime.now(UTC).isoformat(),
-                    "source": "page_node",
-                    "node_path": list(node_path),
-                    "removed_nodes": removed_nodes,
-                    "record_deleted": record_deleted,
-                }
-            )
-            self._atomic_json_write(
-                self.audit_path,
-                entries[-limit:],
-                keep_backup=True,
-            )
-
-        await asyncio.to_thread(append)
-
-    async def audit_entries(self, limit: int = 200) -> list[dict[str, Any]]:
-        """读取最近删除审计。"""
-
-        def read() -> list[dict[str, Any]]:
-            if not self.audit_path.exists():
-                return []
-            value = json.loads(self.audit_path.read_text(encoding="utf-8-sig"))
-            return value[-limit:] if isinstance(value, list) else []
-
-        return await asyncio.to_thread(read)
-
-    async def list_groups(self) -> list[str]:
-        """列出已有群数据文件。"""
-        return await asyncio.to_thread(
-            lambda: sorted(path.stem for path in self.groups_dir.glob("*.json"))
-        )
-
-    async def export_zip(self, include_settings: dict[str, Any]) -> Path:
-        """创建带清单的可移植 ZIP 备份。"""
-        async with self._maintenance_lock:
-            return await asyncio.to_thread(self._export_zip_sync, include_settings)
-
-    def _export_zip_sync(self, include_settings: dict[str, Any]) -> Path:
-        self.backups_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        target = self.backups_dir / f"iconic-quotes-{stamp}-{uuid.uuid4().hex[:6]}.zip"
-        files = [
-            path
-            for directory in (self.groups_dir, self.images_dir)
-            for path in directory.rglob("*")
-            if path.is_file() and not path.name.endswith(".bak")
-        ]
-        manifest = {
-            "format": "astrbot_plugin_iconic_quotes_backup",
-            "schema_version": SCHEMA_VERSION,
-            "created_at": datetime.now(UTC).isoformat(),
-            "files": {
-                path.relative_to(self.root).as_posix(): hashlib.sha256(
-                    path.read_bytes()
-                ).hexdigest()
-                for path in files
-            },
-            "settings": include_settings,
-        }
-        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr(
-                "manifest.json",
-                json.dumps(manifest, ensure_ascii=False, indent=2),
-            )
-            for path in files:
-                archive.write(path, path.relative_to(self.root).as_posix())
-        return target
-
-    async def import_zip(
-        self,
-        archive_path: Path,
-        *,
-        max_records: int | dict[str, int],
-        max_media_bytes: int,
-        max_image_bytes: int = 100 * 1024 * 1024,
-    ) -> dict[str, Any]:
-        """严格校验后以哈希去重方式合并官方备份。"""
-        async with self._maintenance_lock:
-            try:
-                return await asyncio.to_thread(
-                    self._import_zip_sync,
-                    archive_path,
-                    max_records,
-                    max_media_bytes,
-                    max_image_bytes,
-                    True,
-                )
-            except StorageError:
-                raise
-            except (
-                OSError,
-                KeyError,
-                TypeError,
-                ValueError,
-                zipfile.BadZipFile,
-            ) as exc:
-                raise StorageError("备份文件损坏或格式无效") from exc
-
-    async def inspect_zip(
-        self,
-        archive_path: Path,
-        *,
-        max_records: int | dict[str, int],
-        max_media_bytes: int,
-        max_image_bytes: int = 100 * 1024 * 1024,
-    ) -> dict[str, Any]:
-        """完整预检 ZIP，但不写入任何记录或图片。"""
-        async with self._maintenance_lock:
-            try:
-                return await asyncio.to_thread(
-                    self._import_zip_sync,
-                    archive_path,
-                    max_records,
-                    max_media_bytes,
-                    max_image_bytes,
-                    False,
-                )
-            except StorageError:
-                raise
-            except (
-                OSError,
-                KeyError,
-                TypeError,
-                ValueError,
-                zipfile.BadZipFile,
-            ) as exc:
-                raise StorageError("备份文件损坏或格式无效") from exc
-
-    def _import_zip_sync(
-        self,
-        archive_path: Path,
-        max_records: int | dict[str, int],
-        max_media_bytes: int,
-        max_image_bytes: int,
-        commit: bool,
-    ) -> dict[str, Any]:
-        added = duplicates = conflicts = missing_images = 0
-        merged_documents: dict[str, dict[str, Any]] = {}
-        original_documents: dict[str, dict[str, Any]] = {}
-        required_images: set[str] = set()
-        with zipfile.ZipFile(archive_path) as archive:
-            infos = archive.infolist()
-            if len(infos) > 100_000:
-                raise StorageError("备份文件数量超过限制")
-            unpacked_limit = min(max_media_bytes + 512 * 1024 * 1024, 4 * 1024**3)
-            if sum(info.file_size for info in infos) > unpacked_limit:
-                raise StorageError("备份解压后的总大小超过安全限制")
-            names = [info.filename for info in infos]
-            if len(names) != len(set(names)):
-                raise StorageError("备份包含重复文件名")
-            for info in infos:
-                path = Path(info.filename)
-                if (
-                    path.is_absolute()
-                    or ".." in path.parts
-                    or info.file_size > 100 * 1024 * 1024
-                    or (
-                        info.file_size > 10 * 1024 * 1024
-                        and info.file_size > max(1, info.compress_size) * 200
+        def run() -> list[tuple[str, str]]:
+            with self._tx() as db:
+                row = db.execute(
+                    "SELECT content_hash FROM records WHERE group_id = ? AND id = ?",
+                    (group_id, record_id),
+                ).fetchone()
+                if row is None or row["content_hash"] != expected_hash:
+                    raise StorageError("记录内容已发生变化，请刷新页面后重试")
+                shas = {
+                    item["sha256"]
+                    for item in db.execute(
+                        "SELECT sha256 FROM record_media WHERE record_id = ?",
+                        (record_id,),
                     )
-                ):
-                    raise StorageError("备份包含不安全的文件路径或超大文件")
-            manifest = json.loads(archive.read("manifest.json"))
-            if manifest.get("format") != "astrbot_plugin_iconic_quotes_backup":
-                raise StorageError("不是本插件导出的备份")
-            declared = manifest.get("files")
-            if not isinstance(declared, dict):
-                raise StorageError("备份清单无效")
-            actual_files = {info.filename for info in infos if not info.is_dir()}
-            if actual_files != {"manifest.json", *declared.keys()}:
-                raise StorageError("备份文件与清单不一致")
-            payloads: dict[str, bytes] = {}
-            for name, expected_hash in declared.items():
-                path = Path(name)
-                if (
-                    not isinstance(name, str)
-                    or path.is_absolute()
-                    or ".." in path.parts
-                    or not (
-                        name.startswith("images/")
-                        or (name.startswith("groups/") and name.endswith(".json"))
-                    )
-                ):
-                    raise StorageError(f"备份清单包含不允许的路径: {name}")
-                data = archive.read(name)
-                if hashlib.sha256(data).hexdigest() != expected_hash:
-                    raise StorageError(f"备份文件哈希不匹配: {name}")
-                payloads[name] = data
-            image_payloads = {
-                name: data
-                for name, data in payloads.items()
-                if name.startswith("images/")
-            }
-            if any(len(data) > max_image_bytes for data in image_payloads.values()):
-                raise StorageError("备份包含超过当前单张上限的图片")
-            current_usage = sum(
-                path.stat().st_size
-                for path in self.images_dir.rglob("*")
-                if path.is_file()
-            )
-            group_names = sorted(
-                name
-                for name in payloads
-                if name.startswith("groups/") and name.endswith(".json")
-            )
-            for name in group_names:
-                incoming = json.loads(payloads[name])
-                group_id = Path(name).stem
-                group_limit = (
-                    max_records.get(group_id, max_records.get("*", 5000))
-                    if isinstance(max_records, dict)
-                    else max_records
-                )
-                self._validate_document(incoming, group_id)
-                current = self._load_document_sync(group_id)
-                original_documents[group_id] = json.loads(json.dumps(current))
-                self._upgrade_document(incoming)
-                self._upgrade_document(current)
-                hashes = {raw.get("content_hash") for raw in current["records"]}
-                ids = {
-                    raw.get("id"): raw.get("content_hash") for raw in current["records"]
                 }
-                for raw in incoming["records"]:
-                    if raw.get("content_hash") in hashes:
-                        duplicates += 1
-                        continue
-                    if raw.get("id") in ids:
-                        conflicts += 1
-                        continue
-                    if len(current["records"]) >= group_limit:
-                        raise StorageError(f"群 {group_id} 导入后会超过记录上限")
-                    record = QuoteRecord.from_dict(raw)
-                    for segment in record.image_segments():
-                        relative = segment.path or ""
-                        expected = segment.sha256 or ""
-                        image_path = Path(relative)
-                        if (
-                            not relative.startswith(f"images/{group_id}/")
-                            or image_path.is_absolute()
-                            or ".." in image_path.parts
-                            or len(expected) != 64
-                            or image_path.stem.casefold() != expected.casefold()
-                        ):
-                            raise StorageError("记录图片路径或哈希字段无效")
-                        required_images.add(relative)
-                        data = image_payloads.get(relative)
-                        if data is None:
-                            existing = self.root / relative
-                            if not existing.is_file():
-                                missing_images += 1
-                                continue
-                            data = existing.read_bytes()
-                        if hashlib.sha256(data).hexdigest() != expected:
-                            raise StorageError(f"记录图片哈希不匹配: {relative}")
-                        identify_image(data)
-                    current["records"].append(raw)
-                    hashes.add(raw.get("content_hash"))
-                    ids[raw.get("id")] = raw.get("content_hash")
-                    added += 1
-                merged_documents[group_id] = current
-            image_payloads = {
-                name: data
-                for name, data in image_payloads.items()
-                if name in required_images
-            }
-            new_image_bytes = sum(
-                len(data)
-                for name, data in image_payloads.items()
-                if not (self.root / name).exists()
-            )
-            if current_usage + new_image_bytes > max_media_bytes:
-                raise StorageError("导入会超过全局媒体容量")
-        result = {
-            "added": added,
-            "duplicates": duplicates,
-            "conflicts": conflicts,
-            "missing_images": missing_images,
-            "image_bytes": new_image_bytes,
-            "settings": manifest.get("settings") or {},
-        }
-        if not commit:
-            return result
-        if missing_images:
-            raise StorageError(f"备份缺少 {missing_images} 张被记录引用的图片")
-        created_images: list[Path] = []
-        written_groups: list[str] = []
-        try:
-            for name, data in image_payloads.items():
-                target = self.root / name
-                if not target.exists():
-                    self._write_bytes_once(target, data)
-                    created_images.append(target)
-            for group_id, document in merged_documents.items():
-                self._atomic_json_write(self._group_path(group_id), document)
-                written_groups.append(group_id)
-        except Exception:
-            for group_id in reversed(written_groups):
-                original = original_documents[group_id]
-                path = self._group_path(group_id)
-                if (
-                    original["records"]
-                    or path.with_suffix(path.suffix + ".bak").exists()
-                ):
-                    with contextlib.suppress(Exception):
-                        self._atomic_json_write(path, original, keep_backup=False)
-                else:
-                    path.unlink(missing_ok=True)
-            for path in created_images:
-                path.unlink(missing_ok=True)
-            raise
-        return result
+                db.execute("DELETE FROM records WHERE id = ?", (record_id,))
+                if record is not None:
+                    if db.execute(
+                        "SELECT 1 FROM records WHERE group_id = ? AND content_hash = ?",
+                        (group_id, record.content_hash),
+                    ).fetchone():
+                        raise StorageError(
+                            "删除节点后内容与现有群典重复，请改为删除整条记录"
+                        )
+                    self._insert_record(db, record, {})
+                self._audit(
+                    db,
+                    audit_limit,
+                    [
+                        (
+                            group_id,
+                            record_id,
+                            expected_hash,
+                            deleted_by,
+                            now_iso(),
+                            "page_node",
+                            json.dumps(node_path),
+                            removed_nodes,
+                            int(record is None),
+                        )
+                    ],
+                )
+                return self._orphan_media(db, shas)
 
-    async def migrate_to(self, new_subdir: str) -> tuple[Path, Path, Path]:
-        """复制校验数据后切换根目录，并保留带时间戳旧目录。"""
-        new_root = safe_storage_path(self.data_root, new_subdir)
-        if new_root == self.root:
-            raise StorageError("新旧存储路径相同")
-        if new_root in self.root.parents or self.root in new_root.parents:
-            raise StorageError("新旧存储目录不能互相包含")
-        async with self._maintenance_lock:
-            old_root = self.root
-            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            backup_root = old_root.with_name(
-                f"{old_root.name}.backup-{stamp}-{uuid.uuid4().hex[:6]}"
-            )
-            await asyncio.to_thread(self._migrate_sync, old_root, new_root, backup_root)
-            self.root = new_root
-            self.groups_dir = new_root / "groups"
-            self.images_dir = new_root / "images"
-            self.avatars_dir = new_root / "avatars"
-            self.backups_dir = new_root / "backups"
-            self.audit_path = new_root / "audit.json"
-            self._broken_groups.clear()
-            return new_root, backup_root, old_root
+        return await self._run(run)
 
-    async def rollback_migration(
+    # 记录读取 ---------------------------------------------------------
+
+    async def get(self, group_id: str, record_id: str) -> QuoteRecord | None:
+        def run() -> QuoteRecord | None:
+            with self._read() as db:
+                row = db.execute(
+                    "SELECT payload FROM records WHERE group_id = ? AND id = ?",
+                    (group_id, record_id),
+                ).fetchone()
+            return self._row_record(row) if row else None
+
+        return await self._run(run)
+
+    async def load(self, record_ids: list[str]) -> list[QuoteRecord]:
+        """按给定顺序加载记录。"""
+
+        def run() -> list[QuoteRecord]:
+            result: dict[str, QuoteRecord] = {}
+            with self._read() as db:
+                for start in range(0, len(record_ids), 500):
+                    chunk = record_ids[start : start + 500]
+                    marks = ",".join("?" * len(chunk))
+                    for row in db.execute(
+                        f"SELECT id, payload FROM records WHERE id IN ({marks})", chunk
+                    ):
+                        result[row["id"]] = self._row_record(row)
+            return [result[item] for item in record_ids if item in result]
+
+        return await self._run(run)
+
+    async def candidates(
         self,
-        old_root: Path,
-        new_root: Path,
-        backup_root: Path,
-    ) -> None:
-        """配置保存失败时恢复迁移前目录和服务路径。"""
-        async with self._maintenance_lock:
-            await asyncio.to_thread(
-                self._rollback_migration_sync,
-                old_root,
-                new_root,
-                backup_root,
-            )
-            self.root = old_root
-            self.groups_dir = old_root / "groups"
-            self.images_dir = old_root / "images"
-            self.avatars_dir = old_root / "avatars"
-            self.backups_dir = old_root / "backups"
-            self.audit_path = old_root / "audit.json"
-            self._broken_groups.clear()
+        group_id: str,
+        *,
+        user_id: str | None = None,
+        names: Iterable[str] = (),
+        include_broken: bool = False,
+    ) -> tuple[list[str], int]:
+        """候选记录 ID（按收录时间）与媒体缺失的记录数；默认只返回健康记录。
 
-    def _migrate_sync(self, old_root: Path, new_root: Path, backup_root: Path) -> None:
-        if new_root.exists() and any(new_root.iterdir()):
-            raise StorageError("目标存储目录不是空目录")
-        temporary = new_root.with_name(
-            f".{new_root.name}.migrating-{uuid.uuid4().hex[:8]}"
-        )
-        try:
-            if temporary.exists():
-                shutil.rmtree(temporary)
-            shutil.copytree(old_root, temporary)
-            for group_file in (temporary / "groups").glob("*.json"):
-                value = json.loads(group_file.read_text(encoding="utf-8-sig"))
-                self._validate_document(value, group_file.stem)
-            for image in (temporary / "images").rglob("*"):
-                if image.is_file():
-                    identify_image(image.read_bytes())
-            new_root.parent.mkdir(parents=True, exist_ok=True)
-            if new_root.exists():
-                new_root.rmdir()
-            os.replace(temporary, new_root)
-            os.replace(old_root, backup_root)
-        except Exception:
-            if temporary.exists():
-                shutil.rmtree(temporary)
-            if backup_root.exists() and not old_root.exists():
-                os.replace(backup_root, old_root)
-            raise
+        指定用户时，按存档 QQ 或可被纠正到该用户的昵称取超集，调用方再做身份纠正与精确过滤。
+        """
+        names = sorted(set(names))
+
+        def run() -> tuple[list[str], int]:
+            where = "r.group_id = ?"
+            params: list[Any] = [group_id]
+            if user_id is not None:
+                marks = ",".join("?" * len(names))
+                where += (
+                    " AND (EXISTS (SELECT 1 FROM record_participants p WHERE p.record_id = r.id"
+                    " AND p.user_id = ?)"
+                    + (
+                        f" OR EXISTS (SELECT 1 FROM record_names n WHERE n.record_id = r.id"
+                        f" AND n.name_norm IN ({marks}))"
+                        if names
+                        else ""
+                    )
+                    + ")"
+                )
+                params.extend([user_id, *names])
+            with self._read() as db:
+                rows = db.execute(
+                    f"SELECT r.id, {_HEALTHY} AS healthy FROM records r WHERE {where}"
+                    " ORDER BY r.recorded_at, r.id",
+                    params,
+                ).fetchall()
+            healthy = [row["id"] for row in rows if row["healthy"]]
+            broken = len(rows) - len(healthy)
+            return ([row["id"] for row in rows] if include_broken else healthy), broken
+
+        return await self._run(run)
+
+    async def group_records(self, group_id: str) -> list[QuoteRecord]:
+        """整群记录，仅用于低频管理操作（别名影响预览、导出）。"""
+
+        def run() -> list[QuoteRecord]:
+            with self._read() as db:
+                rows = db.execute(
+                    "SELECT payload FROM records WHERE group_id = ? ORDER BY recorded_at, id",
+                    (group_id,),
+                ).fetchall()
+            return [self._row_record(row) for row in rows]
+
+        return await self._run(run)
+
+    async def search(self, group_id: str, needle: str) -> list[QuoteRecord]:
+        """按规范化正文子串检索。"""
+
+        def run() -> list[QuoteRecord]:
+            with self._read() as db:
+                rows = db.execute(
+                    "SELECT payload FROM records WHERE group_id = ? AND instr(search_text, ?) > 0"
+                    " ORDER BY recorded_at, id",
+                    (group_id, needle),
+                ).fetchall()
+            return [self._row_record(row) for row in rows]
+
+        return await self._run(run)
+
+    async def page(
+        self,
+        group_id: str,
+        *,
+        record_type: str = "",
+        has_image: bool | None = None,
+        healthy: bool | None = None,
+        needle: str = "",
+        page: int = 1,
+        page_size: int = 20,
+    ) -> tuple[list[tuple[QuoteRecord, bool]], int]:
+        """管理页分页：返回（记录, 是否健康）列表与总数，按收录时间倒序。"""
+
+        def run() -> tuple[list[tuple[QuoteRecord, bool]], int]:
+            where = ["r.group_id = ?"]
+            params: list[Any] = [group_id]
+            if record_type in {"message", "forward"}:
+                where.append("r.type = ?")
+                params.append(record_type)
+            if has_image is not None:
+                where.append("r.has_media = ?")
+                params.append(int(has_image))
+            if healthy is not None:
+                where.append(_HEALTHY if healthy else f"NOT {_HEALTHY}")
+            if needle:
+                where.append(
+                    "(instr(lower(r.id), ?) > 0 OR instr(r.search_text, ?) > 0"
+                    " OR EXISTS (SELECT 1 FROM record_participants p WHERE p.record_id = r.id"
+                    " AND instr(p.user_id, ?) > 0)"
+                    " OR EXISTS (SELECT 1 FROM record_names n WHERE n.record_id = r.id"
+                    " AND instr(n.name_norm, ?) > 0)"
+                    " OR instr(lower(json_extract(r.payload, '$.author.nickname')), ?) > 0)"
+                )
+                params.extend([needle] * 5)
+            clause = " AND ".join(where)
+            with self._read() as db:
+                (total,) = db.execute(
+                    f"SELECT COUNT(*) FROM records r WHERE {clause}", params
+                ).fetchone()
+                rows = db.execute(
+                    f"SELECT r.payload, {_HEALTHY} AS healthy FROM records r WHERE {clause}"
+                    " ORDER BY r.recorded_at DESC, r.id DESC LIMIT ? OFFSET ?",
+                    (*params, page_size, (page - 1) * page_size),
+                ).fetchall()
+            return [
+                (self._row_record(row), bool(row["healthy"])) for row in rows
+            ], total
+
+        return await self._run(run)
+
+    async def is_healthy(self, record_id: str) -> bool:
+        def run() -> bool:
+            with self._read() as db:
+                row = db.execute(
+                    f"SELECT {_HEALTHY} AS healthy FROM records r WHERE r.id = ?",
+                    (record_id,),
+                ).fetchone()
+            return bool(row and row["healthy"])
+
+        return await self._run(run)
+
+    # 统计 -------------------------------------------------------------
+
+    _SUMMARY = f"""
+        SELECT r.group_id AS group_id,
+               COUNT(*) AS total,
+               SUM(r.type = 'message') AS messages,
+               SUM(r.type = 'forward') AS forwards,
+               SUM(r.has_media) AS with_images,
+               SUM(NOT {_HEALTHY}) AS broken,
+               MIN(r.recorded_at) AS earliest,
+               MAX(r.recorded_at) AS latest
+        FROM records r"""
 
     @staticmethod
-    def _rollback_migration_sync(
-        old_root: Path,
-        new_root: Path,
-        backup_root: Path,
-    ) -> None:
-        if old_root.exists():
-            raise StorageError("无法回滚迁移：原存储目录已被占用")
-        if not backup_root.is_dir():
-            raise StorageError("无法回滚迁移：旧目录备份不存在")
-        if new_root.is_dir():
-            shutil.rmtree(new_root)
-        elif new_root.exists():
-            raise StorageError("无法回滚迁移：新路径不是目录")
-        os.replace(backup_root, old_root)
+    def _image_bytes(db: sqlite3.Connection, group_id: str) -> int:
+        (value,) = db.execute(
+            "SELECT COALESCE(SUM(size), 0) FROM media WHERE sha256 IN ("
+            "SELECT rm.sha256 FROM record_media rm JOIN records r ON r.id = rm.record_id"
+            " WHERE r.group_id = ?)",
+            (group_id,),
+        ).fetchone()
+        return int(value)
 
-    def resolve_media_path(self, relative_path: str) -> Path:
-        """解析已保存媒体路径并确保不会越界。"""
-        resolved = (self.root / relative_path).resolve()
-        if self.root not in resolved.parents or not resolved.is_file():
-            raise StorageError("媒体文件不存在或路径无效")
-        return resolved
+    @staticmethod
+    def _summary_row(row: sqlite3.Row | None, group_id: str) -> dict[str, Any]:
+        if row is None or not row["total"]:
+            return {
+                "group_id": group_id, "total": 0, "messages": 0, "forwards": 0,
+                "with_images": 0, "broken": 0, "earliest": None, "latest": None,
+            }  # fmt: skip
+        return {
+            "group_id": row["group_id"],
+            "total": int(row["total"]),
+            "messages": int(row["messages"] or 0),
+            "forwards": int(row["forwards"] or 0),
+            "with_images": int(row["with_images"] or 0),
+            "broken": int(row["broken"] or 0),
+            "earliest": row["earliest"],
+            "latest": row["latest"],
+        }
+
+    async def info(self, group_id: str) -> dict[str, Any]:
+        """当前群统计，不返回正文。"""
+
+        def run() -> dict[str, Any]:
+            with self._read() as db:
+                row = db.execute(
+                    self._SUMMARY + " WHERE r.group_id = ? GROUP BY r.group_id",
+                    (group_id,),
+                ).fetchone()
+                result = self._summary_row(row, group_id)
+                result["image_bytes"] = self._image_bytes(db, group_id)
+            return result
+
+        return await self._run(run)
+
+    async def summaries(self) -> list[dict[str, Any]]:
+        """全部群的统计，一次查询完成。"""
+
+        def run() -> list[dict[str, Any]]:
+            with self._read() as db:
+                rows = db.execute(
+                    self._SUMMARY + " GROUP BY r.group_id ORDER BY r.group_id"
+                ).fetchall()
+                result = [self._summary_row(row, row["group_id"]) for row in rows]
+                for item in result:
+                    item["image_bytes"] = self._image_bytes(db, item["group_id"])
+            return result
+
+        return await self._run(run)
+
+    async def count(self, group_id: str) -> int:
+        def run() -> int:
+            with self._read() as db:
+                (value,) = db.execute(
+                    "SELECT COUNT(*) FROM records WHERE group_id = ?", (group_id,)
+                ).fetchone()
+            return int(value)
+
+        return await self._run(run)
+
+    async def existing_keys(self, group_id: str) -> tuple[set[str], set[str], int]:
+        """导入预检用：当前群已有的内容哈希、记录 ID 与条数。"""
+
+        def run() -> tuple[set[str], set[str], int]:
+            with self._read() as db:
+                rows = db.execute(
+                    "SELECT id, content_hash FROM records WHERE group_id = ?",
+                    (group_id,),
+                ).fetchall()
+            return (
+                {row["content_hash"] for row in rows},
+                {row["id"] for row in rows},
+                len(rows),
+            )
+
+        return await self._run(run)
+
+    async def all_record_ids(self) -> set[str]:
+        def run() -> set[str]:
+            with self._read() as db:
+                return {row["id"] for row in db.execute("SELECT id FROM records")}
+
+        return await self._run(run)
+
+    async def export_rows(self) -> list[tuple[str, str]]:
+        """导出用：全部记录的 (group_id, payload JSON)。"""
+
+        def run() -> list[tuple[str, str]]:
+            with self._read() as db:
+                return [
+                    (row["group_id"], row["payload"])
+                    for row in db.execute(
+                        "SELECT group_id, payload FROM records ORDER BY group_id, recorded_at, id"
+                    )
+                ]
+
+        return await self._run(run)
+
+    # 媒体 -------------------------------------------------------------
+
+    async def media_usage(self) -> int:
+        """群典媒体与头像缓存的合计字节数。"""
+
+        def run() -> int:
+            with self._read() as db:
+                (media,) = db.execute(
+                    "SELECT COALESCE(SUM(size), 0) FROM media"
+                ).fetchone()
+                (avatars,) = db.execute(
+                    "SELECT COALESCE(SUM(size), 0) FROM avatars"
+                ).fetchone()
+            return int(media) + int(avatars)
+
+        return await self._run(run)
+
+    async def media_rows(
+        self, hashes: Iterable[str] | None = None
+    ) -> dict[str, dict[str, Any]]:
+        """媒体登记信息；hashes 为 None 时返回全部。"""
+        wanted = None if hashes is None else sorted(set(hashes))
+
+        def run() -> dict[str, dict[str, Any]]:
+            with self._read() as db:
+                if wanted is None:
+                    rows = db.execute("SELECT * FROM media").fetchall()
+                else:
+                    rows = []
+                    for start in range(0, len(wanted), 500):
+                        chunk = wanted[start : start + 500]
+                        rows.extend(
+                            db.execute(
+                                f"SELECT * FROM media WHERE sha256 IN ({','.join('?' * len(chunk))})",
+                                chunk,
+                            )
+                        )
+            return {row["sha256"]: dict(row) for row in rows}
+
+        return await self._run(run)
+
+    async def set_media_state(
+        self, states: dict[str, bool], *, verified: bool = False
+    ) -> None:
+        """批量更新媒体缺失标记；verified 时同时刷新校验时间。"""
+
+        def run() -> None:
+            now = now_iso()
+            with self._tx() as db:
+                for sha256, missing in states.items():
+                    if verified:
+                        db.execute(
+                            "UPDATE media SET missing = ?, verified_at = ? WHERE sha256 = ?",
+                            (int(missing), now, sha256),
+                        )
+                    else:
+                        db.execute(
+                            "UPDATE media SET missing = ? WHERE sha256 = ?",
+                            (int(missing), sha256),
+                        )
+
+        if states:
+            await self._run(run)
+
+    async def referenced_user_ids(self) -> set[str]:
+        """全部记录中出现过的 QQ（含回复作者），用于头像清理。"""
+
+        def run() -> set[str]:
+            with self._read() as db:
+                return {
+                    row["user_id"]
+                    for row in db.execute(
+                        "SELECT DISTINCT user_id FROM record_participants"
+                    )
+                }
+
+        return await self._run(run)
+
+    # 头像索引 ---------------------------------------------------------
+
+    async def avatar_rows(self) -> dict[str, dict[str, Any]]:
+        def run() -> dict[str, dict[str, Any]]:
+            with self._read() as db:
+                return {
+                    row["user_id"]: dict(row)
+                    for row in db.execute("SELECT * FROM avatars")
+                }
+
+        return await self._run(run)
+
+    async def avatar_upsert(self, rows: dict[str, tuple[float, float, int]]) -> None:
+        """写入头像索引：user_id → (fetched_at, last_used, size)。"""
+
+        def run() -> None:
+            with self._tx() as db:
+                db.executemany(
+                    "INSERT INTO avatars VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET"
+                    " fetched_at = excluded.fetched_at, last_used = excluded.last_used,"
+                    " size = excluded.size",
+                    [(user_id, *values) for user_id, values in rows.items()],
+                )
+
+        if rows:
+            await self._run(run)
+
+    async def avatar_delete(self, user_ids: Iterable[str]) -> None:
+        ids = list(user_ids)
+
+        def run() -> None:
+            with self._tx() as db:
+                db.executemany(
+                    "DELETE FROM avatars WHERE user_id = ?", [(item,) for item in ids]
+                )
+
+        if ids:
+            await self._run(run)
+
+    # 审计 -------------------------------------------------------------
+
+    async def audit_entries(self, limit: int = 200) -> list[dict[str, Any]]:
+        def run() -> list[dict[str, Any]]:
+            with self._read() as db:
+                rows = db.execute(
+                    "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
+            result = []
+            for row in rows:
+                item = {
+                    key: row[key]
+                    for key in (
+                        "group_id",
+                        "record_id",
+                        "content_hash",
+                        "deleted_by",
+                        "deleted_at",
+                        "source",
+                    )
+                }
+                if row["node_path"] is not None:
+                    item["node_path"] = json.loads(row["node_path"])
+                    item["removed_nodes"] = row["removed_nodes"]
+                    item["record_deleted"] = bool(row["record_deleted"])
+                result.append(item)
+            return result
+
+        return await self._run(run)
+
+    async def import_audit(self, entries: list[dict[str, Any]]) -> None:
+        """旧版 audit.json 迁移。"""
+
+        def run() -> None:
+            with self._tx() as db:
+                db.executemany(
+                    "INSERT INTO audit_log (group_id, record_id, content_hash, deleted_by,"
+                    " deleted_at, source, node_path, removed_nodes, record_deleted)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            str(item.get("group_id") or ""),
+                            str(item.get("record_id") or ""),
+                            str(item.get("content_hash") or ""),
+                            str(item.get("deleted_by") or ""),
+                            str(item.get("deleted_at") or ""),
+                            str(item.get("source") or ""),
+                            json.dumps(item["node_path"])
+                            if isinstance(item.get("node_path"), list)
+                            else None,
+                            item.get("removed_nodes"),
+                            None
+                            if item.get("record_deleted") is None
+                            else int(bool(item["record_deleted"])),
+                        )
+                        for item in entries
+                        if isinstance(item, dict)
+                    ],
+                )
+
+        if entries:
+            await self._run(run)
+
+    # 群级设置 ---------------------------------------------------------
+
+    async def group_settings(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, list[str]]]]:
+        """读取群级覆盖与作者别名。"""
+
+        def run() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, list[str]]]]:
+            with self._read() as db:
+                overrides = {
+                    row["group_id"]: json.loads(row["value"])
+                    for row in db.execute("SELECT group_id, value FROM group_overrides")
+                }
+                aliases: dict[str, dict[str, list[str]]] = {}
+                for row in db.execute(
+                    "SELECT group_id, user_id, alias FROM author_aliases ORDER BY group_id, position"
+                ):
+                    aliases.setdefault(row["group_id"], {}).setdefault(
+                        row["user_id"], []
+                    ).append(row["alias"])
+            return overrides, aliases
+
+        return await self._run(run)
+
+    async def save_group_settings(
+        self,
+        overrides: dict[str, dict[str, Any]],
+        aliases: dict[str, dict[str, list[str]]],
+    ) -> None:
+        """整体替换群级覆盖与作者别名（调用方已校验）。"""
+
+        def run() -> None:
+            now = now_iso()
+            with self._tx() as db:
+                db.execute("DELETE FROM group_overrides")
+                db.executemany(
+                    "INSERT INTO group_overrides VALUES (?, ?, ?)",
+                    [
+                        (group_id, json.dumps(value, ensure_ascii=False), now)
+                        for group_id, value in overrides.items()
+                        if value
+                    ],
+                )
+                db.execute("DELETE FROM author_aliases")
+                rows = []
+                for group_id, targets in aliases.items():
+                    position = 0
+                    for user_id, values in targets.items():
+                        for alias in values:
+                            rows.append(
+                                (
+                                    group_id,
+                                    user_id,
+                                    alias,
+                                    normalize_search(alias),
+                                    position,
+                                )
+                            )
+                            position += 1
+                db.executemany(
+                    "INSERT INTO author_aliases VALUES (?, ?, ?, ?, ?)", rows
+                )
+
+        await self._run(run)
+
+
+def _split_sql(script: str) -> list[str]:
+    """按分号拆分迁移脚本；脚本中不使用触发器等含内部分号的语句。"""
+    lines = [line for line in script.splitlines() if not line.strip().startswith("--")]
+    return [
+        statement.strip()
+        for statement in "\n".join(lines).split(";")
+        if statement.strip()
+    ]

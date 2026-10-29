@@ -3,8 +3,8 @@
 <p align="center">让群友的抽象发言变成经典罢！😋</p>
 
 <p align="center">
-  <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.1.10-blue" alt="Version 1.1.10"></a>
-  <a href="https://github.com/AstrBotDevs/AstrBot"><img src="https://img.shields.io/badge/AstrBot-%3E%3D4.24.2%20%3C5-blue" alt="AstrBot >=4.24.2 <5"></a>
+  <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/version-2.0.0-blue" alt="Version 2.0.0"></a>
+  <a href="https://github.com/AstrBotDevs/AstrBot"><img src="https://img.shields.io/badge/AstrBot-%3E%3D4.29.0%20%3C5-blue" alt="AstrBot >=4.29.0 <5"></a>
   <img src="https://img.shields.io/badge/platform-OneBot%2011%20%7C%20QQ-blue" alt="OneBot 11 / QQ">
   <a href="./LICENSE.txt"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="AGPL-3.0"></a>
 </p>
@@ -39,8 +39,8 @@
 | 消息收录 | 保存文字、图片、QQ 表情、商城表情、回复快照与合并转发      |
 | 随机群典 | 随机发送全群或指定成员的记录，可随机决定单次发送条数       |
 | 爆典合集 | 按记录时间查看指定成员参与的全部群典，支持分页和嵌套转发   |
-| 卡片渲染 | 单条纯文字或图片记录可使用 CSS 卡片，尺寸和样式均可配置    |
-| 后台管理 | 通过官方 Plugin Pages 查看、筛选、删除、备份和迁移群典数据 |
+| 卡片渲染 | 单条纯文字或图片记录可渲染为纸面/墨色引用卡片，可用本地部署的文转图服务 |
+| 后台管理 | 在插件管理页查看、筛选、删除、备份和检查群典数据         |
 
 <a id="quick-start"></a>
 
@@ -54,7 +54,7 @@
 
 运行要求：
 
-- AstrBot `>=4.24.2,<5`
+- AstrBot `>=4.29.0,<5`（管理页使用 4.29.0 起的插件可视化视图）
 - OneBot 11 / QQ，使用 `aiocqhttp` 适配器
 - Python 依赖：`aiohttp>=3.9,<4`、`Pillow>=11.2.1,<13`
 
@@ -161,13 +161,21 @@ python -m pip install -r requirements.txt
 - 回复关系：优先使用 QQ 原生回复；原消息失效或平台拒绝时，拆为被回复节点和回复节点
 - 媒体缺失：爆典保留其余可读内容，并用 `[图片资源缺失]` 或 `[表情资源缺失]` 占位
 
-含 QQ 表情、商城表情或回复快照的记录会绕过 CSS 卡片，使用原生消息链发送，避免内容丢失。
+含 QQ 表情、商城表情或回复快照的记录会绕过卡片，使用原生消息链发送，避免内容丢失。
+
+卡片通过文转图（t2i）服务渲染。默认使用 AstrBot“设置 → 外观 → 文本转图像”中的服务（未修改时为官方公共服务）。如需更快或不把内容发到外部，可在本机部署 [astrbot-t2i-service](https://github.com/AstrBotDevs/astrbot-t2i-service)：
+
+```bash
+docker run -itd -p 8999:8999 soulter/astrbot-t2i-service:latest
+```
+
+然后把 `card_t2i_endpoint` 设为 `http://127.0.0.1:8999`（AstrBot 也在 Docker 中时填该服务的容器名）。插件会直接请求这个地址，渲染失败或超时时改为文字发送。
 
 <a id="configuration"></a>
 
 ## 配置
 
-所有配置都可以在 AstrBot 插件配置或“群典管理”Plugin Page 中修改。管理页保存成功后立即生效；保存失败保留草稿并继续使用旧配置。宿主插件配置页面保存后由 AstrBot 重载插件。以下是最常用的配置。
+全局配置可以在 AstrBot 插件配置或“群典管理”页面中修改；群级覆盖与作者别名只能在管理页修改。管理页保存成功后立即生效；保存失败保留草稿并继续使用旧配置。宿主插件配置页面保存后由 AstrBot 重载插件。以下是最常用的配置。
 
 ### 触发与发送
 
@@ -181,6 +189,7 @@ python -m pip install -r requirements.txt
 | `random_send_count`     | `false`    | 在 1 到 `send_count` 之间随机决定发送数量 |
 | `send_mode`             | `text`     | 单条发送方式：`text` 或 `card`            |
 | `aggregate_multiple`    | `true`     | 将多条普通记录聚合为合并转发              |
+| `forward_hint_nodes`    | `true`     | 合并转发开头加入“群典存档回放”“引用丢失提示”节点；爆典标题与页码始终保留 |
 
 ### 爆典
 
@@ -198,6 +207,7 @@ python -m pip install -r requirements.txt
 | -------------------------- | ---------------- | ----------------------------------------- |
 | `help_enabled`             | `true`           | 启用主动帮助和参数错误后的用法提示        |
 | `help_keywords`            | `help`、`帮助`   | `/群典` 与查询关键词后的帮助子关键词      |
+| `help_send_mode`           | `card`           | 主动帮助的发送方式：`card` 图片卡片（失败时改为文字）或 `text` 文字 |
 | `help_overview_template`   | 见配置页         | 主动帮助模板；留空时组合各操作模板        |
 | `help_*_template`          | 见配置页         | 各操作用法；留空可单独关闭对应提示        |
 | `help_roles`               | `everyone`       | 主动调用帮助的权限                        |
@@ -227,7 +237,7 @@ python -m pip install -r requirements.txt
 | 配置键                   | 默认值  | 作用                           |
 | ------------------------ | ------- | ------------------------------ |
 | `max_records_per_group`  | `5000`  | 每个群的最大记录数             |
-| `max_media_mb`           | `2048`  | 插件全部本地媒体的容量上限     |
+| `max_media_mb`           | `2048`  | 群典图片与头像缓存的合计容量上限 |
 | `max_image_mb`           | `10`    | 单张图片或贴纸的大小上限       |
 | `max_images_per_record`  | `9`     | 单条记录的图片与贴纸数量上限   |
 | `max_forward_nodes`      | `100`   | 单个合并转发的节点上限         |
@@ -249,42 +259,41 @@ python -m pip install -r requirements.txt
 | `retry_on_ambiguous_failure`          | `false`             | 是否重试超时等结果不明确的失败     |
 | `nested_forward_fallback_message`     | 见配置页             | 原生多层发送明确失败后的降级提示   |
 | `nested_forward_unknown_message`      | 见配置页             | 发送结果未知且不降级时的提示       |
-| `card_width`                          | `1200`              | CSS 卡片画布宽度                   |
-| `card_min_height` / `card_max_height` | `480` / `2000`      | 卡片高度边界                       |
-| `card_auto_height`                    | `true`              | 按内容收缩并裁切右侧、底部画布留白 |
-| `card_custom_css`                     | 空                  | 自定义卡片 CSS，不允许外部资源     |
+| `card_t2i_endpoint`                   | 空                  | 卡片文转图服务；留空使用 AstrBot 的文转图设置，可填本地部署地址 |
+| `card_t2i_timeout_s`                  | `30`                | 单独配置的文转图服务超时，5～120 秒 |
+| `card_theme`                          | `light`             | 卡片主题：`light` 纸面、`dark` 墨色 |
+| `card_scale`                          | `high`              | 清晰度：`normal` / `high` / `ultra`（1.0 / 1.3 / 1.8 倍） |
+| `card_width`                          | `960`               | 卡片宽度（px），字号与留白随宽度等比缩放 |
+| `card_min_height` / `card_max_height` | `480` / `2400`      | 卡片高度边界                       |
+| `card_auto_height`                    | `true`              | 高度随内容变化；关闭后不低于最小高度 |
+| `card_custom_css`                     | 空                  | 追加在默认样式后的 CSS，不允许外部资源 |
 | `localize_avatars`                    | `false`             | 将卡片和后台使用的头像缓存到本地   |
 | `avatar_cache_ttl_days`               | `7`                 | 头像缓存有效天数，`0` 表示永久有效 |
 
 <details>
 <summary>高级配置与群级覆盖</summary>
 
-- `storage_subdir`：插件专属数据根目录下的相对目录，默认 `iconic_quotes`。
 - `allow_bot_authors`：是否允许人工引用或合并转发收录机器人作者，默认关闭。
 - `delete_preview_limit`：命令删除一次最多预览的记录数，默认 20。
 - `max_query_keyword_chars`：指定成员查询的关键词长度上限，默认 100，可按群覆盖。
 - `audit_limit`：删除审计最多保留的条数，默认 10000。
-- `group_overrides`：按群号覆盖关键词、发送、爆典、权限和部分容量配置，建议通过管理页编辑。
-- `author_aliases`：按“群号 → QQ → 别名列表”纠正旧合并转发节点和回复快照的作者；保存前会显示受影响记录与节点数量。
+- 群级覆盖：在管理页“配置 → 群聊覆盖”中按群号覆盖关键词、发送、爆典、权限和部分容量配置，未覆盖的字段继承全局值。
+- 作者别名：在管理页“配置 → 作者别名”中按“群号 → QQ → 别名”纠正旧合并转发节点和回复快照的作者；保存前会显示受影响的记录与作者数量。
 
-存储路径迁移必须通过管理页执行。卡片 CSS 会经过安全过滤，不允许 `@import`、`url()` 或其他外部资源。
+2.0 起群级覆盖与作者别名保存在插件数据库中。从 1.x 升级时，宿主配置里的旧值会在首次启动时自动迁入。卡片 CSS 会经过安全过滤，不允许 `@import`、`url()` 或其他外部资源。
 
 </details>
 
 ## WebUI
 
-插件详情页中的“群典管理”复用 AstrBot Dashboard 的端口和认证，无需单独部署 Web 服务。Bot 管理员可以：
+插件详情页中的“群典管理”复用 AstrBot Dashboard 的端口和认证，无需单独部署 Web 服务。页面跟随 Dashboard 的明暗主题，窄屏和键盘均可操作。Dashboard 登录用户可以：
 
-- 按群分页、搜索和筛选记录
-- 查看文字、图片、表情、回复快照、转发节点和记录元数据
-- 单条或批量删除；合并转发详情中可删除任意层级的单个节点，并查看删除审计
-- 编辑全局配置、群级覆盖和作者别名，预览 CSS 卡片
-- 导出 ZIP 备份
-- 预检并确认导入备份，查看新增、重复、冲突和缺失资源统计
-- 显式迁移存储目录，并保留迁移前备份
-- 查看头像缓存数量与占用，清理无引用头像或二次确认后清空缓存
+- **记录**：按群分页、搜索和筛选；在右侧卡片查看正文、图片、表情、回复快照和合并转发层级，内容较多时可加宽或全屏，图片用灯箱浏览；单条或批量删除，或删除合并转发中的单个节点；预览卡片。
+- **配置**：全局配置、群聊覆盖和高级 JSON 共用一份草稿，右侧列出全部改动，右下角按钮保存。保存失败时保留草稿并说明原因。“帮助消息”和“卡片与头像”分区可用当前草稿生成帮助卡片或群典卡片预览（可填写示例文字），未保存的修改也会体现；渲染失败时显示文转图服务返回的原因。
+- **备份**：导出 ZIP；按“上传 → 预检 → 确认影响 → 写入”合并导入，可选择同时恢复配置；运行完整性检查；清理或清空头像缓存。
+- **审计**：按群号、操作者和来源筛选删除记录。
 
-管理页保存期间暂时禁用配置编辑和重复写入；刷新数据或恢复备份配置会替换未保存草稿，必须先确认。取消后保留草稿。备份记录已导入但配置恢复失败时，会明确提示部分完成，原配置继续有效。
+删除记录和清空头像缓存无法撤销，执行前会要求确认并写明数量。刷新数据会放弃未保存的配置草稿，执行前同样会确认。备份中的记录已导入但配置恢复失败时，会明确提示部分完成，原配置继续有效。
 
 发送超时或断线意味着结果可能未知。`retry_on_ambiguous_failure` 默认关闭，此时停止重试及格式降级，请先检查群聊是否已经收到消息；显式开启后允许按次数重试，但最终仍未知时不会换格式补发。开启此选项可能造成重复消息。
 
@@ -295,24 +304,24 @@ python -m pip install -r requirements.txt
 所有插件数据均位于 AstrBot 的插件专属数据目录：
 
 ```text
-AstrBot/data/plugin_data/astrbot_plugin_iconic_quotes/iconic_quotes/
-├── groups/<群号>.json
-├── images/<群号>/<内容哈希>.<扩展名>
-├── avatars/<QQ号>.jpg
-├── backups/
-└── audit.json
+AstrBot/data/plugin_data/astrbot_plugin_iconic_quotes/
+├── quotes.sqlite3      # 记录、媒体引用、群级配置、头像索引与删除审计
+├── media/              # 群典图片与商城表情，按 SHA-256 命名
+├── avatars/<QQ号>.jpg  # 可选的头像缓存
+└── backups/            # 导出的 ZIP 与导入时的临时文件
 ```
 
-- 数据按群隔离，JSON 当前使用 Schema v3。
-- v1、v2 数据和官方备份仍可读取，并在下一次修改时创建 `.bak` 后惰性升级。
-- JSON 使用临时文件原子替换；主文件损坏时可尝试读取 `.bak`。
-- 图片和商城表情按二进制 SHA-256 去重，单独存放在 `images/`。
-- `localize_avatars` 默认关闭；启用后头像按 QQ 号保存到 `avatars/`，不会写入金句 JSON，也不会为每条记录重复保存。
-- 头像缓存计入 `max_media_mb`，容量不足时优先清理无引用头像，再按最久未使用顺序清理；不会删除金句正文或金句图片。
-- 导入备份会校验路径、清单、文件哈希、图片格式和容量，再由管理员确认写入。
+- 每次写入在单个数据库事务中完成，失败不会留下半条记录；数据库启动时做完整性检查，未通过时插件停止初始化，不会用空库覆盖。
+- 同一张图片无论被多少个群收录都只保存一份；删除记录后，不再被任何记录引用的图片会被删除。
+- 发送前只检查被抽中记录的图片是否存在、大小是否一致。图片被外部改写但大小不变时，要在管理页运行“完整性检查”才会发现；缺失或损坏的记录不参与随机群典，爆典中以 `[图片资源缺失]` 占位。
+- `localize_avatars` 默认关闭；启用后头像按 QQ 号缓存，计入 `max_media_mb`。容量不足时优先清理无引用的头像，再按最久未使用顺序清理，不会删除群典正文或图片。
+- 导入备份会校验路径、清单、文件哈希、图片格式和容量，预检通过并确认后才写入。
+- 卡片由文转图服务渲染：`send_mode` 为 `card` 时，卡片中的正文、昵称、头像和图片会发送给所用的服务。未设置 `card_t2i_endpoint` 时是 AstrBot 配置的服务（默认为官方公共服务）；设置为本地部署地址时数据不离开你的服务器。
 - 数据为明文，请保护 AstrBot 数据目录和导出的 ZIP 文件。
 
-从旧目录升级时，如果新目录为空，插件会把旧数据迁移到专属目录并保留带时间戳的备份；如果新旧目录同时有数据，则继续使用新目录，不自动覆盖任一侧。
+### 从 1.x 升级
+
+首次启动 2.0 时，插件会把旧的 `iconic_quotes/groups/*.json`、图片、头像缓存和删除审计迁入数据库，并把旧目录改名为 `iconic_quotes.migrated-<时间>` 保留，不删除任何旧文件。无法读取的群文件会被跳过并在日志中列出，原文件仍在保留的旧目录中。确认迁移结果无误后可以自行删除旧目录。1.x 导出的备份 ZIP 仍可在管理页导入。
 
 ## 已知限制
 
@@ -320,9 +329,9 @@ AstrBot/data/plugin_data/astrbot_plugin_iconic_quotes/iconic_quotes/
 - 嵌套合并转发默认最多收录 3 层，可配置为 1～10 层；超限时整条添加失败。
 - NapCat 会对 2～3 层存档递归重建原生 `node.data.content`；超过原生发送深度、非 NapCat 环境或明确发送失败时会先提示再完整展开。超时、断线等结果未知的情况不会自动降级，以免重复发送。
 - 纯图片记录不能通过字符串删除命令命中，请在管理页删除。
-- 插件优先读取节点 `sender` 身份，并保留 OneBot 原始 ID 与解析来源。查询旧记录时只在内存副本中按管理员别名、有效 QQ 和群内唯一完整昵称纠正，不会自动改写 JSON；无法确认的节点会显示一次提示。
-- OneBot 11 自定义转发节点不支持本地头像字段，因此头像本地化只用于 CSS 卡片和后台展示，不能替换爆典或合并转发气泡旁的原生头像。
-- 图片或 JSON 被外部修改后，异常记录不会参与随机群典；爆典会保留可读内容并标记缺失媒体。
+- 插件优先读取节点 `sender` 身份，并保留 OneBot 原始 ID 与解析来源。查询旧记录时只在内存副本中按管理员别名、有效 QQ 和群内唯一完整昵称纠正，不会改写存档；无法确认的节点会显示一次提示。
+- OneBot 11 自定义转发节点不支持本地头像字段，因此头像本地化只用于卡片和后台展示，不能替换爆典或合并转发气泡旁的原生头像。
+- 图片文件被删除或改动后，相应记录在被检测到（发送前检查或完整性检查）后不再参与随机群典；爆典会保留可读内容并标记缺失媒体。
 
 <a id="changelog"></a>
 

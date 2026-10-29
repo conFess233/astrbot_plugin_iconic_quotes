@@ -19,10 +19,10 @@
     "hint": "text：正常发送，沿用合并转发配置；card：逐条图片卡片，聊天记录保持合并转发，卡片失败发送原消息。"
   },
   "storage_subdir": {
-    "description": "存储相对目录",
+    "description": "旧版存储目录（仅用于 2.0 首次启动迁移）",
     "type": "string",
     "default": "iconic_quotes",
-    "hint": "相对于 AstrBot data/plugin_data/astrbot_plugin_iconic_quotes；旧版数据会自动迁移。"
+    "invisible": true
   },
   "add_keyword_enabled": {
     "description": "启用添加关键词",
@@ -83,6 +83,14 @@
     "type": "bool",
     "default": true,
     "hint": "关闭后不发送主动帮助，也不在参数错误后附带用法。"
+  },
+  "help_send_mode": {
+    "description": "帮助发送方式",
+    "type": "string",
+    "options": ["card", "text"],
+    "labels": ["图片卡片", "文字"],
+    "default": "card",
+    "hint": "主动帮助（/群典 help）的发送方式；卡片使用与群典卡片相同的主题与文转图服务，渲染失败时改为文字。参数错误后附带的用法始终为文字。支持群级覆盖。"
   },
   "help_keywords": {
     "description": "帮助子关键词",
@@ -153,6 +161,12 @@
     "description": "多条群典聚合为合并转发",
     "type": "bool",
     "default": true
+  },
+  "forward_hint_nodes": {
+    "description": "合并转发中插入提示节点",
+    "type": "bool",
+    "default": true,
+    "hint": "发送合并转发群典时，是否在开头加入“群典存档回放”与“引用丢失提示”节点；爆典的标题与页码节点始终保留。支持群级覆盖。"
   },
   "allow_bot_authors": {
     "description": "允许手动引用并收录机器人消息",
@@ -275,16 +289,16 @@
     "default": []
   },
   "group_overrides": {
-    "description": "群级配置覆盖",
+    "description": "旧版群级覆盖（2.0 起保存在数据库，请在管理页编辑）",
     "type": "dict",
     "default": {},
-    "hint": "建议通过群典管理页面编辑。"
+    "invisible": true
   },
   "author_aliases": {
-    "description": "合并转发作者别名",
+    "description": "旧版作者别名（2.0 起保存在数据库，请在管理页编辑）",
     "type": "dict",
     "default": {},
-    "hint": "按群号和 QQ 号配置，建议通过群典管理页面编辑；只影响合并转发节点和回复快照。"
+    "invisible": true
   },
   "global_cooldown_ms": {
     "description": "全局冷却毫秒",
@@ -332,10 +346,37 @@
     "type": "int",
     "default": 10000
   },
+  "card_t2i_endpoint": {
+    "description": "卡片文转图服务地址",
+    "type": "string",
+    "default": "",
+    "hint": "留空时使用 AstrBot 的文转图设置。填写后插件直接请求该服务，可指向本地部署的 astrbot-t2i-service，如 http://127.0.0.1:8999。"
+  },
+  "card_t2i_timeout_s": {
+    "description": "文转图超时（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "仅对上方单独配置的服务生效，范围 5 到 120；超时后改为文字发送。"
+  },
+  "card_theme": {
+    "description": "卡片主题",
+    "type": "string",
+    "options": ["light", "dark"],
+    "labels": ["纸面", "墨色"],
+    "default": "light"
+  },
+  "card_scale": {
+    "description": "卡片清晰度",
+    "type": "string",
+    "options": ["normal", "high", "ultra"],
+    "labels": ["标准", "高清", "超清"],
+    "default": "high",
+    "hint": "对应文转图服务的设备像素比 1.0 / 1.3 / 1.8；越高越清晰，图片越大。"
+  },
   "card_width": {
     "description": "卡片宽度",
     "type": "int",
-    "default": 1200
+    "default": 960
   },
   "card_min_height": {
     "description": "卡片最小高度",
@@ -345,7 +386,7 @@
   "card_max_height": {
     "description": "卡片最大高度",
     "type": "int",
-    "default": 2000
+    "default": 2400
   },
   "card_custom_css": {
     "description": "卡片自定义 CSS",
@@ -353,13 +394,13 @@
     "default": "",
     "editor_mode": true,
     "editor_language": "css",
-    "hint": "不允许 @import、url() 或其他外部资源。渲染内容会发送给 AstrBot 配置的文转图端点。"
+    "hint": "追加在默认样式之后，不允许 @import、url() 或其他外部资源。渲染内容会发送给所用的文转图服务。"
   },
   "card_auto_height": {
     "description": "卡片自动高度",
     "type": "bool",
     "default": true,
-    "hint": "开启后卡片按内容收缩，并安全裁去文转图画布底部留白；关闭后使用配置的最小高度。"
+    "hint": "开启后卡片高度随内容变化；关闭后不低于配置的最小高度。"
   },
   "localize_avatars": {
     "description": "本地化卡片头像",

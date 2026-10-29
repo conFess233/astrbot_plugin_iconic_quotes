@@ -1,73 +1,46 @@
-"""AstrBot 群典插件入口。"""
+"""AstrBot 群典插件入口：注册 Handler、组装服务与生命周期。"""
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import math
 import time
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
-from .models import AuthorSnapshot, ForwardNode, QuoteRecord, ReplySnapshot
 from .services.avatar_cache import AvatarCacheService
-from .services.cooldown import GlobalCooldown
-from .services.identity import AuthorIdentityService
-from .services.onebot import CaptureError, OneBotQuoteExtractor, _RawReply
-from .services.permissions import (
-    PermissionService,
-    RoleLookupError,
-    call_onebot_action,
-    call_onebot_action_once,
+from .services.backup import BackupService
+from .services.capture import QuoteCapture
+from .services.command_parser import (
+    COMMAND_EVENT_KEY,
+    call_input,
+    capture_source_count,
+    is_bot_message,
+    is_command_event,
+    route_keyword,
+    route_query_command,
 )
-from .services.renderer import QuoteRenderer
-from .services.settings import SettingsService
-from .services.storage import DuplicateQuoteError, QuoteStorage, StorageError
-from .services.web_manager import WebManager
-from .utils.hashing import calculate_record_hash
-from .utils.help import is_help_keyword, operation_usage, render_help_template
-from .utils.randomization import resolve_send_count
-from .utils.validation import match_command_syntax, parse_command_segments
+from .services.forward_builder import ForwardBuilder
+from .services.legacy_import import LegacyMigrator
+from .services.media import MediaStore
+from .services.members import MemberService
+from .services.operations import QuoteOperations
+from .services.permissions import PermissionService
+from .services.renderer import CardRenderer
+from .services.sender import Sender
+from .services.settings import GROUP_DATA_KEYS, SettingsService
+from .services.storage import QuoteStorage
+from .services.t2i import T2IClient
+from .services.web_api import WebApi
+from .utils.timefmt import error_reason
+from .utils.validation import match_command_syntax
 
 PLUGIN_NAME = "astrbot_plugin_iconic_quotes"
-COMMAND_EVENT_KEY = "iconic_quotes_command_event"
-
-
-def _error_reason(error: BaseException | None) -> str:
-    """生成适合控制台展示的异常摘要，不记录消息正文或完整载荷。"""
-    if error is None:
-        return "未返回具体异常"
-    detail = str(error).strip()
-    return f"{type(error).__name__}: {detail}" if detail else type(error).__name__
-
-
-@dataclass(slots=True)
-class PendingDeletion:
-    """锁定一次群聊删除确认所需的不可变信息。"""
-
-    expires_at: float
-    record_hashes: dict[str, str]
-
-
-class UsageError(ValueError):
-    """表示已识别插件操作，但调用参数或来源格式不完整。"""
-
-    def __init__(self, message: str, operation: str):
-        super().__init__(message)
-        self.operation = operation
-
-
-class AmbiguousSendError(RuntimeError):
-    """发送可能已经送达，不能继续切换格式或创建删除确认。"""
+ORPHAN_GRACE_SECONDS = 86400
 
 
 class IconicQuotesPlugin(Star):
@@ -77,281 +50,221 @@ class IconicQuotesPlugin(Star):
         super().__init__(context, config)
         self.config = config
         self.settings = SettingsService(config)
-        global_settings = self.settings.global_settings()
-        plugin_data_root = Path(get_astrbot_plugin_data_path())
-        data_root = plugin_data_root / PLUGIN_NAME
-        storage_subdir = global_settings["storage_subdir"]
-        self.storage = QuoteStorage(
-            data_root,
-            storage_subdir,
-            legacy_root=plugin_data_root / storage_subdir,
+        plugin_data = Path(get_astrbot_plugin_data_path())
+        self.data_root = plugin_data / PLUGIN_NAME
+        self.storage = QuoteStorage(self.data_root / "quotes.sqlite3")
+        self.media = MediaStore(self.data_root / "media")
+        self.members = MemberService()
+        self.avatars = AvatarCacheService(self.storage, self.data_root / "avatars")
+        self.builder = ForwardBuilder(self.media)
+        # 未单独配置文转图服务时走 AstrBot 的 html_render；用 lambda 便于测试替换。
+        self.t2i = T2IClient(
+            lambda *args, **kwargs: self.html_render(*args, **kwargs),
+            self.data_root / "tmp",
         )
-        self.extractor = OneBotQuoteExtractor(self.storage)
-        self.permissions = PermissionService()
-        self.cooldown = GlobalCooldown()
-        self.identities = AuthorIdentityService()
-        self.avatars = AvatarCacheService(self.storage)
-        self.renderer = QuoteRenderer(self, self.storage, self.avatars)
-        self.web = WebManager(
-            self.storage,
-            self.settings,
-            self.renderer,
-            self.avatars,
-            self.config,
+        self.cards = CardRenderer(self.t2i, self.media, self.avatars)
+        self.operations = QuoteOperations(
+            settings=self.settings,
+            storage=self.storage,
+            media=self.media,
+            capture=QuoteCapture(self.media, self.members, self.avatars.reserve),
+            members=self.members,
+            permissions=PermissionService(self.members),
+            avatars=self.avatars,
+            builder=self.builder,
+            sender=Sender(self.builder),
+            cards=self.cards,
         )
-        self._pending_deletions: dict[tuple[str, str], PendingDeletion] = {}
-        self._sent_in_operation = False
-        self._operation_log_override: str | None = None
-        self._operation_error_logged = False
-        self._register_web_routes()
-
-    def _register_web_routes(self) -> None:
-        """注册只通过 Dashboard Plugin Pages 调用的管理 API。"""
-        routes = (
-            ("stats", self.web.stats, ["GET"], "群典统计"),
-            ("records", self.web.records, ["GET"], "浏览群典"),
-            ("records/delete", self.web.delete, ["POST"], "删除群典"),
-            (
-                "records/nodes/delete",
-                self.web.delete_forward_node,
-                ["POST"],
-                "删除合并转发节点",
-            ),
-            ("audit", self.web.audit, ["GET"], "删除审计"),
-            ("config", self.web.get_config, ["GET"], "读取配置"),
-            ("config/save", self.web.save_config, ["POST"], "保存配置"),
-            ("aliases/preview", self.web.preview_aliases, ["POST"], "预览作者别名影响"),
-            ("backup/export", self.web.export, ["GET"], "导出备份"),
-            ("backup/import", self.web.import_backup, ["POST"], "预检导入备份"),
-            (
-                "backup/import/commit",
-                self.web.commit_import,
-                ["POST"],
-                "确认导入备份",
-            ),
-            ("storage/migrate", self.web.migrate, ["POST"], "迁移存储"),
-            ("preview", self.web.preview, ["POST"], "预览卡片"),
-            ("media-data", self.web.media_data, ["GET"], "预览群典图片"),
-            ("avatar-data", self.web.avatar_data, ["GET"], "预览本地头像"),
-            ("avatars/stats", self.web.avatar_stats, ["GET"], "头像缓存统计"),
-            (
-                "avatars/cleanup",
-                self.web.cleanup_avatars,
-                ["POST"],
-                "清理无引用头像",
-            ),
-            ("avatars/clear", self.web.clear_avatars, ["POST"], "清空头像缓存"),
+        self.web = WebApi(
+            config=config,
+            settings=self.settings,
+            storage=self.storage,
+            media=self.media,
+            avatars=self.avatars,
+            members=self.members,
+            backups=BackupService(self.storage, self.media, self.data_root / "backups"),
+            cards=self.cards,
+            operations=self.operations,
+            data_root=self.data_root,
         )
-        for route, handler, methods, description in routes:
+        legacy_subdir = str(config.get("storage_subdir") or "iconic_quotes").strip(
+            "/\\"
+        )
+        self._legacy_roots = [
+            self.data_root / legacy_subdir,
+            plugin_data / legacy_subdir,
+        ]
+        for route, handler, methods, description in self.web.routes():
             self.context.register_web_api(
-                f"/{PLUGIN_NAME}/{route}",
-                handler,
-                methods,
-                description,
+                f"/{PLUGIN_NAME}/{route}", handler, methods, description
             )
-        self.context.register_web_api(
-            f"/{PLUGIN_NAME}/media/<path:relative_path>",
-            self.web.media,
-            ["GET"],
-            "读取群典图片",
-        )
 
     async def initialize(self) -> None:
-        """初始化数据目录和可复用头像 HTTP Client。"""
-        legacy_backup = await self.storage.initialize()
+        """打开数据库、迁移旧数据、载入群级配置并建立头像 HTTP Client。"""
+        self.media.ensure()
+        await self.storage.open()
+        await LegacyMigrator(self.storage, self.media, self.avatars.directory).migrate(
+            self._legacy_roots
+        )
+        await self._load_group_settings()
         await self.avatars.initialize()
-        await self.renderer.initialize()
-        if legacy_backup:
-            logger.info("群典：旧数据迁移完成")
-        elif (
-            self.storage.legacy_root
-            and self.storage.legacy_root.is_dir()
-            and any(self.storage.legacy_root.iterdir())
-            and self.storage.legacy_root != self.storage.root
-        ):
-            logger.warning("群典：检测到未迁移的旧数据目录")
+        await self._sweep_orphan_media()
         logger.info("群典：初始化完成")
 
+    async def _load_group_settings(self) -> None:
+        """群级覆盖与别名以 SQLite 为准；1.x 存在宿主配置中的旧值迁入后清空。"""
+        overrides, aliases = await self.storage.group_settings()
+        legacy = {key: self.config.get(key) for key in GROUP_DATA_KEYS}
+        if any(legacy.values()):
+            if overrides or aliases:
+                logger.warning("群典：宿主配置与数据库都有群级配置，以数据库为准")
+            else:
+                probe = SettingsService(self.config)
+                probe.attach_group_data(
+                    legacy["group_overrides"] or {}, legacy["author_aliases"] or {}
+                )
+                values = probe.global_settings()
+                overrides, aliases = values["group_overrides"], values["author_aliases"]
+                await self.storage.save_group_settings(overrides, aliases)
+                logger.info("群典：群级覆盖与作者别名已迁入数据库")
+            for key in GROUP_DATA_KEYS:
+                self.config[key] = {}
+            try:
+                await asyncio.to_thread(self.config.save_config)
+            except Exception as exc:  # noqa: BLE001 - 数据已入库，清理宿主旧值失败只影响冗余。
+                logger.warning("群典：清理宿主旧配置失败，原因=%s", error_reason(exc))
+        self.settings.attach_group_data(overrides, aliases)
+
+    async def _sweep_orphan_media(self) -> None:
+        """删除磁盘上未登记且超过一天的媒体文件（收录中断留下的孤儿）。"""
+        registered = await self.storage.media_rows()
+
+        def sweep() -> int:
+            removed = 0
+            cutoff = time.time() - ORPHAN_GRACE_SECONDS
+            for sha256, path in self.media.files():
+                if sha256 not in registered and path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+            return removed
+
+        if removed := await asyncio.to_thread(sweep):
+            logger.info("群典：已清理 %s 个未引用的媒体文件", removed)
+
     async def terminate(self) -> None:
-        """插件停用或重载时释放网络资源和待确认状态。"""
-        self._pending_deletions.clear()
+        """停用或重载时释放待确认状态、网络资源与数据库连接。"""
+        self.operations.pending_deletions.clear()
         await self.web.close()
-        await self.renderer.close()
         await self.avatars.close()
+        await self.t2i.close()
+        await self.storage.close()
         logger.info("群典：已停止")
+
+    # 指令 -------------------------------------------------------------
+
+    def _wake_prefixes(self, event: AstrMessageEvent) -> Any:
+        try:
+            return self.context.get_config(
+                getattr(event, "unified_msg_origin", None)
+            ).get("wake_prefix", ["/"])
+        except Exception:  # noqa: BLE001 - 兼容不同 AstrBot 配置代理实现。
+            return ["/"]
+
+    def _values(self, event: AstrMessageEvent) -> dict[str, Any]:
+        group_id = str(event.get_group_id() or "")
+        return (
+            self.settings.for_group(group_id)
+            if group_id
+            else self.settings.global_settings()
+        )
 
     @filter.command("添加群典")
     async def add_quote(self, event: AstrMessageEvent):
         """收录当前消息引用的一条消息或合并转发。"""
-        if self._plain_text(event) not in {"添加群典", "/添加群典"}:
+        if call_input(event).text not in {"添加群典", "/添加群典"}:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
-        await self._dispatch(event, "add", self._add_quote, trigger_source="command")
+        await self.operations.run(
+            event, "add", self.operations.add, trigger_source="command"
+        )
 
     @filter.command("群典")
     async def query_quote(self, event: AstrMessageEvent, argument: str = ""):
-        """随机发送群典；参数 info 用于查看当前群统计。"""
-        plain_text = self._plain_text(event)
-        syntax_match, search_keyword = match_command_syntax(
-            plain_text,
-            ["群典"],
-        )
-        # AstrBot 可能把“@用户 + 普通文本”交给命令过滤器；只有正文完整匹配
-        # 群典调用语法时才接管事件，避免将普通群聊误判成带关键词的查询。
-        if not syntax_match:
+        """随机发送群典；参数 info 查看统计，help 查看帮助。"""
+        # 框架可能把“@用户 + 普通文本”交给命令过滤器；只有正文完整匹配调用语法时才接管。
+        route = route_query_command(call_input(event), self._values(event))
+        if route is None:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
-        targets = self._mentioned_users(event)
-        command_argument = search_keyword or ""
-        try:
-            group_id = str(event.get_group_id() or "")
-            current_values = (
-                self.settings.for_group(group_id)
-                if group_id
-                else self.settings.global_settings()
-            )
-            help_keywords = current_values["help_keywords"]
-        except Exception:  # noqa: BLE001 - 配置错误由统一分发器给出正式提示。
-            help_keywords = ["help", "帮助"]
-        if not targets and command_argument.casefold() == "info":
-            await self._dispatch(
-                event, "info", self._show_info, trigger_source="command"
-            )
-            return
-        if not targets and is_help_keyword(command_argument, help_keywords):
-            await self._dispatch(
-                event, "help", self._show_help, trigger_source="command"
-            )
-            return
-        await self._dispatch(
-            event,
-            "query",
-            lambda current, values: self._send_random_quote(
-                current,
-                values,
-                search_keyword,
-            ),
-            trigger_source="command",
-        )
+        await self._run_route(event, route.operation, route.argument, "command")
 
     @filter.command("爆典")
     async def burst_quote(self, event: AstrMessageEvent, argument: str = ""):
         """分页获取当前群中指定成员参与的全部群典记录。"""
-        matched, page_value = match_command_syntax(self._plain_text(event), ["爆典"])
+        matched, page = match_command_syntax(call_input(event).text, ["爆典"])
         if not matched:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
-        await self._dispatch(
-            event,
-            "burst",
-            lambda current, values: self._send_burst(current, values, page_value),
-            trigger_source="command",
-        )
+        await self._run_route(event, "burst", page, "command")
 
     @filter.command("删除群典")
     async def delete_quote(self, event: AstrMessageEvent, keyword: str = ""):
         """预览正文包含指定字符串的记录，并创建删除确认。"""
-        matched, search = match_command_syntax(self._plain_text(event), ["删除群典"])
+        matched, search = match_command_syntax(call_input(event).text, ["删除群典"])
         if not matched:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
-        search = search or ""
-        await self._dispatch(
+        await self.operations.run(
             event,
             "delete",
-            lambda current, values: self._prepare_delete(current, values, search),
+            lambda current, ctx: self.operations.prepare_delete(
+                current, ctx, search or ""
+            ),
             trigger_source="command",
         )
 
     @filter.command("确认删除")
     async def confirm_delete(self, event: AstrMessageEvent):
         """在 60 秒内确认当前用户最近一次删除预览。"""
-        if self._plain_text(event) not in {"确认删除", "/确认删除"}:
+        if call_input(event).text not in {"确认删除", "/确认删除"}:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
-        await self._dispatch(
-            event, "delete", self._confirm_delete, trigger_source="command"
+        await self.operations.run(
+            event, "delete", self.operations.confirm_delete, trigger_source="command"
         )
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def keyword_listener(self, event: AstrMessageEvent):
-        """处理单目标 @ 查询、精确关键词调用与机器人戳一戳。"""
+        """处理无前缀关键词调用与机器人戳一戳。"""
         raw = getattr(event.message_obj, "raw_message", None)
         if isinstance(raw, dict) and raw.get("post_type") == "notice":
             await self._handle_poke(event, raw)
             return
-        if self._is_command_event(event):
+        if is_command_event(event, self._wake_prefixes(event)) or is_bot_message(event):
             return
-        if self._is_bot_message(event):
+        call = call_input(event)
+        if not call.text:
             return
-        plain_text = self._plain_text(event)
-        if not plain_text:
+        route = route_keyword(
+            call, self._values(event), has_source=capture_source_count(event) > 0
+        )
+        if route is None:
             return
-        group_id = str(event.get_group_id() or "")
-        values = (
-            self.settings.for_group(group_id)
-            if group_id
-            else self.settings.global_settings()
-        )
-        has_source = self._has_capture_source(event)
-        add_match = (
-            values["add_keyword_enabled"] and plain_text in values["add_keywords"]
-        )
-        query_syntax_match, search_keyword = match_command_syntax(
-            plain_text,
-            values["query_keywords"],
-        )
-        targets = self._mentioned_users(event)
-        help_match = (
-            values["query_keyword_enabled"]
-            and query_syntax_match
-            and not targets
-            and is_help_keyword(search_keyword, values["help_keywords"])
-        )
-        query_match = values["query_keyword_enabled"] and query_syntax_match
-        burst_match, burst_page = match_command_syntax(
-            plain_text,
-            values["burst_keywords"],
-        )
-        if help_match:
-            event.stop_event()
-            await self._dispatch(
-                event, "help", self._show_help, trigger_source="keyword"
-            )
-        elif values["burst_keyword_enabled"] and burst_match:
-            event.stop_event()
-            await self._dispatch(
-                event,
-                "burst",
-                lambda current, current_values: self._send_burst(
-                    current,
-                    current_values,
-                    burst_page,
-                ),
-                trigger_source="keyword",
-            )
-        elif add_match and has_source:
-            event.stop_event()
-            await self._dispatch(
-                event, "add", self._add_quote, trigger_source="keyword"
-            )
-        elif query_match:
-            event.stop_event()
-            await self._dispatch(
-                event,
-                "query",
-                lambda current, current_values: self._send_random_quote(
-                    current,
-                    current_values,
-                    search_keyword,
-                ),
-                trigger_source="keyword",
-            )
-        elif add_match:
-            event.stop_event()
-            await self._dispatch(
-                event, "add", self._add_quote, trigger_source="keyword"
-            )
+        event.stop_event()
+        await self._run_route(event, route.operation, route.argument, "keyword")
+
+    async def _run_route(
+        self, event: AstrMessageEvent, operation: str, argument: str | None, source: str
+    ) -> None:
+        ops = self.operations
+        actions = {
+            "add": ops.add,
+            "info": ops.info,
+            "help": ops.help,
+            "query": lambda current, ctx: ops.query(current, ctx, argument),
+            "burst": lambda current, ctx: ops.burst(current, ctx, argument),
+        }
+        await ops.run(event, operation, actions[operation], trigger_source=source)
 
     async def _handle_poke(self, event: AstrMessageEvent, raw: dict) -> None:
         """只消费当前群成员戳机器人的通知，复用查询权限和全局冷却。"""
@@ -365,1212 +278,9 @@ class IconicQuotesPlugin(Star):
             or str(raw["user_id"]) == str(event.get_self_id())
         ):
             return
-        values = self.settings.for_group(str(event.get_group_id()))
-        if not values["poke_enabled"]:
+        if not self.settings.for_group(str(event.get_group_id()))["poke_enabled"]:
             return
         event.stop_event()
-        await self._dispatch(
-            event, "query", self._send_poke_quotes, trigger_source="poke"
+        await self.operations.run(
+            event, "query", self.operations.poke, trigger_source="poke"
         )
-
-    async def _send_poke_quotes(self, event: AstrMessageEvent, values: dict) -> None:
-        """使用本次发送配置快照，避免戳一戳设置影响普通查询。"""
-        current = dict(values)
-        current.update(
-            send_count=values["poke_send_count"],
-            random_send_count=False,
-            send_mode=values["poke_send_mode"],
-        )
-        if current["send_mode"] == "card":
-            current["aggregate_multiple"] = False
-        await self._send_random_quote(event, current)
-
-    async def _dispatch(
-        self,
-        event: AstrMessageEvent,
-        operation: str,
-        action: Callable[[AstrMessageEvent, dict[str, Any]], Awaitable[None]],
-        *,
-        trigger_source: str,
-    ) -> None:
-        """统一执行平台、名单、冷却、角色权限和异常反馈。"""
-        event.should_call_llm(False)
-        platform = event.get_platform_name()
-        group_id = str(event.get_group_id() or "")
-        user_id = str(event.get_sender_id() or "")
-        failure_reason: str | None = None
-        operation_label = {
-            "add": "添加",
-            "query": "查询",
-            "burst": "爆典发送",
-            "info": "统计查询",
-            "delete": "删除",
-            "help": "帮助",
-        }.get(operation, "操作")
-        if trigger_source == "poke":
-            operation_label = "戳一戳发送"
-
-        def log_result(result: str) -> None:
-            if result == "success" and self._operation_error_logged:
-                return
-            if result == "success" and self._operation_log_override:
-                logger.info("群典：%s", self._operation_log_override)
-                self._operation_log_override = None
-                return
-            result_label = {
-                "success": "成功",
-                "cooldown": "被冷却",
-                "unsupported_platform_or_session": "平台不支持",
-                "list_blocked": "被名单拦截",
-                "permission_lookup_failed": "权限检查失败",
-                "permission_denied": "权限不足",
-                "duplicate": "重复记录",
-                "operation_failed": "失败",
-                "usage_error": "参数错误",
-            }.get(result, result)
-            if failure_reason:
-                logger.warning(
-                    "群典：%s%s，原因=%s",
-                    operation_label,
-                    result_label,
-                    failure_reason,
-                )
-            else:
-                logger.info("群典：%s%s", operation_label, result_label)
-
-        if platform != "aiocqhttp" or not group_id:
-            try:
-                values = self.settings.global_settings()
-            except Exception:  # noqa: BLE001 - 无有效配置时只能使用无重试提示。
-                logger.exception("群典：配置读取失败")
-                await self._send_without_retry(
-                    event, "群典插件配置无效，请联系管理员。"
-                )
-                return
-            notice_key = group_id or f"private:{platform}:{user_id}"
-            decision = await self.cooldown.try_enter(notice_key)
-            if not decision.accepted:
-                if decision.should_notify:
-                    await self._send_without_retry(event, values["cooldown_message"])
-                log_result("cooldown")
-                return
-            sent = await self._send_without_retry(
-                event,
-                "当前平台或会话不支持群典功能。",
-            )
-            await self.cooldown.leave(
-                values["global_cooldown_ms"],
-                sent_message=sent,
-            )
-            log_result("unsupported_platform_or_session")
-            return
-        try:
-            values = self.settings.for_group(group_id)
-        except Exception:  # noqa: BLE001 - 配置错误必须隔离在 Handler 边界。
-            logger.exception("群典：配置读取失败")
-            await self._send_without_retry(event, "群典插件配置无效，请联系管理员。")
-            return
-        if not self.permissions.list_allows(values, group_id, user_id):
-            log_result("list_blocked")
-            return
-        decision = await self.cooldown.try_enter(group_id)
-        if not decision.accepted:
-            if decision.should_notify:
-                await self._send_without_retry(event, values["cooldown_message"])
-            log_result("cooldown")
-            return
-        self._sent_in_operation = False
-        self._operation_log_override = None
-        self._operation_error_logged = False
-        result = "success"
-        try:
-            try:
-                allowed = await self.permissions.allows(event, values, operation)
-            except RoleLookupError as exc:
-                result = "permission_lookup_failed"
-                failure_reason = _error_reason(exc)
-                await self._send_text(event, "暂时无法验证群权限。", values)
-                return
-            if not allowed:
-                result = "permission_denied"
-                await self._send_text(event, "你没有执行此操作的权限。", values)
-                return
-            with self.storage.media_checks():
-                await action(event, values)
-        except DuplicateQuoteError as exc:
-            result = "duplicate"
-            await self._send_text(
-                event,
-                (f"该群典已存在。\n记录 ID：{exc.record.id[:8]}"),
-                values,
-            )
-        except AmbiguousSendError as exc:
-            result = "operation_failed"
-            failure_reason = _error_reason(exc)
-            with contextlib.suppress(Exception):
-                await self._send_text(
-                    event, "消息发送结果未知，已停止重试和降级，请先检查群聊。", values
-                )
-        except UsageError as exc:
-            result = "usage_error"
-            failure_reason = _error_reason(exc)
-            await self._send_usage_error(event, str(exc), values, exc.operation)
-        except (CaptureError, StorageError, ValueError) as exc:
-            result = "operation_failed"
-            failure_reason = _error_reason(exc)
-            await self._send_text(event, f"操作失败：{exc}", values)
-        except Exception as exc:  # noqa: BLE001 - Handler 边界必须隔离未知插件/适配器异常。
-            result = "unexpected_error"
-            logger.exception(
-                "群典：%s失败，原因=%s", operation_label, _error_reason(exc)
-            )
-            with contextlib.suppress(Exception):
-                await self._send_text(event, "操作失败，请稍后重试。", values)
-        finally:
-            if result != "unexpected_error":
-                log_result(result)
-            await self.cooldown.leave(
-                values["global_cooldown_ms"],
-                sent_message=self._sent_in_operation,
-            )
-
-    async def _add_quote(
-        self,
-        event: AstrMessageEvent,
-        values: dict[str, Any],
-    ) -> None:
-        source_count = self._capture_source_count(event)
-        if source_count != 1:
-            reason = (
-                "请引用一条消息或携带一个合并转发。"
-                if source_count == 0
-                else "一次只能添加一个引用或合并转发来源。"
-            )
-            raise UsageError(reason, "add")
-        record = await self.extractor.extract(event, values)
-        # 新收录的转发/回复作者在落盘前完成别名与唯一昵称解析；旧数据仍只读纠正。
-        resolution = await self.identities.resolve_records(
-            event, record.group_id, [record], values
-        )
-        record = resolution.records[0]
-        record.content_hash = calculate_record_hash(record)
-        await self.storage.add(record, values["max_records_per_group"])
-        if record.type == "message" and record.author:
-            await self.avatars.prefetch(record.author.user_id, values)
-        info = await self.storage.info(record.group_id, values["max_records_per_group"])
-        author = self._record_author_name(record)
-        warning = (
-            f"；已忽略 {self.extractor.last_ignored_segments} 个不支持的消息段"
-            if self.extractor.last_ignored_segments
-            else ""
-        )
-        if resolution.incomplete_count:
-            warning += f"\n另有 {resolution.incomplete_count} 个作者身份未能确认。"
-        if record.has_missing_replies():
-            warning += "\n该记录存在无法追溯的引用内容。"
-        await self._send_text(
-            event,
-            f"已收录 {author} 的群典，当前共 {info['total']} 条。\n记录 ID：{record.id[:8]}{warning}",
-            values,
-        )
-
-    async def _send_random_quote(
-        self,
-        event: AstrMessageEvent,
-        values: dict[str, Any],
-        search_keyword: str | None = None,
-    ) -> None:
-        targets = self._mentioned_users(event)
-        if len(targets) > 1:
-            raise UsageError("一次只能指定一名用户。", "query")
-        target_id = targets[0] if targets else None
-        keyword = (search_keyword or "").strip()
-        if keyword and not target_id:
-            raise UsageError("关键词查询必须指定一名用户。", "query")
-        if len(keyword) > values["max_query_keyword_chars"]:
-            raise UsageError(
-                f"查询关键词不能超过 {values['max_query_keyword_chars']} 个字符。",
-                "query",
-            )
-        requested_count = resolve_send_count(
-            values["send_count"],
-            values["random_send_count"],
-        )
-        group_id = str(event.get_group_id())
-        resolution = await self.identities.resolve_records(
-            event,
-            group_id,
-            await self.storage.records(group_id),
-            values,
-        )
-        records, broken = await self.storage.select_random(
-            group_id,
-            requested_count,
-            target_id,
-            keyword or None,
-            candidate_records=resolution.records,
-        )
-        if not records:
-            if target_id and keyword:
-                displayed = keyword if len(keyword) <= 30 else f"{keyword[:30]}…"
-                message = f"未找到该用户包含“{displayed}”的可用群典。"
-            elif broken:
-                message = "暂无可用群典，请联系 Bot 管理员检查存储。"
-            elif target_id:
-                message = "该用户在当前群暂无可用群典。"
-            else:
-                message = "当前群还没有群典。"
-            await self._send_text(event, message, values)
-            return
-        if target_id and resolution.member_lookup_failed:
-            await self._send_text(
-                event, "群成员列表读取失败，本次结果可能不完整。", values
-            )
-        if any(
-            record.type == "forward" and record.identity_incomplete
-            for record in records
-        ):
-            await self._send_text(event, "部分历史节点的作者身份尚未确认。", values)
-        await self._send_records(event, records, values)
-
-    async def _send_burst(
-        self,
-        event: AstrMessageEvent,
-        values: dict[str, Any],
-        page_value: str | None,
-    ) -> None:
-        targets = self._mentioned_users(event)
-        if len(targets) != 1:
-            reason = (
-                "爆典需要指定一名用户。"
-                if not targets
-                else "爆典一次只能指定一名用户。"
-            )
-            raise UsageError(reason, "burst")
-        target_id = targets[0]
-        group_id = str(event.get_group_id())
-        resolution = await self.identities.resolve_records(
-            event,
-            group_id,
-            await self.storage.records(group_id),
-            values,
-        )
-        records, broken = await self.storage.records_for_user(
-            group_id,
-            target_id,
-            candidate_records=resolution.records,
-        )
-        if not records:
-            message = (
-                "该用户的群典记录均存在资源缺失，请联系管理员检查插件数据。"
-                if broken
-                else "未找到该用户的群典记录。"
-            )
-            await self._send_text(event, message, values)
-            return
-        if resolution.member_lookup_failed:
-            await self._send_text(
-                event, "群成员列表读取失败，本次结果可能不完整。", values
-            )
-        page_size = values["burst_page_size"]
-        pages = math.ceil(len(records) / page_size)
-        if page_value is None and len(records) > page_size:
-            raise UsageError(
-                f"当前记录数量大于 {page_size} 条，将分页发送。当前共有 {pages} 页，"
-                "请指定要获取的页码。",
-                "burst",
-            )
-        try:
-            page = int(page_value) if page_value is not None else 1
-        except (TypeError, ValueError):
-            page = 0
-        if page < 1 or page > pages:
-            raise UsageError(
-                f"页码无效，有效范围为 1 到 {pages}。",
-                "burst",
-            )
-        start = (page - 1) * page_size
-        selected = records[start : start + page_size]
-        await self._refresh_record_author_names(event, selected)
-        target_name = await self._burst_target_name(event, target_id, records)
-        configured_time_mode = values["burst_time_mode"]
-        # 爆典自身会包一层合集，因此按最终 OneBot 节点树深度做本地预检。
-        payload_depth = max(
-            (record.forward_depth() + 1 if record.type == "forward" else 1)
-            for record in selected
-        )
-        if payload_depth <= 3:
-            raw_time_modes = [configured_time_mode]
-            if configured_time_mode == "native":
-                raw_time_modes.append("none")
-            raw_error: Exception | None = None
-            for raw_time_mode in raw_time_modes:
-                outcome, raw_error = await self._try_raw_forward(
-                    event,
-                    values,
-                    lambda native_replies, native_stickers, mode=raw_time_mode: (
-                        self.renderer.raw_burst_nodes(
-                            selected,
-                            target_name=target_name,
-                            total=len(records),
-                            page=page,
-                            pages=pages,
-                            skipped=broken,
-                            identity_incomplete=any(
-                                record.identity_incomplete for record in selected
-                            ),
-                            native_stickers=native_stickers,
-                            native_replies=native_replies,
-                            time_mode=mode,
-                        )
-                    ),
-                    has_replies=any(record.has_replies() for record in selected),
-                    has_stickers=any(record.has_stickers() for record in selected),
-                )
-                if outcome == "success":
-                    self._operation_log_override = "原生合并转发"
-                    return
-                if outcome == "ambiguous":
-                    await self._send_text(
-                        event, values["nested_forward_unknown_message"], values
-                    )
-                    self._operation_log_override = "合并转发结果未知"
-                    return
-            logger.warning(
-                "群典：爆典原生合并转发失败，准备降级；页码=%s/%s，节点树深度=%s，原因=%s",
-                page,
-                pages,
-                payload_depth,
-                _error_reason(raw_error),
-            )
-        else:
-            logger.warning(
-                "群典：爆典原生合并转发未发送，准备降级；节点树深度=%s，原因=超过 OneBot 安全深度 3",
-                payload_depth,
-            )
-        await self._send_text(event, values["nested_forward_fallback_message"], values)
-        time_modes = [configured_time_mode]
-        if configured_time_mode == "native":
-            time_modes.append("none")
-        variants: list[tuple[bool, bool, str]] = []
-        for time_mode in time_modes:
-            variants.append((True, True, time_mode))
-        if any(record.has_replies() for record in selected):
-            for time_mode in time_modes:
-                variants.append((True, False, time_mode))
-        if any(record.has_stickers() for record in selected):
-            variants.extend(
-                (False, native_replies, time_mode)
-                for _, native_replies, time_mode in list(variants)
-            )
-        last_error: Exception | None = None
-        for native_stickers, native_replies, time_mode in dict.fromkeys(variants):
-            try:
-                nodes = await asyncio.to_thread(
-                    self.renderer.burst_nodes,
-                    selected,
-                    target_name=target_name,
-                    total=len(records),
-                    page=page,
-                    pages=pages,
-                    skipped=broken,
-                    identity_incomplete=any(
-                        record.identity_incomplete for record in selected
-                    ),
-                    native_stickers=native_stickers,
-                    native_replies=native_replies,
-                    time_mode=time_mode,
-                )
-                await self._send_chain(event, [Comp.Nodes(nodes)], values)
-                if (
-                    not native_stickers
-                    or not native_replies
-                    or time_mode != configured_time_mode
-                ):
-                    self._operation_log_override = "合并转发失败，已降级"
-                return
-            except Exception as exc:
-                last_error = exc
-                if isinstance(exc, AmbiguousSendError):
-                    raise
-                logger.debug(
-                    "群典：爆典降级发送失败；原生回复=%s，原生表情=%s，时间模式=%s，原因=%s",
-                    native_replies,
-                    native_stickers,
-                    time_mode,
-                    _error_reason(exc),
-                )
-        if last_error is not None:
-            self._operation_error_logged = True
-            logger.error(
-                "群典：爆典发送失败；页码=%s/%s，记录数=%s，原因=%s",
-                page,
-                pages,
-                len(selected),
-                _error_reason(last_error),
-                exc_info=(type(last_error), last_error, last_error.__traceback__),
-            )
-        await self._send_text(
-            event,
-            "爆典合集发送失败，请稍后重试或联系管理员检查 OneBot 日志。",
-            values,
-        )
-
-    async def _burst_target_name(
-        self,
-        event: AstrMessageEvent,
-        target_id: str,
-        records: list[QuoteRecord],
-    ) -> str:
-        try:
-            payload = await call_onebot_action(
-                event,
-                "get_group_member_info",
-                group_id=int(event.get_group_id()),
-                user_id=int(target_id),
-                no_cache=False,
-            )
-            if isinstance(payload, dict):
-                name = str(payload.get("card") or payload.get("nickname") or "").strip()
-                if name:
-                    return name
-        except Exception as exc:  # noqa: BLE001 - 昵称查询失败应回退存档。
-            logger.debug(
-                "群典：读取目标群名片失败；用户=%s，原因=%s",
-                target_id,
-                _error_reason(exc),
-            )
-
-        def find_node_name(node: ForwardNode) -> str | None:
-            if node.author.user_id == target_id and node.author.nickname:
-                return node.author.nickname
-            for nested in reversed(node.nested_forwards):
-                for child in reversed(nested.nodes):
-                    if name := find_node_name(child):
-                        return name
-            return None
-
-        for record in reversed(records):
-            if (
-                record.author
-                and record.author.user_id == target_id
-                and record.author.nickname
-            ):
-                return record.author.nickname
-            for node in reversed(record.nodes):
-                if name := find_node_name(node):
-                    return name
-        return target_id
-
-    async def _send_records(
-        self,
-        event: AstrMessageEvent,
-        records: list[QuoteRecord],
-        values: dict[str, Any],
-        *,
-        preview: bool = False,
-    ) -> bool:
-        await self._refresh_record_author_names(event, records)
-        if preview:
-            for record in records:
-                if record.type == "forward":
-                    if not await self._send_forward(
-                        event,
-                        [record],
-                        values,
-                        replay=True,
-                    ):
-                        return False
-                else:
-                    await self._send_missing_reply_warning(event, record, values)
-                    await self._send_record_chain(event, record, values)
-            return True
-        if len(records) > 1 and values["aggregate_multiple"]:
-            ordinary = [record for record in records if record.type == "message"]
-            forwarded = [record for record in records if record.type == "forward"]
-            if ordinary and not await self._send_forward(
-                event, ordinary, values, replay=False
-            ):
-                return False
-            for record in forwarded:
-                if not await self._send_forward(event, [record], values, replay=True):
-                    return False
-            return True
-        for record in records:
-            if record.type == "forward":
-                if not await self._send_forward(event, [record], values, replay=True):
-                    return False
-            elif values["send_mode"] == "card":
-                await self._send_missing_reply_warning(event, record, values)
-                if record.has_native_segments():
-                    await self._send_record_chain(event, record, values)
-                else:
-                    await self._send_card_with_fallback(event, record, values)
-            else:
-                await self._send_missing_reply_warning(event, record, values)
-                await self._send_record_chain(event, record, values)
-        return True
-
-    async def _send_missing_reply_warning(
-        self,
-        event: AstrMessageEvent,
-        record: QuoteRecord,
-        values: dict[str, Any],
-    ) -> None:
-        """单条普通消息在正文前独立提示已丢失的引用关系。"""
-        if warning := self.renderer.missing_reply_warning([record]):
-            await self._send_text(event, warning, values)
-
-    async def _refresh_record_author_names(
-        self,
-        event: AstrMessageEvent,
-        records: list[QuoteRecord],
-    ) -> None:
-        """发送前按 QQ ID 刷新当前群名片，失败时保留存档快照。"""
-        authors: list[AuthorSnapshot] = []
-
-        def collect_reply(reply: ReplySnapshot | None) -> None:
-            if reply is None:
-                return
-            authors.append(reply.author)
-            collect_reply(reply.reply)
-
-        def collect_node(node: ForwardNode) -> None:
-            authors.append(node.author)
-            collect_reply(node.reply)
-            for nested in node.nested_forwards:
-                for child in nested.nodes:
-                    collect_node(child)
-
-        for record in records:
-            if record.author:
-                authors.append(record.author)
-            collect_reply(record.reply)
-            for node in record.nodes:
-                collect_node(node)
-        by_id: dict[str, list[AuthorSnapshot]] = {}
-        for author in authors:
-            if author.user_id:
-                by_id.setdefault(author.user_id, []).append(author)
-        for user_id, snapshots in by_id.items():
-            try:
-                payload = await call_onebot_action(
-                    event,
-                    "get_group_member_info",
-                    group_id=int(event.get_group_id()),
-                    user_id=int(user_id),
-                    no_cache=False,
-                )
-                if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-                    payload = payload["data"]
-                if not isinstance(payload, dict):
-                    continue
-                name = str(payload.get("card") or payload.get("nickname") or "").strip()
-                if name:
-                    for snapshot in snapshots:
-                        snapshot.nickname = name
-            except Exception as exc:  # noqa: BLE001 - 昵称刷新失败应保留存档快照。
-                logger.debug(
-                    "群典：刷新作者群名片失败；用户=%s，原因=%s",
-                    user_id,
-                    _error_reason(exc),
-                )
-
-    async def _send_card_with_fallback(
-        self,
-        event: AstrMessageEvent,
-        record: QuoteRecord,
-        values: dict[str, Any],
-    ) -> None:
-        paths: list[str] = []
-        try:
-            paths = await self.renderer.card_paths(record, values)
-            await self._send_chain(
-                event,
-                [Comp.Image.fromFileSystem(path) for path in paths],
-                values,
-            )
-        except Exception as exc:
-            if isinstance(exc, AmbiguousSendError):
-                raise
-            logger.warning(
-                "群典：卡片生成失败，准备降级；记录=%s，原因=%s",
-                record.id,
-                _error_reason(exc),
-            )
-            self._operation_log_override = "已降级发送"
-            await self._send_record_chain(event, record, values)
-            await self._send_text(
-                event, "金句图片生成失败，已使用文字方式发送。", values
-            )
-        finally:
-            for path in paths:
-                with contextlib.suppress(OSError):
-                    Path(path).unlink(missing_ok=True)
-
-    async def _send_forward(
-        self,
-        event: AstrMessageEvent,
-        records: list[QuoteRecord],
-        values: dict[str, Any],
-        *,
-        replay: bool,
-    ) -> bool:
-        # 一层与多层记录都优先从本地 JSON 重建，不再依赖易失的 res_id。
-        payload_depth = max((record.forward_depth() for record in records), default=1)
-        if payload_depth <= 3:
-            outcome, raw_error = await self._try_raw_forward(
-                event,
-                values,
-                lambda native_replies, native_stickers: self.renderer.raw_forward_nodes(
-                    records,
-                    replay=replay,
-                    native_stickers=native_stickers,
-                    native_replies=native_replies,
-                ),
-                has_replies=any(record.has_replies() for record in records),
-                has_stickers=any(record.has_stickers() for record in records),
-            )
-            if outcome == "success":
-                self._operation_log_override = "原生合并转发"
-                return True
-            if outcome == "ambiguous":
-                await self._send_text(
-                    event, values["nested_forward_unknown_message"], values
-                )
-                self._operation_log_override = "合并转发结果未知"
-                return False
-            logger.warning(
-                "群典：原生合并转发失败，准备降级；记录=%s，节点树深度=%s，原因=%s",
-                ",".join(record.id[:8] for record in records),
-                payload_depth,
-                _error_reason(raw_error),
-            )
-        else:
-            logger.warning(
-                "群典：原生合并转发未发送，准备降级；记录=%s，节点树深度=%s，原因=超过 OneBot 安全深度 3",
-                ",".join(record.id[:8] for record in records),
-                payload_depth,
-            )
-
-        await self._send_text(event, values["nested_forward_fallback_message"], values)
-        sent = await self._send_forward_flattened(event, records, values, replay=replay)
-        if sent:
-            self._operation_log_override = "合并转发失败，已降级"
-            return True
-        await self._send_text(event, "合并转发发送失败，请稍后重试。", values)
-        return False
-
-    async def _send_forward_flattened(
-        self,
-        event: AstrMessageEvent,
-        records: list[QuoteRecord],
-        values: dict[str, Any],
-        *,
-        replay: bool,
-    ) -> bool:
-        """完整展开层级；这里只在原生多层明确不可用时调用。"""
-        variants = [(True, True)]
-        if any(record.has_replies() for record in records):
-            variants.append((False, True))
-        if any(record.has_stickers() for record in records):
-            variants.extend(
-                (native_replies, False) for native_replies, _ in list(variants)
-            )
-        last_error: Exception | None = None
-        for native_replies, native_stickers in dict.fromkeys(variants):
-            try:
-                nodes = await asyncio.to_thread(
-                    self.renderer.forward_nodes,
-                    records,
-                    replay=replay,
-                    native_stickers=native_stickers,
-                    native_replies=native_replies,
-                )
-                await self._send_chain(event, [Comp.Nodes(nodes)], values)
-                return True
-            except Exception as exc:
-                last_error = exc
-                if isinstance(exc, AmbiguousSendError):
-                    raise
-                logger.debug(
-                    "群典：多层嵌套降级发送失败；原生回复=%s，原生表情=%s，原因=%s",
-                    native_replies,
-                    native_stickers,
-                    _error_reason(exc),
-                )
-        if last_error is not None:
-            self._operation_error_logged = True
-            logger.error(
-                "群典：多层嵌套降级发送失败；记录=%s，原因=%s",
-                ",".join(record.id[:8] for record in records),
-                _error_reason(last_error),
-                exc_info=(type(last_error), last_error, last_error.__traceback__),
-            )
-        return False
-
-    async def _try_raw_forward(
-        self,
-        event: AstrMessageEvent,
-        values: dict[str, Any],
-        builder: Callable[[bool, bool], Awaitable[list[dict[str, Any]]]],
-        *,
-        has_replies: bool,
-        has_stickers: bool,
-    ) -> tuple[Literal["success", "explicit", "ambiguous"], Exception | None]:
-        """按回复、贴纸回退顺序尝试原生树；结果未知时立即停止。"""
-        variants = [(True, True)]
-        if has_replies:
-            variants.append((False, True))
-        if has_stickers:
-            variants.extend(
-                (native_replies, False) for native_replies, _ in list(variants)
-            )
-        last_error: Exception | None = None
-        for native_replies, native_stickers in dict.fromkeys(variants):
-            try:
-                messages = await builder(native_replies, native_stickers)
-            except Exception as exc:  # noqa: BLE001 - 本地序列化失败属于明确失败。
-                last_error = exc
-                logger.debug(
-                    "群典：构造原生多层嵌套失败；原生回复=%s，原生表情=%s，原因=%s",
-                    native_replies,
-                    native_stickers,
-                    _error_reason(exc),
-                )
-                continue
-            outcome, error = await self._send_raw_forward_action(
-                event,
-                messages,
-                values,
-            )
-            if outcome == "success":
-                return outcome, None
-            last_error = error
-            if outcome == "ambiguous":
-                return outcome, error
-            logger.debug(
-                "群典：原生多层嵌套发送失败；原生回复=%s，原生表情=%s，结果=%s，原因=%s",
-                native_replies,
-                native_stickers,
-                outcome,
-                _error_reason(error),
-            )
-        return "explicit", last_error
-
-    async def _send_raw_forward_action(
-        self,
-        event: AstrMessageEvent,
-        messages: list[dict[str, Any]],
-        values: dict[str, Any],
-    ) -> tuple[Literal["success", "explicit", "ambiguous"], Exception | None]:
-        """直接发送 NapCat 节点树，并区分明确失败与结果未知。"""
-        attempts = values["send_retry_count"] + 1
-        delay = values["send_retry_delay_ms"] / 1000
-        last_error: Exception | None = None
-        last_outcome: Literal["explicit", "ambiguous"] = "explicit"
-        saw_ambiguous = False
-        for attempt in range(attempts):
-            try:
-                params: dict[str, Any] = {
-                    "group_id": int(event.get_group_id()),
-                    "messages": messages,
-                    **self.renderer.raw_forward_meta(messages),
-                }
-                self_id = str(event.get_self_id() or "")
-                if self_id.isdigit():
-                    params["self_id"] = int(self_id)
-                await call_onebot_action_once(
-                    event,
-                    "send_group_forward_msg",
-                    **params,
-                )
-                self._sent_in_operation = True
-                return "success", None
-            except Exception as exc:  # noqa: BLE001 - OneBot 错误类型不统一。
-                last_error = exc
-                last_outcome = (
-                    "ambiguous" if self._is_ambiguous_send_error(exc) else "explicit"
-                )
-                saw_ambiguous = saw_ambiguous or last_outcome == "ambiguous"
-                if (
-                    last_outcome == "ambiguous"
-                    and not values["retry_on_ambiguous_failure"]
-                ):
-                    logger.warning(
-                        "群典：原生合并转发结果未知，停止重试；尝试=%s/%s，节点数=%s，原因=%s",
-                        attempt + 1,
-                        attempts,
-                        len(messages),
-                        _error_reason(exc),
-                    )
-                    break
-            if attempt + 1 < attempts:
-                logger.debug(
-                    "群典：原生合并转发发送失败，准备重试；尝试=%s/%s，结果=%s，节点数=%s，原因=%s",
-                    attempt + 1,
-                    attempts,
-                    last_outcome,
-                    len(messages),
-                    _error_reason(last_error),
-                )
-                await asyncio.sleep(delay)
-        # 任一次结果未知都意味着消息可能已经送达，后续明确失败不能消除重复风险。
-        return ("ambiguous" if saw_ambiguous else last_outcome), last_error
-
-    @staticmethod
-    def _is_ambiguous_send_error(error: Exception) -> bool:
-        """网络中断和超时可能发生在服务端已受理之后，不能安全降级。"""
-        return isinstance(
-            error,
-            (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError),
-        )
-
-    async def _send_record_chain(
-        self,
-        event: AstrMessageEvent,
-        record: QuoteRecord,
-        values: dict[str, Any],
-    ) -> None:
-        sticker_modes = [True, False] if record.has_stickers() else [True]
-        last_error: Exception | None = None
-        for native_stickers in sticker_modes:
-            try:
-                await self._send_chain(
-                    event,
-                    await asyncio.to_thread(
-                        self.renderer.text_chain,
-                        record,
-                        native_stickers=native_stickers,
-                        native_replies=True,
-                    ),
-                    values,
-                )
-                return
-            except Exception as exc:
-                last_error = exc
-                if isinstance(exc, AmbiguousSendError):
-                    raise
-                if not record.reply:
-                    continue
-                break
-        if record.reply:
-            for native_stickers in sticker_modes:
-                try:
-                    nodes = await asyncio.to_thread(
-                        self.renderer.forward_nodes,
-                        [record],
-                        native_stickers=native_stickers,
-                        native_replies=False,
-                    )
-                    await self._send_chain(event, [Comp.Nodes(nodes)], values)
-                    self._operation_log_override = "已降级发送"
-                    return
-                except Exception as exc:
-                    last_error = exc
-                    if isinstance(exc, AmbiguousSendError):
-                        raise
-        if last_error:
-            raise last_error
-
-    async def _show_info(
-        self,
-        event: AstrMessageEvent,
-        values: dict[str, Any],
-    ) -> None:
-        info = await self.storage.info(
-            str(event.get_group_id()),
-            values["max_records_per_group"],
-        )
-        await self._send_text(
-            event,
-            "\n".join(
-                (
-                    f"群典总数：{info['total']} / {info['limit']}",
-                    f"普通金句：{info['messages']}",
-                    f"合并转发：{info['forwards']}",
-                    f"含图片记录：{info['with_images']}",
-                    f"异常记录：{info['broken']}",
-                    f"图片占用：{self._format_bytes(info['image_bytes'])}",
-                    f"最早收录：{self._display_time(info['earliest'])}",
-                    f"最近收录：{self._display_time(info['latest'])}",
-                )
-            ),
-            values,
-        )
-
-    async def _show_help(
-        self,
-        event: AstrMessageEvent,
-        values: dict[str, Any],
-    ) -> None:
-        """发送当前群配置渲染后的总帮助。"""
-        if not values["help_enabled"]:
-            await self._send_text(event, "群典帮助功能未启用。", values)
-            return
-        overview = render_help_template(values["help_overview_template"], values)
-        if not overview:
-            sections = []
-            for operation, label in (
-                ("add", "添加"),
-                ("query", "查询"),
-                ("burst", "爆典"),
-                ("info", "统计"),
-                ("delete", "删除"),
-                ("help", "帮助"),
-            ):
-                usage = operation_usage(values, operation)
-                if usage:
-                    sections.append(f"{label}：{usage}")
-            overview = "群典帮助" + ("\n" + "\n".join(sections) if sections else "")
-        overview += "\n支持 @成员 群典 或 群典 @成员；关键词前最多一个成员 @，也可引用消息或 @Bot。"
-        await self._send_text(event, overview, values)
-
-    async def _prepare_delete(
-        self,
-        event: AstrMessageEvent,
-        values: dict[str, Any],
-        keyword: str,
-    ) -> None:
-        if not keyword.strip():
-            raise UsageError("请提供要匹配的正文字符串。", "delete")
-        matches = await self.storage.search(str(event.get_group_id()), keyword)
-        if not matches:
-            await self._send_text(event, "没有找到包含该字符串的群典。", values)
-            return
-        if len(matches) > values["delete_preview_limit"]:
-            await self._send_text(
-                event,
-                f"共命中 {len(matches)} 条，超过预览上限，请缩小关键词或在后台管理。",
-                values,
-            )
-            return
-        await self._send_text(event, f"以下 {len(matches)} 条群典将被删除：", values)
-        if not await self._send_records(event, matches, values, preview=True):
-            await self._send_text(
-                event,
-                "删除预览未能完整发送，本次未创建删除确认。",
-                values,
-            )
-            return
-        await self._send_text(event, "请在 60 秒内发送 /确认删除。", values)
-        key = (str(event.get_group_id()), str(event.get_sender_id()))
-        self._pending_deletions[key] = PendingDeletion(
-            expires_at=time.monotonic() + 60,
-            record_hashes={record.id: record.content_hash for record in matches},
-        )
-
-    async def _confirm_delete(
-        self,
-        event: AstrMessageEvent,
-        values: dict[str, Any],
-    ) -> None:
-        key = (str(event.get_group_id()), str(event.get_sender_id()))
-        pending = self._pending_deletions.get(key)
-        if not pending or pending.expires_at < time.monotonic():
-            self._pending_deletions.pop(key, None)
-            await self._send_text(event, "没有有效的待确认删除操作。", values)
-            return
-        deleted = await self.storage.delete_ids(
-            key[0],
-            set(pending.record_hashes),
-            deleted_by=key[1],
-            source="command",
-            expected_hashes=pending.record_hashes,
-            audit_limit=values["audit_limit"],
-        )
-        self._pending_deletions.pop(key, None)
-        await self._send_text(event, f"已删除 {deleted} 条群典。", values)
-
-    async def _send_text(
-        self,
-        event: AstrMessageEvent,
-        text: str,
-        values: dict[str, Any],
-    ) -> None:
-        await self._send_chain(event, [Comp.Plain(text)], values)
-
-    async def _send_usage_error(
-        self,
-        event: AstrMessageEvent,
-        reason: str,
-        values: dict[str, Any],
-        operation: str,
-    ) -> None:
-        """把参数错误与当前操作用法合并为一条消息。"""
-        usage = operation_usage(values, operation)
-        message = reason
-        if values["help_enabled"] and usage:
-            message += f"\n\n用法：{usage}"
-        await self._send_text(event, message, values)
-
-    async def _send_chain(
-        self,
-        event: AstrMessageEvent,
-        chain: list[Any],
-        values: dict[str, Any],
-    ) -> None:
-        attempts = values["send_retry_count"] + 1
-        delay = values["send_retry_delay_ms"] / 1000
-        last_error: Exception | None = None
-        saw_ambiguous = False
-        for attempt in range(attempts):
-            try:
-                await event.send(MessageChain(chain))
-                self._sent_in_operation = True
-                return
-            except Exception as exc:  # noqa: BLE001 - OneBot 适配器异常类型不稳定。
-                last_error = exc
-                saw_ambiguous = saw_ambiguous or self._is_ambiguous_send_error(exc)
-                if (
-                    self._is_ambiguous_send_error(exc)
-                    and not values["retry_on_ambiguous_failure"]
-                ):
-                    break
-            if attempt + 1 < attempts:
-                logger.debug(
-                    "群典：消息发送失败，准备重试；尝试=%s/%s，消息段数=%s，原因=%s",
-                    attempt + 1,
-                    attempts,
-                    len(chain),
-                    _error_reason(last_error),
-                )
-                await asyncio.sleep(delay)
-        assert last_error is not None
-        if saw_ambiguous:
-            raise AmbiguousSendError("消息可能已送达") from last_error
-        raise last_error
-
-    @staticmethod
-    async def _send_without_retry(event: AstrMessageEvent, text: str) -> bool:
-        """用于冷却或平台提示，避免提示本身递归进入重试状态。"""
-        try:
-            await event.send(MessageChain([Comp.Plain(text)]))
-            return True
-        except Exception:  # noqa: BLE001 - 冷却提示失败不能递归重试。
-            return False
-
-    @staticmethod
-    def _has_capture_source(event: AstrMessageEvent) -> bool:
-        return IconicQuotesPlugin._capture_source_count(event) > 0
-
-    @staticmethod
-    def _capture_source_count(event: AstrMessageEvent) -> int:
-        """统计唯一收录来源，并兼容 AstrBot 未展开的原始 reply 段。"""
-        messages = list(event.get_messages())
-        count = sum(
-            isinstance(item, (Comp.Reply, Comp.Forward, Comp.Node, Comp.Nodes))
-            for item in messages
-        )
-        if any(isinstance(item, Comp.Reply) for item in messages):
-            return count
-        raw = getattr(event.message_obj, "raw_message", None)
-        raw_segments = raw.get("message") if isinstance(raw, dict) else None
-        if isinstance(raw_segments, list) and any(
-            isinstance(item, dict) and item.get("type") == "reply"
-            for item in raw_segments
-        ):
-            count += 1
-        return count
-
-    def _is_command_event(self, event: AstrMessageEvent) -> bool:
-        """识别命令事件，避免去前缀后的正文再次命中关键词监听器。"""
-        if event.get_extra(COMMAND_EVENT_KEY, False):
-            return True
-        candidates = [str(getattr(event.message_obj, "message_str", "") or "")]
-        raw = getattr(event.message_obj, "raw_message", None)
-        if isinstance(raw, dict) and isinstance(raw.get("raw_message"), str):
-            candidates.append(raw["raw_message"])
-        try:
-            astrbot_config = self.context.get_config(
-                getattr(event, "unified_msg_origin", None)
-            )
-            configured = astrbot_config.get("wake_prefix", ["/"])
-        except Exception:  # noqa: BLE001 - 兼容不同 AstrBot 配置代理实现。
-            configured = ["/"]
-        if isinstance(configured, str):
-            prefixes = [configured]
-        elif isinstance(configured, (list, tuple, set)):
-            prefixes = configured
-        else:
-            prefixes = ["/"]
-        return any(
-            prefix and candidate.strip().startswith(str(prefix))
-            for prefix in prefixes
-            for candidate in candidates
-        )
-
-    @staticmethod
-    def _call_input(event: AstrMessageEvent) -> tuple[str, list[str]]:
-        """优先解析原始消息，避免框架加工的昵称与正文改变调用边界。"""
-        raw = getattr(event.message_obj, "raw_message", None)
-        if isinstance(raw, dict) and isinstance(raw.get("message"), list):
-            segments = raw["message"]
-            if any(not isinstance(item, dict) for item in segments):
-                return "", []
-            return parse_command_segments(segments, str(event.get_self_id() or ""))
-        if isinstance(raw, dict):
-            raw_text = raw.get("message")
-            if not isinstance(raw_text, str):
-                raw_text = raw.get("raw_message")
-            if isinstance(raw_text, str):
-                messages = OneBotQuoteExtractor._payload_components(
-                    {"message": raw_text}
-                )
-            else:
-                return "", []
-        else:
-            messages = event.get_messages()
-        segments = []
-        for item in messages:
-            if isinstance(item, Comp.Plain):
-                segments.append({"type": "text", "data": {"text": item.text}})
-            elif isinstance(item, Comp.At):
-                segments.append({"type": "at", "data": {"qq": item.qq}})
-            elif isinstance(item, (Comp.Reply, _RawReply)):
-                segments.append({"type": "reply"})
-            else:
-                segments.append({"type": "other"})
-        return parse_command_segments(segments, str(event.get_self_id() or ""))
-
-    @staticmethod
-    def _mentioned_users(event: AstrMessageEvent) -> list[str]:
-        return IconicQuotesPlugin._call_input(event)[1]
-
-    @staticmethod
-    def _plain_text(event: AstrMessageEvent) -> str:
-        return IconicQuotesPlugin._call_input(event)[0]
-
-    @staticmethod
-    def _is_bot_message(event: AstrMessageEvent) -> bool:
-        if str(event.get_sender_id()) == str(event.get_self_id()):
-            return True
-        raw = getattr(event.message_obj, "raw_message", None)
-        sender = raw.get("sender", {}) if isinstance(raw, dict) else {}
-        return bool(sender.get("is_bot") or sender.get("is_robot"))
-
-    @staticmethod
-    def _record_author_name(record: QuoteRecord) -> str:
-        if record.type == "message" and record.author:
-            return record.author.nickname or record.author.user_id or "未知用户"
-        return "合并转发"
-
-    @staticmethod
-    def _display_time(value: str | None) -> str:
-        if not value:
-            return "无"
-        try:
-            return (
-                datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %H:%M:%S")
-            )
-        except ValueError:
-            return value
-
-    @staticmethod
-    def _format_bytes(value: int) -> str:
-        number = float(value)
-        for unit in ("B", "KB", "MB", "GB"):
-            if number < 1024 or unit == "GB":
-                return f"{number:.1f} {unit}"
-            number /= 1024
-        return f"{number:.1f} GB"

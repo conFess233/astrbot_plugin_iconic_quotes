@@ -7,6 +7,7 @@ from .quote import (
     QuoteRecord,
     QuoteSegment,
     ReplySnapshot,
+    remove_forward_node,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "QuoteRecord",
     "QuoteSegment",
     "ReplySnapshot",
+    "remove_forward_node",
 ]

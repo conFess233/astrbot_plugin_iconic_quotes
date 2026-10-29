@@ -1,8 +1,13 @@
-"""插件配置校验、默认值与群级覆盖。"""
+"""插件配置校验、默认值与群级覆盖。
+
+全局配置保存在宿主 AstrBotConfig；群级覆盖与作者别名保存在 SQLite，
+由插件初始化时载入，二者合成同一份经过校验的快照。
+"""
 
 from __future__ import annotations
 
 import copy
+import re
 from string import Formatter
 from typing import Any
 
@@ -42,11 +47,13 @@ GROUP_OVERRIDE_KEYS = {
     "help_enabled",
     "help_keywords",
     "help_roles",
+    "help_send_mode",
     *HELP_TEMPLATE_KEYS,
     "send_count",
     "random_send_count",
     "send_mode",
     "aggregate_multiple",
+    "forward_hint_nodes",
     "allow_bot_authors",
     "max_records_per_group",
     "add_roles",
@@ -66,7 +73,6 @@ DEFAULTS: dict[str, Any] = {
     "poke_enabled": False,
     "poke_send_count": 1,
     "poke_send_mode": "text",
-    "storage_subdir": "iconic_quotes",
     "add_keyword_enabled": True,
     "add_keywords": ["添加群典"],
     "query_keyword_enabled": True,
@@ -79,6 +85,8 @@ DEFAULTS: dict[str, Any] = {
     "help_enabled": True,
     "help_keywords": ["help", "帮助"],
     "help_roles": ["everyone"],
+    # 主动帮助的发送方式；卡片渲染失败时自动改用文字。
+    "help_send_mode": "card",
     "help_overview_template": (
         "群典帮助\n"
         "添加：引用消息或携带合并转发后发送 /添加群典；关键词：{add_keywords}\n"
@@ -111,6 +119,8 @@ DEFAULTS: dict[str, Any] = {
     "random_send_count": False,
     "send_mode": "text",
     "aggregate_multiple": True,
+    # 发送合并转发时是否插入“群典存档回放”“引用丢失提示”等提示节点。
+    "forward_hint_nodes": True,
     "allow_bot_authors": False,
     "add_roles": ["everyone"],
     "query_roles": ["everyone"],
@@ -122,9 +132,6 @@ DEFAULTS: dict[str, Any] = {
     "user_blacklist": [],
     "user_whitelist": [],
     "excluded_author_ids": [],
-    "group_overrides": {},
-    # 作者别名只用于合并转发节点和回复快照，不会改写普通消息作者。
-    "author_aliases": {},
     "global_cooldown_ms": 1000,
     "cooldown_message": "群典功能冷却中...",
     "delete_preview_limit": 20,
@@ -134,14 +141,24 @@ DEFAULTS: dict[str, Any] = {
     "nested_forward_fallback_message": "原生多层嵌套发送失败，以下内容已降级展开。",
     "nested_forward_unknown_message": "多层群典发送结果未知，为避免重复发送，本次未执行降级，请检查群消息。",
     "audit_limit": 10000,
-    "card_width": 1200,
+    "card_width": 960,
     "card_min_height": 480,
-    "card_max_height": 2000,
+    "card_max_height": 2400,
     "card_custom_css": "",
     "card_auto_height": True,
+    "card_theme": "light",
+    "card_scale": "high",
+    # 留空时使用 AstrBot 的文转图设置；填写后插件直接请求该服务（可本地部署）。
+    "card_t2i_endpoint": "",
+    "card_t2i_timeout_s": 30,
     "localize_avatars": False,
     "avatar_cache_ttl_days": 7,
 }
+
+
+# 2.0 起群级数据保存在 SQLite；schema 中与 storage_subdir 一起暂保留为 invisible，
+# 只供首次启动从宿主配置迁移读取。
+GROUP_DATA_KEYS = ("group_overrides", "author_aliases")
 
 
 class SettingsService:
@@ -149,10 +166,35 @@ class SettingsService:
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
-        self._snapshot = self._validate({**DEFAULTS, **dict(config)})
+        self._snapshot = self._validate(self._candidate({}, {}, {}))
+
+    def _candidate(
+        self,
+        payload: dict[str, Any],
+        overrides: dict[str, Any] | None = None,
+        aliases: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        host = {key: self.config[key] for key in DEFAULTS if key in self.config}
+        values = {**DEFAULTS, **host}
+        values["group_overrides"] = (
+            overrides
+            if overrides is not None
+            else self._snapshot.get("group_overrides", {})
+        )
+        values["author_aliases"] = (
+            aliases if aliases is not None else self._snapshot.get("author_aliases", {})
+        )
+        values.update({key: value for key, value in payload.items() if key in values})
+        return values
+
+    def attach_group_data(
+        self, overrides: dict[str, Any], aliases: dict[str, Any]
+    ) -> None:
+        """载入 SQLite 中的群级数据；无效时抛出异常，由调用方决定降级。"""
+        self._snapshot = self._validate(self._candidate({}, overrides, aliases))
 
     def global_settings(self) -> dict[str, Any]:
-        """返回已校验全局配置的独立副本，供管理页面及导出使用。"""
+        """返回已校验全局配置（含群级数据）的独立副本。"""
         return copy.deepcopy(self._snapshot)
 
     def for_group(self, group_id: str) -> dict[str, Any]:
@@ -160,7 +202,7 @@ class SettingsService:
         values = {
             key: value
             for key, value in self._snapshot.items()
-            if key not in {"group_overrides", "author_aliases"}
+            if key not in GROUP_DATA_KEYS
         }
         values.update(self._snapshot["group_overrides"].get(str(group_id), {}))
         values["author_aliases"] = {
@@ -170,18 +212,22 @@ class SettingsService:
 
     def validate_update(self, payload: dict[str, Any]) -> dict[str, Any]:
         """校验候选配置，尚不更新业务快照或宿主配置。"""
-        return self._validate({**DEFAULTS, **dict(self.config), **payload})
+        if not isinstance(payload, dict):
+            raise TypeError("配置必须是对象")
+        return self._validate(self._candidate(payload))
 
     def publish(self, values: dict[str, Any]) -> None:
         """保存成功后一次性发布已校验快照。"""
         self._snapshot = copy.deepcopy(values)
 
-    def update_from_page(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """仅供隔离预检对象使用；真实保存通过管理 API 统一提交。"""
-        values = self.validate_update(payload)
-        self.config.update({key: values[key] for key in DEFAULTS})
-        self.publish(values)
-        return values
+    @staticmethod
+    def host_values(values: dict[str, Any]) -> dict[str, Any]:
+        """快照中应写回宿主配置的部分。"""
+        return {key: values[key] for key in DEFAULTS}
+
+    @classmethod
+    def validate_aliases(cls, value: Any) -> dict[str, dict[str, list[str]]]:
+        return cls._author_aliases(value)
 
     @staticmethod
     def _id_list(value: Any, label: str) -> list[str]:
@@ -287,6 +333,7 @@ class SettingsService:
             "card_width": (480, 3000),
             "card_min_height": (240, 3000),
             "card_max_height": (480, 6000),
+            "card_t2i_timeout_s": (5, 120),
             "avatar_cache_ttl_days": (0, 3650),
         }
         for key, (minimum, maximum) in integer_ranges.items():
@@ -299,10 +346,23 @@ class SettingsService:
             result[key] = number
         if result["card_min_height"] > result["card_max_height"]:
             raise ValueError("卡片最小高度不能大于最大高度")
+        if result.get("card_theme") not in {"light", "dark"}:
+            raise ValueError("card_theme 只能是 light 或 dark")
+        if result.get("card_scale") not in {"normal", "high", "ultra"}:
+            raise ValueError("card_scale 只能是 normal、high 或 ultra")
+        endpoint = str(result.get("card_t2i_endpoint") or "").strip()
+        if endpoint and (
+            len(endpoint) > 500
+            or not re.fullmatch(r"https?://[^\s/]+(/[^\s]*)?", endpoint)
+        ):
+            raise ValueError("文转图服务地址必须是 http:// 或 https:// 开头的 URL")
+        result["card_t2i_endpoint"] = endpoint
         if result.get("send_mode") not in {"text", "card"}:
             raise ValueError("send_mode 只能是 text 或 card")
         if result.get("poke_send_mode") not in {"text", "card"}:
             raise ValueError("poke_send_mode 只能是 text 或 card")
+        if result.get("help_send_mode") not in {"text", "card"}:
+            raise ValueError("help_send_mode 只能是 text 或 card")
         if result.get("burst_time_mode") not in {"text", "native", "none"}:
             raise ValueError("burst_time_mode 只能是 text、native 或 none")
         for key in (
@@ -312,6 +372,7 @@ class SettingsService:
             "burst_keyword_enabled",
             "help_enabled",
             "aggregate_multiple",
+            "forward_hint_nodes",
             "random_send_count",
             "allow_bot_authors",
             "retry_on_ambiguous_failure",
