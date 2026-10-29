@@ -1,4 +1,8 @@
-"""插件配置校验、默认值与群级覆盖。"""
+"""插件配置校验、默认值与群级覆盖。
+
+全局配置保存在宿主 AstrBotConfig；群级覆盖与作者别名保存在 SQLite，
+由插件初始化时载入，二者合成同一份经过校验的快照。
+"""
 
 from __future__ import annotations
 
@@ -66,7 +70,6 @@ DEFAULTS: dict[str, Any] = {
     "poke_enabled": False,
     "poke_send_count": 1,
     "poke_send_mode": "text",
-    "storage_subdir": "iconic_quotes",
     "add_keyword_enabled": True,
     "add_keywords": ["添加群典"],
     "query_keyword_enabled": True,
@@ -122,9 +125,6 @@ DEFAULTS: dict[str, Any] = {
     "user_blacklist": [],
     "user_whitelist": [],
     "excluded_author_ids": [],
-    "group_overrides": {},
-    # 作者别名只用于合并转发节点和回复快照，不会改写普通消息作者。
-    "author_aliases": {},
     "global_cooldown_ms": 1000,
     "cooldown_message": "群典功能冷却中...",
     "delete_preview_limit": 20,
@@ -144,15 +144,45 @@ DEFAULTS: dict[str, Any] = {
 }
 
 
+# 2.0 起群级数据保存在 SQLite；schema 中与 storage_subdir 一起暂保留为 invisible，
+# 只供首次启动从宿主配置迁移读取。
+GROUP_DATA_KEYS = ("group_overrides", "author_aliases")
+
+
 class SettingsService:
     """提供经过边界收敛的配置快照。"""
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
-        self._snapshot = self._validate({**DEFAULTS, **dict(config)})
+        self._snapshot = self._validate(self._candidate({}, {}, {}))
+
+    def _candidate(
+        self,
+        payload: dict[str, Any],
+        overrides: dict[str, Any] | None = None,
+        aliases: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        host = {key: self.config[key] for key in DEFAULTS if key in self.config}
+        values = {**DEFAULTS, **host}
+        values["group_overrides"] = (
+            overrides
+            if overrides is not None
+            else self._snapshot.get("group_overrides", {})
+        )
+        values["author_aliases"] = (
+            aliases if aliases is not None else self._snapshot.get("author_aliases", {})
+        )
+        values.update({key: value for key, value in payload.items() if key in values})
+        return values
+
+    def attach_group_data(
+        self, overrides: dict[str, Any], aliases: dict[str, Any]
+    ) -> None:
+        """载入 SQLite 中的群级数据；无效时抛出异常，由调用方决定降级。"""
+        self._snapshot = self._validate(self._candidate({}, overrides, aliases))
 
     def global_settings(self) -> dict[str, Any]:
-        """返回已校验全局配置的独立副本，供管理页面及导出使用。"""
+        """返回已校验全局配置（含群级数据）的独立副本。"""
         return copy.deepcopy(self._snapshot)
 
     def for_group(self, group_id: str) -> dict[str, Any]:
@@ -160,7 +190,7 @@ class SettingsService:
         values = {
             key: value
             for key, value in self._snapshot.items()
-            if key not in {"group_overrides", "author_aliases"}
+            if key not in GROUP_DATA_KEYS
         }
         values.update(self._snapshot["group_overrides"].get(str(group_id), {}))
         values["author_aliases"] = {
@@ -170,18 +200,22 @@ class SettingsService:
 
     def validate_update(self, payload: dict[str, Any]) -> dict[str, Any]:
         """校验候选配置，尚不更新业务快照或宿主配置。"""
-        return self._validate({**DEFAULTS, **dict(self.config), **payload})
+        if not isinstance(payload, dict):
+            raise TypeError("配置必须是对象")
+        return self._validate(self._candidate(payload))
 
     def publish(self, values: dict[str, Any]) -> None:
         """保存成功后一次性发布已校验快照。"""
         self._snapshot = copy.deepcopy(values)
 
-    def update_from_page(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """仅供隔离预检对象使用；真实保存通过管理 API 统一提交。"""
-        values = self.validate_update(payload)
-        self.config.update({key: values[key] for key in DEFAULTS})
-        self.publish(values)
-        return values
+    @staticmethod
+    def host_values(values: dict[str, Any]) -> dict[str, Any]:
+        """快照中应写回宿主配置的部分。"""
+        return {key: values[key] for key in DEFAULTS}
+
+    @classmethod
+    def validate_aliases(cls, value: Any) -> dict[str, dict[str, list[str]]]:
+        return cls._author_aliases(value)
 
     @staticmethod
     def _id_list(value: Any, label: str) -> list[str]:

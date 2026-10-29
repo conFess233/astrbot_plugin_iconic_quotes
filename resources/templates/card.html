@@ -1,0 +1,31 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: transparent; }
+.quote-card {
+  width: {{ width }}px; min-height: {{ min_height }}px; max-height: {{ max_height }}px;
+  overflow: hidden; display: grid; grid-template-columns: 250px 1fr; gap: 42px;
+  padding: 54px; color: #29251f; background: linear-gradient(135deg, #f7f2e8, #e9dfcc);
+  border: 2px solid rgba(91, 70, 42, .2); border-radius: 28px;
+  font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+}
+.avatar { width: 220px; height: 220px; border-radius: 50%; object-fit: cover; background: rgba(255,255,255,.55); }
+.avatar.empty { border: 2px dashed rgba(91,70,42,.25); }
+.content { min-width: 0; display: flex; flex-direction: column; align-self: start; }
+.quote { font-size: 42px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.quote::before { content: "“"; font-size: 72px; color: #9a6d38; vertical-align: -.2em; }
+.quote::after { content: "”"; font-size: 72px; color: #9a6d38; vertical-align: -.2em; }
+.images { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 24px; }
+.images img { width: 100%; max-height: 460px; object-fit: contain; border-radius: 14px; background: rgba(255,255,255,.48); }
+.meta { margin-top: 28px; text-align: right; color: #625746; font-size: 25px; line-height: 1.45; }
+.page { opacity: .65; font-size: 19px; }
+{{ custom_css }}
+</style></head><body>
+<article class="quote-card">
+  {% if avatar %}<img class="avatar" src="{{ avatar }}">{% else %}<div class="avatar empty"></div>{% endif %}
+  <section class="content">
+    <div class="quote">{{ text }}</div>
+    {% if images %}<div class="images">{% for image in images %}<img src="{{ image }}">{% endfor %}</div>{% endif %}
+    <div class="meta"><div>{{ nickname }}</div><div>{{ recorded_at }}</div>{% if pages > 1 %}<div class="page">{{ page }}/{{ pages }}</div>{% endif %}</div>
+  </section>
+</article></body></html>
