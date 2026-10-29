@@ -17,7 +17,7 @@ from astrbot.api import logger
 
 from ..models import QuoteRecord
 from ..utils.hashing import calculate_record_hash, normalize_search
-from ..utils.help import operation_usage, render_help_template
+from ..utils.help import build_help_text, operation_usage
 from ..utils.randomization import resolve_send_count
 from ..utils.timefmt import error_reason, local_time
 from .avatar_cache import AvatarCacheService
@@ -643,22 +643,7 @@ class QuoteOperations:
         if not values["help_enabled"]:
             await self.sender.text(event, ctx, "群典帮助功能未启用。")
             return
-        overview = render_help_template(values["help_overview_template"], values)
-        if not overview:
-            sections = [
-                f"{label}：{usage}"
-                for operation, label in (
-                    ("add", "添加"),
-                    ("query", "查询"),
-                    ("burst", "爆典"),
-                    ("info", "统计"),
-                    ("delete", "删除"),
-                    ("help", "帮助"),
-                )
-                if (usage := operation_usage(values, operation))
-            ]
-            overview = "群典帮助" + ("\n" + "\n".join(sections) if sections else "")
-        overview += "\n支持 @成员 群典 或 群典 @成员；关键词前最多一个成员 @，也可引用消息或 @Bot。"
+        overview = build_help_text(values)
         if values["help_send_mode"] == "card" and await self._send_help_card(
             event, ctx, overview
         ):

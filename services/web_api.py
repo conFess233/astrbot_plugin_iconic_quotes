@@ -24,8 +24,10 @@ from astrbot.api.web import (
     request,
 )
 
-from ..models import QuoteRecord, remove_forward_node
+from ..models import AuthorSnapshot, QuoteRecord, QuoteSegment, remove_forward_node
 from ..utils.hashing import calculate_record_hash, normalize_search
+from ..utils.help import build_help_text
+from ..utils.timefmt import error_reason, now_iso
 from ..utils.validation import validate_numeric_id
 from .avatar_cache import AvatarCacheService
 from .backup import BackupService
@@ -39,6 +41,8 @@ from .storage import QuoteStorage, StorageError
 IMPORT_TOKEN_SECONDS = 600
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
 MAX_PREVIEW_BYTES = 20 * 1024 * 1024
+MAX_PREVIEW_TEXT = 2000
+PREVIEW_TEXT = "今晚谁再说一句“最后一把”，我就把网线拔了。"
 
 Handler = Callable[..., Awaitable[Any]]
 
@@ -124,6 +128,7 @@ class WebApi:
             ("backup/import", self.import_backup, ["POST"], "预检导入备份"),
             ("backup/import/commit", self.commit_import, ["POST"], "确认导入备份"),
             ("preview", self.preview, ["POST"], "预览卡片"),
+            ("preview/draft", self.preview_draft, ["POST"], "用配置草稿预览卡片"),
             ("media-data", self.media_data, ["GET"], "预览群典图片"),
             ("avatar-data", self.avatar_data, ["GET"], "预览本地头像"),
             ("avatars/stats", self.avatar_stats, ["GET"], "头像缓存统计"),
@@ -477,22 +482,67 @@ class WebApi:
         if record.type != "message":
             raise ApiError("合并转发不生成卡片预览")
         if record.has_native_segments():
-            raise ApiError("包含表情、贴纸或回复快照的记录不生成 CSS 卡片")
+            raise ApiError("包含表情、贴纸或回复快照的记录不生成卡片")
+        return {
+            "images": await self._render_images(
+                self.cards.card_paths(record, self.settings.for_group(group_id))
+            )
+        }
+
+    @endpoint
+    async def preview_draft(self) -> dict[str, Any]:
+        """用配置草稿（含未保存的修改）渲染示例群典卡片或帮助卡片。"""
+        payload = await self._json()
+        draft = payload.get("config")
+        if not isinstance(draft, dict):
+            raise ApiError("缺少配置草稿")
+        try:
+            values = self.settings.validate_update(draft)
+        except (TypeError, ValueError) as exc:
+            raise ApiError(f"草稿中有无效配置：{exc}") from exc
+        if payload.get("kind") == "help":
+            return {
+                "images": await self._render_images(
+                    self._single(
+                        self.cards.help_card_path(build_help_text(values), values)
+                    )
+                )
+            }
+        sample = str(payload.get("text") or "").strip() or PREVIEW_TEXT
+        if len(sample) > MAX_PREVIEW_TEXT:
+            raise ApiError(f"示例文字不能超过 {MAX_PREVIEW_TEXT} 个字符")
+        record = QuoteRecord(
+            id="preview",
+            type="message",
+            group_id="0",
+            author=AuthorSnapshot(nickname=str(request.username or "群友")),
+            segments=[QuoteSegment(type="text", text=sample)],
+            recorded_at=now_iso(),
+        )
+        return {
+            "images": await self._render_images(self.cards.card_paths(record, values))
+        }
+
+    @staticmethod
+    async def _single(render: Awaitable[str]) -> list[str]:
+        return [await render]
+
+    @staticmethod
+    async def _render_images(render: Awaitable[list[str]]) -> list[str]:
+        """等待渲染完成，转为 data URL 并删除临时文件；失败原因原样提示，便于排查文转图服务。"""
         paths: list[str] = []
         try:
             try:
-                paths = await self.cards.card_paths(
-                    record, self.settings.for_group(group_id)
-                )
+                paths = await render
             except Exception as exc:
-                raise ApiError("卡片预览生成失败") from exc
+                raise ApiError(f"卡片生成失败：{error_reason(exc)}") from exc
             images = []
             for path in paths:
                 data = await asyncio.to_thread(Path(path).read_bytes)
                 images.append(
                     f"data:image/png;base64,{base64.b64encode(data).decode()}"
                 )
-            return {"images": images}
+            return images
         finally:
             for path in paths:
                 with contextlib.suppress(OSError):

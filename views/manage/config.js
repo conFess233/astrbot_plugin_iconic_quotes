@@ -1,7 +1,7 @@
 // 配置模块：全局配置、群聊覆盖、高级 JSON 三种编辑方式共用一份草稿；
 // 右侧卡片列出全部改动，右下悬浮按钮变形为唯一的保存入口。
 
-import { $, $$, bridge, confirmAction, el, hydrate, icon, reducedMotion, segBar, toast } from "./core.js";
+import { $, $$, bridge, busy, confirmAction, el, hydrate, icon, openLightbox, reducedMotion, segBar, toast } from "./core.js";
 
 const ROLE_OPTIONS = [["bot_admin", "Bot 管理员"], ["owner", "群主"], ["admin", "群管理员"], ["member", "群成员"], ["everyone", "所有人"]];
 
@@ -403,6 +403,7 @@ function changed(key, changedNow) {
   }
   updateTabDots();
   renderDraft();
+  markPreviewStale();
 }
 
 // ── 分区标签与范围 ───────────────────────────
@@ -458,16 +459,79 @@ function sectionCard(section, rows) {
     rows);
 }
 
+// ── 卡片预览：用当前草稿渲染，未保存的修改也会生效 ───
+
+const PREVIEW_KINDS = { card: "quote", help: "help" };
+const previews = {};
+
+function previewPanel(sectionId) {
+  const kind = PREVIEW_KINDS[sectionId];
+  const last = previews[kind];
+  const result = el("div.preview-result", { "aria-live": "polite" });
+  const stale = el("p.preview-stale", { text: "草稿已有新的修改，重新生成可查看最新效果。", hidden: true });
+  const sample = kind === "quote"
+    ? el("textarea.input.area", { rows: 2, placeholder: "示例文字（留空使用默认句子）", "aria-label": "示例文字" })
+    : null;
+  if (sample && last?.text) sample.value = last.text;
+  const button = el("button.btn.btn-tonal", { type: "button", icon: "image" }, "生成预览");
+  const showImages = (images) => {
+    const buttons = images.map((url, index) => el("button.thumb.preview-thumb", {
+      type: "button",
+      "aria-label": `放大查看第 ${index + 1} 张`,
+    }, el("img", { src: url, alt: `卡片预览第 ${index + 1} 张` })));
+    buttons.forEach((thumb, index) => thumb.addEventListener("click", () => openLightbox(buttons, index)));
+    result.replaceChildren(el("div.preview-images", {}, buttons));
+  };
+  button.addEventListener("click", () => busy(button, "生成中", async () => {
+    const draft = JSON.stringify(state.draft);
+    try {
+      const response = await bridge.apiPost("preview/draft", {
+        kind,
+        config: state.draft,
+        text: sample ? sample.value : "",
+      });
+      previews[kind] = { images: response.images || [], draft, text: sample?.value || "" };
+      stale.hidden = true;
+      showImages(previews[kind].images);
+    } catch (error) {
+      result.replaceChildren(el("div.inline-error", { role: "alert", text: error.message }));
+    }
+  }));
+  if (last) {
+    showImages(last.images);
+    stale.hidden = last.draft === JSON.stringify(state.draft);
+  } else {
+    result.append(el("p.muted", { text: "生成后在这里显示，点击图片可放大。" }));
+  }
+  return el("div.preview-panel", { dataset: { previewKind: kind } },
+    el("div.preview-head", {},
+      el("div", {}, el("strong", { text: kind === "help" ? "帮助卡片预览" : "群典卡片预览" }),
+        el("p.muted", { text: "使用当前草稿，未保存的修改也会生效；渲染走所配置的文转图服务。" })),
+      button),
+    sample,
+    stale,
+    result);
+}
+
+function markPreviewStale() {
+  const panel = $("#config-body [data-preview-kind]");
+  const last = panel && previews[panel.dataset.previewKind];
+  if (!last) return;
+  $(".preview-stale", panel).hidden = last.draft === JSON.stringify(state.draft);
+}
+
 function renderGlobal() {
   const section = SECTIONS.find((item) => item.id === state.section);
-  return [sectionCard(section, section.fields.map((field) => formRow(
+  const card = sectionCard(section, section.fields.map((field) => formRow(
     field,
     !same(state.saved[field.key], state.draft[field.key]),
     control(field, state.draft[field.key], (value) => {
       state.draft[field.key] = value;
       changed(field.key, !same(state.saved[field.key], value));
     }, { id: `cfg-${field.key}` }),
-  )))];
+  )));
+  if (PREVIEW_KINDS[section.id]) card.append(previewPanel(section.id));
+  return [card];
 }
 
 function overrideRow(field) {
