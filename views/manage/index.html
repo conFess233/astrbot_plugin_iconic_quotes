@@ -90,6 +90,7 @@
         <div class="section-head">
           <h2>配置</h2>
           <div id="scope" class="segmented" role="radiogroup" aria-label="编辑范围">
+            <span class="seg-pill" aria-hidden="true"></span>
             <button type="button" role="radio" class="on" aria-checked="true" data-scope="global">全局</button>
             <button type="button" role="radio" aria-checked="false" data-scope="override">群聊覆盖</button>
             <button type="button" role="radio" aria-checked="false" data-scope="json">高级 JSON</button>
@@ -98,7 +99,7 @@
         <div class="ruler" aria-hidden="true"></div>
         <div class="layout">
           <div class="main">
-            <nav id="anchors" class="anchors" aria-label="配置分区"></nav>
+            <div id="anchors" class="tabs" role="tablist" aria-label="配置分区"></div>
             <div id="config-body" class="stack"></div>
           </div>
           <aside class="side" aria-label="未保存的改动">

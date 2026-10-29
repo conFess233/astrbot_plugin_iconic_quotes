@@ -159,35 +159,71 @@ export function changes() {
 
 export const isDirty = () => changes().length > 0;
 
+/** 当前编辑范围下某个分区是否有改动：全局看字段本身，群聊覆盖看当前群的覆盖字段。 */
 function sectionDirty(sectionId) {
+  if (state.scope === "override") {
+    const prefix = `override:${state.overrideGroup}:`;
+    return changes().some((change) => change.key.startsWith(prefix)
+      && FIELD_BY_KEY.get(change.key.slice(prefix.length))?.section === sectionId);
+  }
   return changes().some((change) => FIELD_BY_KEY.get(change.key)?.section === sectionId);
 }
 
-// ── 控件 ─────────────────────────────────────
+/** 当前编辑范围下可用的分区；群聊覆盖只显示含可覆盖字段的分区。 */
+function visibleSections() {
+  if (state.scope !== "override") return SECTIONS;
+  return SECTIONS.filter((section) => section.fields.some((field) => OVERRIDE_KEYS.includes(field.key)));
+}
+
+// ── 控件：就地更新自身状态，不触发整页重建 ───
 
 function parseLines(value) {
   return [...new Set(value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean))];
 }
 
+function fillSeg(bar, ratio) {
+  const on = Math.round(bar.children.length * Math.max(0, Math.min(1, ratio)));
+  [...bar.children].forEach((cell, index) => cell.classList.toggle("on", index < on));
+}
+
 function control(field, value, onChange, { disabled = false, id } = {}) {
   const common = { id, disabled };
+  let current = value;
   switch (field.type) {
     case "boolean": {
-      const button = el("button.switch", { ...common, type: "button", role: "switch", "aria-checked": String(Boolean(value)), class: `switch${value ? " on" : ""}`, "aria-label": field.label });
-      button.addEventListener("click", () => onChange(!value));
+      const button = el("button.switch", { ...common, type: "button", role: "switch", "aria-checked": String(Boolean(current)), class: `switch${current ? " on" : ""}`, "aria-label": field.label });
+      button.addEventListener("click", () => {
+        current = !current;
+        button.classList.toggle("on", current);
+        button.setAttribute("aria-checked", String(current));
+        onChange(current);
+      });
       return button;
     }
     case "select": {
-      const group = el("div.segmented", { role: "radiogroup", "aria-label": field.label });
+      const group = el("div.segmented", { role: "radiogroup", "aria-label": field.label }, el("span.seg-pill", { "aria-hidden": "true" }));
       field.options.forEach(([key, label]) => {
-        const option = el("button", { type: "button", role: "radio", "aria-checked": String(value === key), class: value === key ? "on" : "", disabled, text: label });
-        option.addEventListener("click", () => onChange(key));
+        const option = el("button", { type: "button", role: "radio", "aria-checked": String(current === key), class: current === key ? "on" : "", disabled, text: label, dataset: { value: key } });
+        option.addEventListener("click", () => {
+          if (current === key) return;
+          current = key;
+          $$(":scope > button", group).forEach((item) => {
+            const on = item.dataset.value === key;
+            item.classList.toggle("on", on);
+            item.setAttribute("aria-checked", String(on));
+          });
+          slide(group);
+          onChange(key);
+        });
         group.append(option);
       });
+      requestAnimationFrame(() => slide(group, true));
       return group;
     }
     case "number": {
-      const input = el("input.input.num", { ...common, type: "number", min: field.min, max: field.max, step: "1", value: String(value ?? "") });
+      const input = el("input.input.num", { ...common, type: "number", min: field.min, max: field.max, step: "1", value: String(current ?? "") });
+      const ranged = field.max - field.min <= 200;
+      const bar = ranged ? segBar(24, ((current ?? field.min) - field.min) / (field.max - field.min || 1)) : null;
       input.addEventListener("change", () => {
         const number = Number(input.value);
         if (!Number.isInteger(number) || number < field.min || number > field.max) {
@@ -200,26 +236,37 @@ function control(field, value, onChange, { disabled = false, id } = {}) {
         }
         input.removeAttribute("aria-invalid");
         input.classList.remove("err");
+        current = number;
+        if (bar) fillSeg(bar, (number - field.min) / (field.max - field.min || 1));
         onChange(number);
       });
-      if (field.max - field.min > 200) return input;
-      return el("div.seg-input", {}, el("div.row", {}, segBar(24, ((value ?? field.min) - field.min) / (field.max - field.min || 1)), input));
+      return ranged ? el("div.seg-input", {}, el("div.row", {}, bar, input)) : input;
     }
     case "list":
     case "textarea": {
       const area = el("textarea.input.area", { ...common, rows: field.type === "list" ? 3 : 4, spellcheck: "false" });
-      area.value = field.type === "list" ? (value || []).join("\n") : value || "";
+      area.value = field.type === "list" ? (current || []).join("\n") : current || "";
       area.addEventListener("change", () => onChange(field.type === "list" ? parseLines(area.value) : area.value));
       return area;
     }
     case "roles": {
       const group = el("div.role-chips", { role: "group", "aria-label": field.label });
       ROLE_OPTIONS.forEach(([key, label]) => {
-        const on = (value || []).includes(key);
-        const chip = el("button.role-chip", { type: "button", "aria-pressed": String(on), class: `role-chip${on ? " on" : ""}`, disabled, text: label });
+        const has = (current || []).includes(key);
+        const chip = el("button.role-chip", { type: "button", "aria-pressed": String(has), class: `role-chip${has ? " on" : ""}`, disabled, text: label });
         chip.addEventListener("click", () => {
-          const next = on ? value.filter((role) => role !== key) : [...value, key];
-          if (!next.length) return toast("至少保留一个角色", "info");
+          const on = current.includes(key);
+          const next = on ? current.filter((role) => role !== key) : [...current, key];
+          if (!next.length) {
+            chip.classList.remove("err");
+            void chip.offsetWidth;
+            chip.classList.add("err");
+            toast("至少保留一个角色", "info");
+            return;
+          }
+          current = next;
+          chip.classList.toggle("on", !on);
+          chip.setAttribute("aria-pressed", String(!on));
           onChange(next);
         });
         group.append(chip);
@@ -227,9 +274,9 @@ function control(field, value, onChange, { disabled = false, id } = {}) {
       return group;
     }
     case "aliases":
-      return aliasEditor(value || {}, onChange);
+      return aliasEditor(current || {}, onChange);
     default: {
-      const input = el("input.input", { ...common, type: "text", value: value ?? "" });
+      const input = el("input.input", { ...common, type: "text", value: current ?? "" });
       input.addEventListener("change", () => onChange(input.value));
       return input;
     }
@@ -239,7 +286,7 @@ function control(field, value, onChange, { disabled = false, id } = {}) {
 function aliasEditor(value, onChange) {
   const rows = Object.entries(value).flatMap(([group, targets]) =>
     Object.entries(targets).map(([user, aliases]) => ({ group, user, aliases: aliases.join("，") })));
-  const box = el("div.alias-editor");
+  const list = el("div.alias-list");
   const commit = () => {
     const result = {};
     for (const row of rows) {
@@ -252,66 +299,214 @@ function aliasEditor(value, onChange) {
     }
     onChange(result);
   };
-  const render = () => {
-    box.replaceChildren(
-      ...rows.map((row, index) => {
-        const input = (key, label, placeholder, numeric) => {
-          const node = el("input.input", { type: "text", value: row[key], placeholder, "aria-label": label, inputmode: numeric ? "numeric" : null });
-          node.addEventListener("change", () => { row[key] = node.value; commit(); });
-          return node;
-        };
-        return el("div.alias-row", {},
-          input("group", "群号", "群号", true),
-          input("user", "QQ", "QQ", true),
-          input("aliases", "别名", "别名，用逗号分隔", false),
-          el("button.icon-btn", { type: "button", "aria-label": "删除这一行", onclick: () => { rows.splice(index, 1); render(); commit(); } }, icon("x")));
-      }),
-      el("button.btn.btn-ghost.btn-sm", { type: "button", onclick: () => { rows.push({ group: state.overrideGroup || "", user: "", aliases: "" }); render(); } }, "添加别名"),
-    );
+  const rowNode = (row) => {
+    const input = (key, label, placeholder, numeric) => {
+      const node = el("input.input", { type: "text", value: row[key], placeholder, "aria-label": label, inputmode: numeric ? "numeric" : null });
+      node.addEventListener("change", () => { row[key] = node.value; commit(); });
+      return node;
+    };
+    const node = el("div.alias-row", {},
+      input("group", "群号", "群号", true),
+      input("user", "QQ", "QQ", true),
+      input("aliases", "别名", "别名，用逗号分隔", false));
+    node.append(el("button.icon-btn", {
+      type: "button",
+      "aria-label": "删除这一行",
+      onclick: () => {
+        rows.splice(rows.indexOf(row), 1);
+        leave(node);
+        commit();
+      },
+    }, icon("x")));
+    return node;
   };
-  render();
-  return box;
+  list.append(...rows.map(rowNode));
+  const add = el("button.btn.btn-ghost.btn-sm", {
+    type: "button",
+    onclick: () => {
+      const row = { group: state.overrideGroup || "", user: "", aliases: "" };
+      rows.push(row);
+      const node = rowNode(row);
+      list.append(node);
+      $("input", node).focus();
+    },
+  }, "添加别名");
+  return el("div.alias-editor", {}, list, add);
 }
 
-function formRow(field, changed, controlNode, extra) {
+/** 元素先淡出、再收起高度后移除。 */
+function leave(node, done) {
+  if (reducedMotion()) {
+    node.remove();
+    done?.();
+    return;
+  }
+  node.style.height = `${node.offsetHeight}px`;
+  node.classList.add("leaving");
+  setTimeout(() => {
+    node.classList.add("collapsing");
+    node.style.height = "0px";
+    setTimeout(() => {
+      node.remove();
+      done?.();
+    }, 200);
+  }, 160);
+}
+
+/** 滑动选中指示块：用于分区标签与分段切换。 */
+function slide(container, instant = false) {
+  if (!container) return;
+  const pill = $(":scope > .seg-pill, :scope > .tab-pill", container);
+  const active = $(":scope > .on", container);
+  if (!pill) return;
+  if (!active || !active.offsetWidth) {
+    pill.style.opacity = "0";
+    return;
+  }
+  if (instant || reducedMotion()) pill.style.transition = "none";
+  Object.assign(pill.style, {
+    opacity: "1",
+    width: `${active.offsetWidth}px`,
+    height: `${active.offsetHeight}px`,
+    transform: `translate(${active.offsetLeft}px, ${active.offsetTop}px)`,
+  });
+  if (instant) requestAnimationFrame(() => { pill.style.transition = ""; });
+}
+
+function formRow(field, isChanged, controlNode, extra) {
   const id = `cfg-${field.key}`;
-  return el("div.form-row", { class: `form-row${changed ? " changed" : ""}`, dataset: { key: field.key } },
+  return el("div.form-row", { class: `form-row${isChanged ? " changed" : ""}`, dataset: { key: field.key } },
     el("div.lbl", {}, el("label", { for: id }, el("strong", { text: field.label })), extra),
     el("div", {}, controlNode, field.hint ? el("div.help", { text: field.hint }) : null));
 }
 
-function flash(key) {
-  const row = $(`.form-row[data-key="${CSS.escape(key)}"]`);
+function flash(row) {
   if (!row || reducedMotion()) return;
+  row.classList.remove("flash");
+  void row.offsetWidth;
   row.classList.add("flash");
   setTimeout(() => row.classList.remove("flash"), 320);
 }
 
-function setValue(key, value) {
-  state.draft[key] = value;
-  update(key);
+/** 一次修改后的局部刷新：所在行的“已修改”、分区圆点、右侧差异与悬浮按钮。 */
+function changed(key, changedNow) {
+  const row = $(`#config-body .form-row[data-key="${CSS.escape(key)}"]`);
+  if (row) {
+    row.classList.toggle("changed", changedNow);
+    flash(row);
+  }
+  updateTabDots();
+  renderDraft();
 }
 
-// ── 渲染 ─────────────────────────────────────
+// ── 分区标签与范围 ───────────────────────────
 
-function renderAnchors() {
-  $("#anchors").replaceChildren(...SECTIONS.map((section) => el("a", {
-    href: `#sec-${section.id}`,
+function renderTabs() {
+  const tabs = $("#anchors");
+  const sections = visibleSections();
+  if (!sections.some((section) => section.id === state.section)) state.section = sections[0].id;
+  tabs.replaceChildren(el("span.tab-pill", { "aria-hidden": "true" }), ...sections.map((section) => el("button", {
+    type: "button",
+    role: "tab",
+    id: `tab-${section.id}`,
     class: state.section === section.id ? "on" : "",
-    "aria-current": state.section === section.id ? "true" : null,
-  }, section.title, sectionDirty(section.id) ? el("span.mod", { "aria-label": "有修改" }) : null)));
+    "aria-selected": String(state.section === section.id),
+    "aria-controls": "config-body",
+    tabindex: state.section === section.id ? "0" : "-1",
+    dataset: { section: section.id },
+  }, section.title, el("span.mod", { "aria-hidden": "true", hidden: !sectionDirty(section.id) }))));
+  requestAnimationFrame(() => slide(tabs, true));
+}
+
+function updateTabDots() {
+  $$("#anchors [data-section]").forEach((tab) => {
+    const dirty = sectionDirty(tab.dataset.section);
+    const dot = $(".mod", tab);
+    if (dot.hidden === !dirty) return;
+    dot.hidden = !dirty;
+    if (dirty && !reducedMotion()) {
+      dot.animate([{ transform: "scale(.4)", opacity: 0 }, { transform: "scale(1)", opacity: 1 }], { duration: 200, easing: "cubic-bezier(.2,.8,.2,1)" });
+    }
+  });
+}
+
+function selectSection(id, { focus = false } = {}) {
+  if (id === state.section) return;
+  const order = visibleSections().map((section) => section.id);
+  const direction = order.indexOf(id) > order.indexOf(state.section) ? 1 : -1;
+  state.section = id;
+  $$("#anchors [data-section]").forEach((tab) => {
+    const on = tab.dataset.section === id;
+    tab.classList.toggle("on", on);
+    tab.setAttribute("aria-selected", String(on));
+    tab.tabIndex = on ? 0 : -1;
+    if (on && focus) tab.focus();
+  });
+  slide($("#anchors"));
+  renderBody(direction);
+}
+
+function sectionCard(section, rows) {
+  return el("section.card.card-pad.cfg-section", { id: `sec-${section.id}`, role: "tabpanel", "aria-labelledby": `tab-${section.id}` },
+    el("div.card-title", {}, el("div", {}, el("h3", { text: section.title }), el("p", { text: section.description }))),
+    rows);
 }
 
 function renderGlobal() {
-  const saved = state.saved;
-  const draft = state.draft;
-  return SECTIONS.map((section) => el("section.card.card-pad.cfg-section", { id: `sec-${section.id}` },
-    el("div.card-title", {}, el("div", {}, el("h3", { text: section.title }), el("p", { text: section.description }))),
-    section.fields.map((field) => formRow(
-      field,
-      !same(saved[field.key], draft[field.key]),
-      control(field, draft[field.key], (value) => setValue(field.key, value), { id: `cfg-${field.key}` }),
-    ))));
+  const section = SECTIONS.find((item) => item.id === state.section);
+  return [sectionCard(section, section.fields.map((field) => formRow(
+    field,
+    !same(state.saved[field.key], state.draft[field.key]),
+    control(field, state.draft[field.key], (value) => {
+      state.draft[field.key] = value;
+      changed(field.key, !same(state.saved[field.key], value));
+    }, { id: `cfg-${field.key}` }),
+  )))];
+}
+
+function overrideRow(field) {
+  const group = state.overrideGroup;
+  const overrides = state.draft.group_overrides || (state.draft.group_overrides = {});
+  const current = () => overrides[group] || {};
+  const savedValue = () => state.saved.group_overrides?.[group]?.[field.key];
+  const enabled = Object.hasOwn(current(), field.key);
+  const toggle = el("button.switch.switch-sm", {
+    type: "button", role: "switch", "aria-checked": String(enabled), class: `switch switch-sm${enabled ? " on" : ""}`,
+    "aria-label": `覆盖${field.label}`,
+  });
+  const node = control(field, enabled ? current()[field.key] : state.draft[field.key], (value) => {
+    overrides[group] = { ...current(), [field.key]: value };
+    changed(field.key, !same(value, savedValue()));
+  }, { disabled: !enabled, id: `cfg-${field.key}` });
+  const row = formRow(field, !same(current()[field.key], savedValue()), node,
+    el("span.override-toggle", {}, toggle, enabled ? "覆盖中" : "继承全局"));
+  toggle.addEventListener("click", () => {
+    const next = { ...current() };
+    if (Object.hasOwn(next, field.key)) delete next[field.key];
+    else next[field.key] = clone(state.draft[field.key]);
+    if (Object.keys(next).length) overrides[group] = next; else delete overrides[group];
+    toggle.classList.toggle("on");
+    toggle.setAttribute("aria-checked", String(Object.hasOwn(next, field.key)));
+    // 开关动画结束后再按新的可编辑状态重建这一行。
+    setTimeout(() => {
+      const fresh = overrideRow(field);
+      row.replaceWith(fresh);
+      flash(fresh);
+      $(".switch-sm", fresh).focus();
+    }, reducedMotion() ? 0 : 200);
+    updateOverrideSummary();
+    updateTabDots();
+    renderDraft();
+  });
+  return row;
+}
+
+function updateOverrideSummary() {
+  const count = Object.keys(state.draft.group_overrides?.[state.overrideGroup] || {}).length;
+  const summary = $("#override-summary");
+  if (summary && state.overrideGroup) summary.textContent = `群 ${state.overrideGroup} · ${count} 个字段覆盖中，其余继承全局配置。`;
+  const clear = $("#override-clear");
+  if (clear) clear.disabled = !count;
 }
 
 function renderOverride() {
@@ -320,7 +515,7 @@ function renderOverride() {
     el("option", { value: "", text: known.length ? "选择群聊" : "暂无群聊" }),
     known.map((id) => el("option", { value: id, text: `${id}${state.draft.group_overrides?.[id] ? " · 已覆盖" : ""}` })));
   select.value = state.overrideGroup;
-  select.addEventListener("change", () => { state.overrideGroup = select.value; renderBody(); });
+  select.addEventListener("change", () => openGroup(select.value));
   const input = el("input.input", { type: "text", inputmode: "numeric", placeholder: "或输入群号", "aria-label": "输入群号" });
   const open = el("button.btn.btn-ghost", { type: "button", text: "打开" });
   open.addEventListener("click", () => {
@@ -329,47 +524,36 @@ function renderOverride() {
       input.classList.remove("err");
       void input.offsetWidth;
       input.classList.add("err");
-      return toast("群号必须是正整数", "bad");
+      toast("群号必须是正整数", "bad");
+      return;
     }
-    state.overrideGroup = value;
-    renderBody();
+    openGroup(value);
+  });
+  const clear = el("button.btn.btn-danger.btn-sm", { id: "override-clear", type: "button", text: "清空本群覆盖" });
+  clear.addEventListener("click", async () => {
+    const group = state.overrideGroup;
+    const count = Object.keys(state.draft.group_overrides?.[group] || {}).length;
+    if (!await confirmAction({ title: "清空群聊覆盖", message: `将从草稿中移除群 ${group} 的 ${count} 个覆盖字段，保存后生效。`, confirm: "清空覆盖" })) return;
+    delete state.draft.group_overrides[group];
+    refresh();
   });
   const picker = el("div.card.card-pad", {},
-    el("div.card-title", {}, el("div", {}, el("h3", { text: "群聊覆盖" }), el("p", { text: "只覆盖打开开关的字段，其余继续继承全局配置。" }))),
+    el("div.card-title", {},
+      el("div", {}, el("h3", { text: "群聊覆盖" }),
+        el("p", { id: "override-summary", text: "只覆盖打开开关的字段，其余继续继承全局配置。" })),
+      state.overrideGroup ? clear : null),
     el("div.picker", {}, el("label.field", {}, "群聊", select), el("label.field", {}, "群号", input), open));
   if (!state.overrideGroup) return [picker];
-  const group = state.overrideGroup;
-  const overrides = state.draft.group_overrides || (state.draft.group_overrides = {});
-  const current = overrides[group] || {};
-  const savedCurrent = state.saved.group_overrides?.[group] || {};
-  const rows = OVERRIDE_KEYS.map((key) => {
-    const field = FIELD_BY_KEY.get(key);
-    const enabled = Object.hasOwn(current, key);
-    const toggle = el("button.switch.switch-sm", {
-      type: "button", role: "switch", "aria-checked": String(enabled), class: `switch switch-sm${enabled ? " on" : ""}`,
-      "aria-label": `覆盖${field.label}`, title: enabled ? "取消覆盖" : "覆盖此项",
-    });
-    toggle.addEventListener("click", () => {
-      const next = { ...current };
-      if (enabled) delete next[key]; else next[key] = clone(state.draft[key]);
-      if (Object.keys(next).length) overrides[group] = next; else delete overrides[group];
-      update(key);
-    });
-    const node = control(field, enabled ? current[key] : state.draft[key], (value) => {
-      overrides[group] = { ...current, [key]: value };
-      update(key);
-    }, { disabled: !enabled, id: `cfg-${key}` });
-    return formRow(field, !same(current[key], savedCurrent[key]), node, el("span.override-toggle", {}, toggle, enabled ? "覆盖中" : "继承全局"));
-  });
-  const clear = el("button.btn.btn-danger.btn-sm", { type: "button", text: "清空本群覆盖", disabled: !Object.keys(current).length });
-  clear.addEventListener("click", async () => {
-    if (!await confirmAction({ title: "清空群聊覆盖", message: `将从草稿中移除群 ${group} 的 ${Object.keys(current).length} 个覆盖字段，保存后生效。`, confirm: "清空覆盖", danger: true })) return;
-    delete overrides[group];
-    update();
-  });
-  return [picker, el("section.card.card-pad", {},
-    el("div.card-title", {}, el("div", {}, el("h3", { text: `群 ${group}` }), el("p", { text: `${Object.keys(current).length} 个字段覆盖中` })), clear),
-    rows)];
+  const section = SECTIONS.find((item) => item.id === state.section);
+  const fields = section.fields.filter((field) => OVERRIDE_KEYS.includes(field.key));
+  return [picker, sectionCard(section, fields.map(overrideRow))];
+}
+
+function openGroup(group) {
+  state.overrideGroup = group;
+  renderScope();
+  renderBody();
+  updateOverrideSummary();
 }
 
 function renderJson() {
@@ -385,6 +569,8 @@ function renderJson() {
     } catch (exc) {
       error.hidden = false;
       error.textContent = `JSON 无法解析：${exc.message}`;
+      area.classList.remove("err");
+      void area.offsetWidth;
       area.classList.add("err");
       return;
     }
@@ -393,7 +579,7 @@ function renderJson() {
     const next = clone(state.draft);
     for (const key of Object.keys(next)) if (Object.hasOwn(parsed, key)) next[key] = parsed[key];
     state.draft = next;
-    update();
+    renderDraft();
     toast("已应用到草稿，保存前仍可继续修改");
   });
   const format = el("button.btn.btn-ghost", { type: "button", text: "重新生成" });
@@ -403,42 +589,74 @@ function renderJson() {
     error, area, el("div.inline-actions", {}, apply, format))];
 }
 
-function renderBody() {
-  $$("#scope button").forEach((button) => {
+/** 渲染当前范围与分区；direction 决定切换分区时内容从哪一侧进入。 */
+function renderBody(direction = 0) {
+  const body = $("#config-body");
+  body.replaceChildren(...(state.scope === "global" ? renderGlobal() : state.scope === "override" ? renderOverride() : renderJson()));
+  body.classList.remove("swap-left", "swap-right", "swap-up");
+  void body.offsetWidth;
+  body.classList.add(direction > 0 ? "swap-right" : direction < 0 ? "swap-left" : "swap-up");
+  hydrate(body);
+}
+
+function renderScope() {
+  $$("#scope > button").forEach((button) => {
     const on = button.dataset.scope === state.scope;
     button.classList.toggle("on", on);
     button.setAttribute("aria-checked", String(on));
   });
-  $("#anchors").hidden = state.scope !== "global";
-  if (state.scope === "global") renderAnchors();
-  const body = $("#config-body");
-  body.replaceChildren(...(state.scope === "global" ? renderGlobal() : state.scope === "override" ? renderOverride() : renderJson()));
-  hydrate(body);
+  slide($("#scope"));
+  const tabs = $("#anchors");
+  tabs.hidden = state.scope === "json" || (state.scope === "override" && !state.overrideGroup);
+  if (!tabs.hidden) renderTabs();
 }
+
+// ── 右侧差异：按键复用列表项，只让新增项淡入、移除项淡出 ──
 
 function renderDraft() {
   const list = changes();
   const card = $("#config-side");
-  card.replaceChildren(list.length
-    ? el("div.side-body", {}, el("h3", { text: `${list.length} 项改动待保存` }),
-      el("ul.diff", {}, list.map((item) => el("li", {},
-        el("span.name", { text: item.name }),
-        el("span.from", { text: item.from }),
-        el("span.to", { text: item.to })))))
-    : el("div.side-body", {}, el("h3", { text: "没有未保存的修改" }),
-      el("p.muted", { text: "修改左侧任意配置后，改动会列在这里，右下角按钮变为保存入口。保存成功后立即生效。" })));
+  let body = $(".side-body", card);
+  if (!list.length) {
+    if (!body?.classList.contains("empty-draft")) {
+      card.replaceChildren(el("div.side-body.empty-draft", {}, el("h3", { text: "没有未保存的修改" }),
+        el("p.muted", { text: "修改左侧任意配置后，改动会列在这里，右下角按钮变为保存入口。保存成功后立即生效。" })));
+    }
+    state.onChange(0);
+    return;
+  }
+  if (!body || body.classList.contains("empty-draft")) {
+    body = el("div.side-body.draft", {}, el("h3"), el("ul.diff"));
+    card.replaceChildren(body);
+  }
+  $("h3", body).textContent = `${list.length} 项改动待保存`;
+  const ul = $("ul", body);
+  const existing = new Map($$(":scope > li:not(.leaving)", ul).map((li) => [li.dataset.key, li]));
+  let previous = null;
+  for (const item of list) {
+    let li = existing.get(item.key);
+    existing.delete(item.key);
+    if (!li) {
+      li = el("li", { dataset: { key: item.key } }, el("span.name"), el("span.from"), el("span.to"));
+      if (previous) previous.after(li); else ul.prepend(li);
+    } else if ($(".to", li).textContent !== item.to && !reducedMotion()) {
+      $(".to", li).animate([{ opacity: 0.2, transform: "translateY(3px)" }, { opacity: 1, transform: "none" }], { duration: 200, easing: "cubic-bezier(.2,.8,.2,1)" });
+    }
+    $(".name", li).textContent = item.name;
+    $(".from", li).textContent = item.from;
+    $(".to", li).textContent = item.to;
+    previous = li;
+  }
+  existing.forEach((li) => leave(li));
   state.onChange(list.length);
 }
 
-/** 修改后只局部刷新：保持当前滚动位置，并闪烁所在行。 */
-function update(key) {
-  const scrollY = window.scrollY;
-  const focusedKey = document.activeElement?.closest?.(".form-row")?.dataset.key;
+/** 草稿被整体替换后（放弃、保存、清空覆盖）重建当前视图。 */
+function refresh() {
+  renderScope();
   renderBody();
   renderDraft();
-  window.scrollTo(0, scrollY);
-  if (key) flash(key);
-  if (focusedKey) $(`.form-row[data-key="${CSS.escape(focusedKey)}"] button, .form-row[data-key="${CSS.escape(focusedKey)}"] input`)?.focus({ preventScroll: true });
+  if (state.scope === "override") updateOverrideSummary();
 }
 
 // ── 加载、放弃与保存 ─────────────────────────
@@ -448,16 +666,13 @@ export async function loadConfig() {
   delete value.status;
   state.saved = clone(value);
   state.draft = clone(value);
-  if (state.saved && $("#config-body")) {
-    renderBody();
-    renderDraft();
-  }
+  if ($("#config-body")) refresh();
 }
 
 export function discard() {
   state.draft = clone(state.saved);
   $("#save-error").hidden = true;
-  update();
+  refresh();
   toast("已放弃修改");
 }
 
@@ -494,7 +709,7 @@ export async function save(button) {
     await new Promise((resolve) => setTimeout(resolve, reducedMotion() ? 0 : 600));
     state.saved = clone(saved);
     state.draft = clone(saved);
-    update();
+    refresh();
     toast("配置已校验、保存并立即生效");
   } catch (exc) {
     error.hidden = false;
@@ -512,17 +727,28 @@ export function initConfig({ groups, onChange }) {
   state.onChange = onChange;
   $("#scope").addEventListener("click", (event) => {
     const button = event.target.closest("[data-scope]");
-    if (!button) return;
+    if (!button || button.dataset.scope === state.scope) return;
     state.scope = button.dataset.scope;
+    renderScope();
     renderBody();
+    if (state.scope === "override") updateOverrideSummary();
   });
   $("#anchors").addEventListener("click", (event) => {
-    const link = event.target.closest("a");
-    if (!link) return;
+    const tab = event.target.closest("[data-section]");
+    if (tab) selectSection(tab.dataset.section);
+  });
+  $("#anchors").addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
-    state.section = link.getAttribute("href").slice(5);
-    renderAnchors();
-    $(link.getAttribute("href"))?.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
+    const order = visibleSections().map((section) => section.id);
+    const index = order.indexOf(state.section);
+    const next = event.key === "Home" ? 0 : event.key === "End" ? order.length - 1
+      : (index + (event.key === "ArrowRight" ? 1 : -1) + order.length) % order.length;
+    selectSection(order[next], { focus: true });
+  });
+  window.addEventListener("resize", () => {
+    slide($("#anchors"), true);
+    slide($("#scope"), true);
   });
   window.addEventListener("beforeunload", (event) => {
     if (isDirty()) {
@@ -530,8 +756,14 @@ export function initConfig({ groups, onChange }) {
       event.returnValue = "";
     }
   });
-  if (state.saved) {
-    renderBody();
-    renderDraft();
-  }
+  if (state.saved) refresh();
+}
+
+/** 切换到配置模块时重新对齐指示块（模块隐藏时无法测量尺寸）。 */
+export function onShowConfig() {
+  requestAnimationFrame(() => {
+    slide($("#anchors"), true);
+    slide($("#scope"), true);
+    $$("#config-body .segmented").forEach((group) => slide(group, true));
+  });
 }

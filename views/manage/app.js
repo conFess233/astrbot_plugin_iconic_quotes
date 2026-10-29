@@ -1,7 +1,7 @@
 // 群典管理页入口：顶部悬浮岛导航、右下悬浮按钮（快捷菜单 / 草稿保存胶囊）与模块装配。
 
 import { initAudit, initBackup, loadAudit, loadAvatarStats, runExport, runIntegrity } from "./backup.js";
-import { changes, discard, initConfig, isDirty, loadConfig, save } from "./config.js";
+import { changes, discard, initConfig, isDirty, loadConfig, onShowConfig, save } from "./config.js";
 import {
   $, $$, bridge, confirmAction, hydrate, installOverlays, lightboxOpen, reducedMotion, sheetOpen, task, toast,
 } from "./core.js";
@@ -31,6 +31,7 @@ function showView(name) {
   });
   $$(".view").forEach((section) => section.classList.toggle("on", section.id === `view-${name}`));
   movePill();
+  if (name === "config") onShowConfig();
   if (name === "audit") task(loadAudit);
   if (name === "backup") task(loadAvatarStats).catch(() => {});
 }
