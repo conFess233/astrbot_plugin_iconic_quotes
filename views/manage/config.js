@@ -19,6 +19,7 @@ const SECTIONS = [
     { key: "random_send_count", label: "随机发送条数", type: "boolean", hint: "每次在 1 到最大发送条数之间随机。" },
     { key: "send_mode", label: "单条发送方式", type: "select", options: [["text", "文字"], ["card", "图片卡片"]], hint: "含表情、贴纸或回复的记录始终按原消息发送。" },
     { key: "aggregate_multiple", label: "多条聚合为合并转发", type: "boolean" },
+    { key: "forward_hint_nodes", label: "合并转发中插入提示", type: "boolean", hint: "开头加入“群典存档回放”与“引用丢失提示”节点；爆典的标题与页码始终保留。" },
     { key: "allow_bot_authors", label: "允许收录 Bot 消息", type: "boolean" },
   ] },
   { id: "poke", title: "戳一戳", description: "群成员戳机器人时随机发送群典。", fields: [
@@ -98,7 +99,7 @@ const OVERRIDE_KEYS = [
   "help_enabled", "help_keywords", "help_roles",
   "help_overview_template", "help_add_template", "help_query_template", "help_burst_template",
   "help_info_template", "help_delete_template", "help_help_template",
-  "send_count", "random_send_count", "send_mode", "aggregate_multiple", "allow_bot_authors",
+  "send_count", "random_send_count", "send_mode", "aggregate_multiple", "forward_hint_nodes", "allow_bot_authors",
   "max_records_per_group", "add_roles", "query_roles", "burst_roles", "info_roles", "delete_roles",
   "user_blacklist", "user_whitelist", "excluded_author_ids",
   "nested_forward_fallback_message", "nested_forward_unknown_message",

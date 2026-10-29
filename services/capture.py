@@ -47,6 +47,41 @@ class CaptureError(RuntimeError):
     """无法完整、可靠地收录本次消息。"""
 
 
+@dataclass(slots=True, frozen=True)
+class LocalMessage:
+    """合并转发中的一条原始消息：作者、消息段、发送时间与来源群。"""
+
+    author: AuthorSnapshot
+    chain: list[Any]
+    sent_at: str | None
+    group_id: str | None
+
+
+_NODE_ID_KEYS = ("message_id", "id", "real_id", "message_seq", "real_seq")
+
+
+def _node_identifiers(raw_node: Any) -> set[str]:
+    """转发节点可被回复引用的标识；Comp.Node 没有可用 ID。"""
+    if not isinstance(raw_node, dict):
+        return set()
+    data = raw_node.get("data") if isinstance(raw_node.get("data"), dict) else raw_node
+    result = set()
+    for source in (data, raw_node):
+        for key in _NODE_ID_KEYS:
+            value = source.get(key)
+            if value not in (None, "", 0, "0") and not isinstance(value, (dict, list)):
+                result.add(str(value))
+    return result
+
+
+def _node_group(raw_node: Any) -> str | None:
+    if not isinstance(raw_node, dict):
+        return None
+    data = raw_node.get("data") if isinstance(raw_node.get("data"), dict) else raw_node
+    value = data.get("group_id") or raw_node.get("group_id")
+    return str(value) if value not in (None, "", 0, "0") else None
+
+
 @dataclass(slots=True)
 class CaptureSession:
     """一次收录的累计状态：限额计数、新写入的媒体与忽略的消息段。"""
@@ -57,6 +92,8 @@ class CaptureSession:
     images: int = 0
     nodes: int = 0
     ignored_segments: int = 0
+    # 转发树内全部节点按消息 ID / 序号索引，节点间的回复优先在本地解析。
+    local_messages: dict[str, LocalMessage] = field(default_factory=dict)
 
     @property
     def new_bytes(self) -> int:
@@ -396,12 +433,27 @@ class QuoteCapture:
             raise CaptureError("合并转发节点数超过配置上限")
         nodes: list[ForwardNode] = []
         total_text = 0
+        parsed = []
         for raw_node in raw_nodes:
             author, chain, sent_at = _parse_forward_node(raw_node)
+            local = LocalMessage(author, chain, sent_at, _node_group(raw_node))
+            for identifier in _node_identifiers(raw_node):
+                session.local_messages.setdefault(identifier, local)
+            parsed.append(local)
+        # 先登记本层全部节点，再登记子转发：回复可能指向同层后面的节点或子转发里的消息。
+        for local in parsed:
+            self._index_nested(local.chain, session)
+        for local in parsed:
+            author, chain, sent_at = local.author, local.chain, local.sent_at
             author = await self._resolve_author(event, group_id, author)
             await self._check_author_allowed(event, group_id, author, settings)
             reply_snapshot, reply_missing = await self._capture_reply(
-                event, chain, group_id, session, visited=set()
+                event,
+                chain,
+                group_id,
+                session,
+                visited=set(),
+                source_group=local.group_id,
             )
             segments: list[QuoteSegment] = []
             nested_forwards: list[NestedForward] = []
@@ -458,6 +510,24 @@ class QuoteCapture:
             )
         return nodes, total_text
 
+    @staticmethod
+    def _index_nested(chain: list[Any], session: CaptureSession) -> None:
+        """登记内联子转发中的消息（只读内联内容，不发起网络请求）。"""
+        for component in chain:
+            if not isinstance(component, RawForward) or not component.content:
+                continue
+            for raw_node in component.content:
+                try:
+                    author, child_chain, sent_at = _parse_forward_node(raw_node)
+                except CaptureError:
+                    continue
+                local = LocalMessage(
+                    author, child_chain, sent_at, _node_group(raw_node)
+                )
+                for identifier in _node_identifiers(raw_node):
+                    session.local_messages.setdefault(identifier, local)
+                QuoteCapture._index_nested(child_chain, session)
+
     async def _capture_reply(
         self,
         event: Any,
@@ -467,6 +537,7 @@ class QuoteCapture:
         *,
         visited: set[str],
         depth: int = 1,
+        source_group: str | None = None,
     ) -> tuple[ReplySnapshot | None, bool]:
         settings = session.settings
         replies = [item for item in chain if isinstance(item, REPLY_TYPES)]
@@ -497,39 +568,59 @@ class QuoteCapture:
             else []
         )
         incomplete = False
-        try:
-            payload = await self._get_message(
-                event, message_id, group_id=group_id, message_seq=message_seq
+        local = session.local_messages.get(message_id) or (
+            session.local_messages.get(message_seq) if message_seq else None
+        )
+        if local is not None:
+            # 被回复的消息就在本次转发里：直接使用转发内容，不依赖易失的消息 ID。
+            author = AuthorSnapshot(
+                user_id=local.author.user_id,
+                nickname=local.author.nickname,
+                raw_user_id=local.author.raw_user_id,
+                identity_source=local.author.identity_source,
             )
-            message_seq = (
-                str(
-                    payload.get("real_seq")
-                    or payload.get("msg_seq")
-                    or message_seq
-                    or payload.get("message_seq")
-                    or ""
+            # 回复快照不保存子转发：被回复节点中的聊天记录以文字占位。
+            reply_chain = [
+                Comp.Plain("[聊天记录]") if isinstance(item, FORWARD_TYPES) else item
+                for item in local.chain
+            ]
+        else:
+            try:
+                payload = await self._get_message(
+                    event,
+                    message_id,
+                    group_id=source_group or group_id,
+                    message_seq=message_seq,
                 )
-                or None
-            )
-            reply_chain = fallback_chain or payload_components(payload)
-            author = _payload_author(payload)
-        except CaptureError as exc:
-            logger.warning(
-                "群典：引用源无法追溯，已标记引用丢失；消息ID=%s，消息序号=%s，层级=%s，原因=%s",
-                message_id or "无",
-                message_seq or "无",
-                depth,
-                error_reason(exc),
-            )
-            if not fallback_chain:
-                # 当前正文仍可保存时，只丢弃无法追溯的更早引用关系。
-                return None, True
-            reply_chain = fallback_chain
-            incomplete = True
-            author = _as_author(
-                getattr(component, "sender_id", None),
-                getattr(component, "sender_nickname", None),
-            )
+                message_seq = (
+                    str(
+                        payload.get("real_seq")
+                        or payload.get("msg_seq")
+                        or message_seq
+                        or payload.get("message_seq")
+                        or ""
+                    )
+                    or None
+                )
+                reply_chain = fallback_chain or payload_components(payload)
+                author = _payload_author(payload)
+            except CaptureError as exc:
+                logger.warning(
+                    "群典：引用源无法追溯，已标记引用丢失；消息ID=%s，消息序号=%s，层级=%s，原因=%s",
+                    message_id or "无",
+                    message_seq or "无",
+                    depth,
+                    error_reason(exc),
+                )
+                if not fallback_chain:
+                    # 当前正文仍可保存时，只丢弃无法追溯的更早引用关系。
+                    return None, True
+                reply_chain = fallback_chain
+                incomplete = True
+                author = _as_author(
+                    getattr(component, "sender_id", None),
+                    getattr(component, "sender_nickname", None),
+                )
         author = await self._resolve_author(event, group_id, author)
         await self._check_author_allowed(event, group_id, author, settings)
         segments = await self._segments(
@@ -546,6 +637,7 @@ class QuoteCapture:
                 session,
                 visited={*visited, visit_key},
                 depth=depth + 1,
+                source_group=local.group_id if local is not None else source_group,
             )
         if not segments and nested is None and not truncated:
             raise CaptureError("被回复消息没有可保存的文字、图片或表情")

@@ -181,6 +181,7 @@ python -m pip install -r requirements.txt
 | `random_send_count`     | `false`    | 在 1 到 `send_count` 之间随机决定发送数量 |
 | `send_mode`             | `text`     | 单条发送方式：`text` 或 `card`            |
 | `aggregate_multiple`    | `true`     | 将多条普通记录聚合为合并转发              |
+| `forward_hint_nodes`    | `true`     | 合并转发开头加入“群典存档回放”“引用丢失提示”节点；爆典标题与页码始终保留 |
 
 ### 爆典
 

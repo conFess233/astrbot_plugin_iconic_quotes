@@ -284,15 +284,23 @@ class ForwardBuilder:
     # 对外构造 ---------------------------------------------------------
 
     def forward(
-        self, records: list[QuoteRecord], options: BuildOptions, *, replay: bool
+        self,
+        records: list[QuoteRecord],
+        options: BuildOptions,
+        *,
+        replay: bool,
+        hints: bool = True,
     ) -> list[Raw]:
-        """多条普通记录聚合，或一条合并转发记录的回放。"""
+        """多条普通记录聚合，或一条合并转发记录的回放。
+
+        hints 为 False 时不插入“群典存档回放”“引用丢失提示”等提示节点。
+        """
         result: list[Raw] = []
-        if replay:
+        if hints and replay:
             result.append(
                 raw_node(uin="0", name="群典", content=[_text("群典存档回放")])
             )
-        if warning := missing_reply_warning(records):
+        if hints and (warning := missing_reply_warning(records)):
             result.append(
                 raw_node(uin="0", name="引用丢失提示", content=[_text(warning)])
             )
@@ -304,9 +312,17 @@ class ForwardBuilder:
         return result
 
     def burst(
-        self, records: list[QuoteRecord], header: BurstHeader, options: BuildOptions
+        self,
+        records: list[QuoteRecord],
+        header: BurstHeader,
+        options: BuildOptions,
+        *,
+        hints: bool = True,
     ) -> list[Raw]:
-        """按时间排列的个人合集；原生模式下每条转发记录是一个子树。"""
+        """按时间排列的个人合集；原生模式下每条转发记录是一个子树。
+
+        标题节点带有页码信息，始终保留；hints 只控制引用丢失提示节点。
+        """
         title = f"聊天记录：{header.target_name}\n"
         title += (
             f"共 {header.total} 条｜第 {header.page} / {header.pages} 页"
@@ -326,7 +342,7 @@ class ForwardBuilder:
         if missing:
             title += f"\n本页有 {missing} 处媒体资源缺失"
         result = [raw_node(uin="0", name="群典", content=[_text(title)])]
-        if warning := missing_reply_warning(records):
+        if hints and (warning := missing_reply_warning(records)):
             result.append(
                 raw_node(uin="0", name="引用丢失提示", content=[_text(warning)])
             )

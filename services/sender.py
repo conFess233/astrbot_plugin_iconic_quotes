@@ -285,7 +285,11 @@ class Sender:
                     missing=ctx.missing,
                 )
                 messages = await asyncio.to_thread(
-                    self.builder.forward, [record], options, replay=False
+                    self.builder.forward,
+                    [record],
+                    options,
+                    replay=False,
+                    hints=ctx.values["forward_hint_nodes"],
                 )
                 outcome, error = await self.raw_forward(event, ctx, messages)
                 if outcome == "success":

@@ -479,7 +479,9 @@ class QuoteOperations:
         return await self.sender.forward(
             event,
             ctx,
-            lambda options: self.builder.forward(records, options, replay=replay),
+            lambda options: self.builder.forward(
+                records, options, replay=replay, hints=ctx.values["forward_hint_nodes"]
+            ),
             depth=max((record.forward_depth() for record in records), default=1),
             has_replies=any(record.has_replies() for record in records),
             has_stickers=any(record.has_stickers() for record in records),
@@ -582,7 +584,9 @@ class QuoteOperations:
         await self.sender.forward(
             event,
             ctx,
-            lambda options: self.builder.burst(selected, header, options),
+            lambda options: self.builder.burst(
+                selected, header, options, hints=values["forward_hint_nodes"]
+            ),
             depth=max(
                 record.forward_depth() + 1 if record.type == "forward" else 1
                 for record in selected

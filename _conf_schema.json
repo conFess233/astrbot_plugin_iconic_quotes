@@ -154,6 +154,12 @@
     "type": "bool",
     "default": true
   },
+  "forward_hint_nodes": {
+    "description": "合并转发中插入提示节点",
+    "type": "bool",
+    "default": true,
+    "hint": "发送合并转发群典时，是否在开头加入“群典存档回放”与“引用丢失提示”节点；爆典的标题与页码节点始终保留。支持群级覆盖。"
+  },
   "allow_bot_authors": {
     "description": "允许手动引用并收录机器人消息",
     "type": "bool",
