@@ -29,6 +29,7 @@ const SECTIONS = [
   ] },
   { id: "help", title: "帮助消息", description: "主动帮助与参数错误后附带的用法。", fields: [
     { key: "help_enabled", label: "启用帮助功能", type: "boolean", hint: "关闭后不发送主动帮助，也不附带用法。" },
+    { key: "help_send_mode", label: "帮助发送方式", type: "select", options: [["card", "图片卡片"], ["text", "文字"]], hint: "卡片沿用群典卡片的主题与文转图服务，失败时改为文字；参数错误后的用法始终为文字。" },
     { key: "help_keywords", label: "帮助子关键词", type: "list", hint: "用于 /群典 <关键词> 与 群典 <关键词>。" },
     { key: "help_overview_template", label: "总帮助模板", type: "textarea", hint: "留空时自动组合下方非空模板。" },
     { key: "help_add_template", label: "添加用法", type: "textarea" },
@@ -100,7 +101,7 @@ const OVERRIDE_KEYS = [
   "poke_enabled", "poke_send_count", "poke_send_mode",
   "add_keyword_enabled", "add_keywords", "query_keyword_enabled", "query_keywords", "max_query_keyword_chars",
   "burst_keyword_enabled", "burst_keywords", "burst_page_size", "burst_time_mode",
-  "help_enabled", "help_keywords", "help_roles",
+  "help_enabled", "help_keywords", "help_roles", "help_send_mode",
   "help_overview_template", "help_add_template", "help_query_template", "help_burst_template",
   "help_info_template", "help_delete_template", "help_help_template",
   "send_count", "random_send_count", "send_mode", "aggregate_multiple", "forward_hint_nodes", "allow_bot_authors",

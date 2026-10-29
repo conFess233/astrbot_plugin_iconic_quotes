@@ -47,6 +47,7 @@ GROUP_OVERRIDE_KEYS = {
     "help_enabled",
     "help_keywords",
     "help_roles",
+    "help_send_mode",
     *HELP_TEMPLATE_KEYS,
     "send_count",
     "random_send_count",
@@ -84,6 +85,8 @@ DEFAULTS: dict[str, Any] = {
     "help_enabled": True,
     "help_keywords": ["help", "帮助"],
     "help_roles": ["everyone"],
+    # 主动帮助的发送方式；卡片渲染失败时自动改用文字。
+    "help_send_mode": "card",
     "help_overview_template": (
         "群典帮助\n"
         "添加：引用消息或携带合并转发后发送 /添加群典；关键词：{add_keywords}\n"
@@ -358,6 +361,8 @@ class SettingsService:
             raise ValueError("send_mode 只能是 text 或 card")
         if result.get("poke_send_mode") not in {"text", "card"}:
             raise ValueError("poke_send_mode 只能是 text 或 card")
+        if result.get("help_send_mode") not in {"text", "card"}:
+            raise ValueError("help_send_mode 只能是 text 或 card")
         if result.get("burst_time_mode") not in {"text", "native", "none"}:
             raise ValueError("burst_time_mode 只能是 text、native 或 none")
         for key in (

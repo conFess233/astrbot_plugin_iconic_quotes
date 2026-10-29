@@ -207,6 +207,7 @@ docker run -itd -p 8999:8999 soulter/astrbot-t2i-service:latest
 | -------------------------- | ---------------- | ----------------------------------------- |
 | `help_enabled`             | `true`           | 启用主动帮助和参数错误后的用法提示        |
 | `help_keywords`            | `help`、`帮助`   | `/群典` 与查询关键词后的帮助子关键词      |
+| `help_send_mode`           | `card`           | 主动帮助的发送方式：`card` 图片卡片（失败时改为文字）或 `text` 文字 |
 | `help_overview_template`   | 见配置页         | 主动帮助模板；留空时组合各操作模板        |
 | `help_*_template`          | 见配置页         | 各操作用法；留空可单独关闭对应提示        |
 | `help_roles`               | `everyone`       | 主动调用帮助的权限                        |

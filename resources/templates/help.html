@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN" class="theme-{{ theme }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width={{ width }}">
+<style>
+/* 群典帮助卡片：与引用卡片共用纸面 / 墨色主题，尺寸随 width 等比缩放（1rem = width / 40）。 */
+:root {
+  --paper: #f5efe4;
+  --paper-edge: #ebe3d3;
+  --ink: #2b2620;
+  --ink-soft: #6f6556;
+  --ink-faint: #a69a86;
+  --accent: #b5532d;
+  --accent-soft: rgba(181, 83, 45, .10);
+  --rule: rgba(43, 38, 32, .12);
+  --frame: rgba(43, 38, 32, .06);
+  --code-bg: rgba(43, 38, 32, .06);
+}
+.theme-dark {
+  --paper: #1d1b19;
+  --paper-edge: #2a2724;
+  --ink: #efe7da;
+  --ink-soft: #b3a894;
+  --ink-faint: #7d7465;
+  --accent: #e3895e;
+  --accent-soft: rgba(227, 137, 94, .12);
+  --rule: rgba(239, 231, 218, .12);
+  --frame: rgba(239, 231, 218, .05);
+  --code-bg: rgba(239, 231, 218, .07);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: {{ width }}px; background: var(--paper); }
+html { font-size: calc({{ width }}px / 40); }
+body {
+  color: var(--ink);
+  font-family: "Noto Sans CJK SC", "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.card {
+  position: relative;
+  width: {{ width }}px;
+  padding: 3rem 3.4rem 2.4rem;
+  background: var(--paper);
+}
+.card::before {
+  content: "";
+  position: absolute;
+  inset: 1.1rem;
+  border: 1px solid var(--frame);
+  border-radius: .6rem;
+  pointer-events: none;
+}
+.head { display: flex; align-items: flex-end; justify-content: space-between; gap: 1rem; }
+.title {
+  font-family: "Noto Serif CJK SC", "Source Han Serif SC", "Songti SC", Georgia, serif;
+  font-size: 2.1rem;
+  font-weight: 700;
+  letter-spacing: .06em;
+  line-height: 1.2;
+}
+.subtitle { margin-top: .45rem; font-size: .78rem; color: var(--ink-soft); letter-spacing: .08em; }
+.badge {
+  flex: none;
+  padding: .32rem .8rem;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: .72rem;
+  font-weight: 700;
+  letter-spacing: .2em;
+}
+.rows { margin-top: 1.8rem; border-top: 1px solid var(--rule); }
+.row {
+  display: grid;
+  grid-template-columns: 4.6rem minmax(0, 1fr);
+  gap: 1.1rem;
+  padding: 1.05rem 0;
+  border-bottom: 1px solid var(--rule);
+}
+.label {
+  align-self: start;
+  justify-self: start;
+  margin-top: .1rem;
+  padding: .22rem .7rem;
+  border-radius: .4rem;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: .82rem;
+  font-weight: 700;
+  letter-spacing: .12em;
+  white-space: nowrap;
+}
+.body { font-size: .95rem; line-height: 1.75; overflow-wrap: anywhere; }
+.body code {
+  padding: .05rem .38rem;
+  border-radius: .3rem;
+  background: var(--code-bg);
+  font-family: "JetBrains Mono", "Cascadia Mono", "Noto Sans Mono CJK SC", Consolas, monospace;
+  font-size: .9em;
+  font-weight: 600;
+  color: var(--ink);
+}
+.body .arg { color: var(--ink-soft); font-style: normal; }
+.keywords { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; margin-top: .5rem; }
+.keywords span { font-size: .72rem; color: var(--ink-faint); letter-spacing: .06em; margin-right: .1rem; }
+.keywords b {
+  padding: .12rem .6rem;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  font-size: .78rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+.notes { margin-top: 1.3rem; display: grid; gap: .35rem; }
+.notes p {
+  position: relative;
+  padding-left: 1rem;
+  font-size: .78rem;
+  line-height: 1.7;
+  color: var(--ink-soft);
+}
+.notes p::before {
+  content: "";
+  position: absolute;
+  left: .15rem;
+  top: .68em;
+  width: .32rem;
+  height: .32rem;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: .55;
+}
+</style>
+</head>
+<body>
+<article class="card">
+  <header class="head">
+    <div>
+      <div class="title">{{ title }}</div>
+      <div class="subtitle">收录群友金句，随时翻出来回味</div>
+    </div>
+    <div class="badge">群典</div>
+  </header>
+  {% if rows %}<section class="rows">{% for row in rows %}
+    <div class="row">
+      <div class="label">{{ row.label }}</div>
+      <div>
+        <div class="body">{{ row.body }}</div>
+        {% if row.keywords %}<div class="keywords"><span>关键词</span>{% for keyword in row.keywords %}<b>{{ keyword }}</b>{% endfor %}</div>{% endif %}
+      </div>
+    </div>{% endfor %}
+  </section>{% endif %}
+  {% if notes %}<section class="notes">{% for note in notes %}<p>{{ note }}</p>{% endfor %}</section>{% endif %}
+</article>
+</body>
+</html>

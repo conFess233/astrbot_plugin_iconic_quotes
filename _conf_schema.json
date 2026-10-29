@@ -84,6 +84,14 @@
     "default": true,
     "hint": "关闭后不发送主动帮助，也不在参数错误后附带用法。"
   },
+  "help_send_mode": {
+    "description": "帮助发送方式",
+    "type": "string",
+    "options": ["card", "text"],
+    "labels": ["图片卡片", "文字"],
+    "default": "card",
+    "hint": "主动帮助（/群典 help）的发送方式；卡片使用与群典卡片相同的主题与文转图服务，渲染失败时改为文字。参数错误后附带的用法始终为文字。支持群级覆盖。"
+  },
   "help_keywords": {
     "description": "帮助子关键词",
     "type": "list",

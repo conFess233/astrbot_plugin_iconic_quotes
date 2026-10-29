@@ -8,14 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from ..models import QuoteRecord
+from ..utils.help import help_card_data
 from ..utils.timefmt import local_time
 from .avatar_cache import AvatarCacheService
 from .media import MediaStore
 from .t2i import T2IClient
 
-TEMPLATE_PATH = (
-    Path(__file__).resolve().parent.parent / "resources" / "templates" / "card.html"
-)
+TEMPLATES = Path(__file__).resolve().parent.parent / "resources" / "templates"
 TEXT_PER_PAGE = 1200
 IMAGES_PER_PAGE = 4
 # 按单页正文长度选择字号档位，短句更醒目，长文更紧凑。
@@ -34,7 +33,23 @@ class CardRenderer:
         self.t2i = t2i
         self.media = media
         self.avatars = avatars
-        self._template: str | None = None
+        self._templates: dict[str, str] = {}
+
+    async def _template(self, name: str) -> str:
+        if name not in self._templates:
+            self._templates[name] = await asyncio.to_thread(
+                (TEMPLATES / name).read_text, "utf-8"
+            )
+        return self._templates[name]
+
+    async def help_card_path(self, overview: str, settings: dict[str, Any]) -> str:
+        """把渲染后的帮助文本生成一张卡片；返回临时 PNG 路径，调用方负责删除。"""
+        data = {
+            "width": settings["card_width"],
+            "theme": settings["card_theme"],
+            **help_card_data(overview),
+        }
+        return await self.t2i.render(await self._template("help.html"), data, settings)
 
     async def card_paths(
         self, record: QuoteRecord, settings: dict[str, Any]
@@ -42,8 +57,7 @@ class CardRenderer:
         """返回临时 PNG 路径；调用方负责删除。"""
         if record.type != "message" or record.author is None:
             raise ValueError("卡片只适用于普通群典")
-        if self._template is None:
-            self._template = await asyncio.to_thread(TEMPLATE_PATH.read_text, "utf-8")
+        template = await self._template("card.html")
         text = "".join(
             segment.text or "" for segment in record.segments if segment.type == "text"
         ).strip()
@@ -86,7 +100,7 @@ class CardRenderer:
                     "page": index + 1,
                     "pages": pages,
                 }
-                paths.append(await self.t2i.render(self._template, data, settings))
+                paths.append(await self.t2i.render(template, data, settings))
         except BaseException:
             for path in paths:
                 await asyncio.to_thread(Path(path).unlink, missing_ok=True)

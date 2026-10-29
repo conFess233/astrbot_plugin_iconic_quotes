@@ -659,7 +659,33 @@ class QuoteOperations:
             ]
             overview = "群典帮助" + ("\n" + "\n".join(sections) if sections else "")
         overview += "\n支持 @成员 群典 或 群典 @成员；关键词前最多一个成员 @，也可引用消息或 @Bot。"
+        if values["help_send_mode"] == "card" and await self._send_help_card(
+            event, ctx, overview
+        ):
+            return
         await self.sender.text(event, ctx, overview)
+
+    async def _send_help_card(
+        self, event: Any, ctx: OperationContext, overview: str
+    ) -> bool:
+        """发送帮助卡片；渲染失败返回 False 由调用方改发文字，结果未知时不再补发。"""
+        path: str | None = None
+        try:
+            path = await self.cards.help_card_path(overview, ctx.values)
+            await self.sender.chain(event, ctx, [Comp.Image.fromFileSystem(path)])
+            return True
+        except AmbiguousSendError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 渲染服务异常类型不稳定，降级为文字。
+            logger.warning(
+                "群典：帮助卡片生成失败，改为文字发送；原因=%s", error_reason(exc)
+            )
+            ctx.log_override = "帮助卡片失败，已改为文字"
+            return False
+        finally:
+            if path:
+                with contextlib.suppress(OSError):
+                    Path(path).unlink(missing_ok=True)
 
     # 删除 -------------------------------------------------------------
 
