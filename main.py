@@ -34,6 +34,7 @@ from .services.renderer import CardRenderer
 from .services.sender import Sender
 from .services.settings import GROUP_DATA_KEYS, SettingsService
 from .services.storage import QuoteStorage
+from .services.t2i import T2IClient
 from .services.web_api import WebApi
 from .utils.timefmt import error_reason
 from .utils.validation import match_command_syntax
@@ -56,11 +57,12 @@ class IconicQuotesPlugin(Star):
         self.members = MemberService()
         self.avatars = AvatarCacheService(self.storage, self.data_root / "avatars")
         self.builder = ForwardBuilder(self.media)
-        self.cards = CardRenderer(
+        # 未单独配置文转图服务时走 AstrBot 的 html_render；用 lambda 便于测试替换。
+        self.t2i = T2IClient(
             lambda *args, **kwargs: self.html_render(*args, **kwargs),
-            self.media,
-            self.avatars,
+            self.data_root / "tmp",
         )
+        self.cards = CardRenderer(self.t2i, self.media, self.avatars)
         self.operations = QuoteOperations(
             settings=self.settings,
             storage=self.storage,
@@ -154,6 +156,7 @@ class IconicQuotesPlugin(Star):
         self.operations.pending_deletions.clear()
         await self.web.close()
         await self.avatars.close()
+        await self.t2i.close()
         await self.storage.close()
         logger.info("群典：已停止")
 

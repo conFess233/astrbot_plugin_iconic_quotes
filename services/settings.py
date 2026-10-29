@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from string import Formatter
 from typing import Any
 
@@ -137,11 +138,16 @@ DEFAULTS: dict[str, Any] = {
     "nested_forward_fallback_message": "原生多层嵌套发送失败，以下内容已降级展开。",
     "nested_forward_unknown_message": "多层群典发送结果未知，为避免重复发送，本次未执行降级，请检查群消息。",
     "audit_limit": 10000,
-    "card_width": 1200,
+    "card_width": 960,
     "card_min_height": 480,
-    "card_max_height": 2000,
+    "card_max_height": 2400,
     "card_custom_css": "",
     "card_auto_height": True,
+    "card_theme": "light",
+    "card_scale": "high",
+    # 留空时使用 AstrBot 的文转图设置；填写后插件直接请求该服务（可本地部署）。
+    "card_t2i_endpoint": "",
+    "card_t2i_timeout_s": 30,
     "localize_avatars": False,
     "avatar_cache_ttl_days": 7,
 }
@@ -324,6 +330,7 @@ class SettingsService:
             "card_width": (480, 3000),
             "card_min_height": (240, 3000),
             "card_max_height": (480, 6000),
+            "card_t2i_timeout_s": (5, 120),
             "avatar_cache_ttl_days": (0, 3650),
         }
         for key, (minimum, maximum) in integer_ranges.items():
@@ -336,6 +343,17 @@ class SettingsService:
             result[key] = number
         if result["card_min_height"] > result["card_max_height"]:
             raise ValueError("卡片最小高度不能大于最大高度")
+        if result.get("card_theme") not in {"light", "dark"}:
+            raise ValueError("card_theme 只能是 light 或 dark")
+        if result.get("card_scale") not in {"normal", "high", "ultra"}:
+            raise ValueError("card_scale 只能是 normal、high 或 ultra")
+        endpoint = str(result.get("card_t2i_endpoint") or "").strip()
+        if endpoint and (
+            len(endpoint) > 500
+            or not re.fullmatch(r"https?://[^\s/]+(/[^\s]*)?", endpoint)
+        ):
+            raise ValueError("文转图服务地址必须是 http:// 或 https:// 开头的 URL")
+        result["card_t2i_endpoint"] = endpoint
         if result.get("send_mode") not in {"text", "card"}:
             raise ValueError("send_mode 只能是 text 或 card")
         if result.get("poke_send_mode") not in {"text", "card"}:
