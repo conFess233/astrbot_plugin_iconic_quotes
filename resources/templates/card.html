@@ -43,8 +43,6 @@ body {
   overflow: hidden;
   padding: 3.4rem 3.4rem 2.6rem;
   background: var(--paper);
-  display: flex;
-  flex-direction: column;
 }
 /* 内框细线：只做克制的装饰 */
 .card::before {
@@ -66,12 +64,17 @@ body {
   opacity: .2;
   user-select: none;
 }
+/* 撑满内容区宽度，避免部分文转图环境把文字块收窄到一半 */
 .quote {
   position: relative;
+  display: block;
+  width: 100%;
   margin-top: 1.6rem;
   font-family: "Noto Serif CJK SC", "Source Han Serif SC", "Songti SC", "STSong", Georgia, serif;
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  word-break: normal;
+  overflow-wrap: break-word;
+  line-break: loose;
   letter-spacing: .02em;
   color: var(--ink);
 }
