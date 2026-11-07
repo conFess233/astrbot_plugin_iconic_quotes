@@ -12,6 +12,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any, TypeVar
@@ -517,16 +518,30 @@ class QuoteStorage:
         user_id: str | None = None,
         names: Iterable[str] = (),
         include_broken: bool = False,
+        needle: str = "",
+        excluded: Iterable[str] = (),
     ) -> tuple[list[str], int]:
         """候选记录 ID（按收录时间）与媒体缺失的记录数；默认只返回健康记录。
 
         指定用户时，按存档 QQ 或可被纠正到该用户的昵称取超集，调用方再做身份纠正与精确过滤。
+        needle 为规范化后的正文子串；excluded 中的 QQ 参与的记录不进入结果。
         """
         names = sorted(set(names))
+        hidden = sorted(set(excluded))
 
         def run() -> tuple[list[str], int]:
             where = "r.group_id = ?"
             params: list[Any] = [group_id]
+            if needle:
+                where += " AND instr(r.search_text, ?) > 0"
+                params.append(needle)
+            if hidden:
+                where += (
+                    " AND NOT EXISTS (SELECT 1 FROM record_participants x"
+                    " WHERE x.record_id = r.id"
+                    f" AND x.user_id IN ({','.join('?' * len(hidden))}))"
+                )
+                params.extend(hidden)
             if user_id is not None:
                 marks = ",".join("?" * len(names))
                 where += (
@@ -553,8 +568,127 @@ class QuoteStorage:
 
         return await self._run(run)
 
+    async def find_by_prefix(self, group_id: str, prefix: str) -> list[QuoteRecord]:
+        """按记录 ID 前缀查找当前群的记录；最多返回两条，足以判断是否唯一。"""
+
+        def run() -> list[QuoteRecord]:
+            with self._read() as db:
+                rows = db.execute(
+                    "SELECT payload FROM records WHERE group_id = ?"
+                    " AND substr(lower(id), 1, ?) = ? LIMIT 2",
+                    (group_id, len(prefix), prefix.lower()),
+                ).fetchall()
+            return [self._row_record(row) for row in rows]
+
+        return await self._run(run)
+
+    async def dated_candidates(
+        self, group_id: str, excluded: Iterable[str] = ()
+    ) -> list[tuple[str, str]]:
+        """健康记录的 (ID, 收录时间)，供按日期筛选。"""
+        hidden = sorted(set(excluded))
+
+        def run() -> list[tuple[str, str]]:
+            where = f"r.group_id = ? AND {_HEALTHY}"
+            params: list[Any] = [group_id]
+            if hidden:
+                where += (
+                    " AND NOT EXISTS (SELECT 1 FROM record_participants x"
+                    " WHERE x.record_id = r.id"
+                    f" AND x.user_id IN ({','.join('?' * len(hidden))}))"
+                )
+                params.extend(hidden)
+            with self._read() as db:
+                rows = db.execute(
+                    f"SELECT r.id, r.recorded_at FROM records r WHERE {where}", params
+                ).fetchall()
+            return [(row["id"], row["recorded_at"]) for row in rows]
+
+        return await self._run(run)
+
+    # 随机发送历史 -----------------------------------------------------
+
+    async def recent_sent(self, group_id: str, limit: int) -> list[str]:
+        """当前群最近被随机发送的记录 ID，从新到旧。"""
+
+        def run() -> list[str]:
+            with self._read() as db:
+                rows = db.execute(
+                    "SELECT record_id FROM record_sends WHERE group_id = ?"
+                    " ORDER BY last_sent_at DESC LIMIT ?",
+                    (group_id, limit),
+                ).fetchall()
+            return [row["record_id"] for row in rows]
+
+        return await self._run(run)
+
+    async def mark_sent(self, group_id: str, record_ids: Iterable[str]) -> None:
+        ids = list(record_ids)
+
+        def run() -> None:
+            now = time.time()
+            with self._tx() as db:
+                # 记录可能在发送期间被删除，只登记仍然存在的。
+                db.executemany(
+                    "INSERT INTO record_sends (record_id, group_id, last_sent_at)"
+                    " SELECT id, group_id, ? FROM records WHERE id = ? AND group_id = ?"
+                    " ON CONFLICT(record_id) DO UPDATE SET"
+                    " last_sent_at = excluded.last_sent_at,"
+                    " send_count = send_count + 1",
+                    [(now, item, group_id) for item in ids],
+                )
+
+        if ids:
+            await self._run(run)
+
+    # 群会话 -----------------------------------------------------------
+
+    async def group_sessions(self) -> dict[str, dict[str, str]]:
+        def run() -> dict[str, dict[str, str]]:
+            with self._read() as db:
+                return {
+                    row["group_id"]: {
+                        "umo": row["umo"],
+                        "platform_id": row["platform_id"],
+                        "self_id": row["self_id"],
+                    }
+                    for row in db.execute("SELECT * FROM group_sessions")
+                }
+
+        return await self._run(run)
+
+    async def save_group_session(
+        self, group_id: str, umo: str, platform_id: str, self_id: str
+    ) -> None:
+        def run() -> None:
+            with self._tx() as db:
+                db.execute(
+                    "INSERT INTO group_sessions VALUES (?, ?, ?, ?, ?)"
+                    " ON CONFLICT(group_id) DO UPDATE SET umo = excluded.umo,"
+                    " platform_id = excluded.platform_id, self_id = excluded.self_id,"
+                    " updated_at = excluded.updated_at",
+                    (group_id, umo, platform_id, self_id, now_iso()),
+                )
+
+        await self._run(run)
+
+    async def backup_fingerprint(self) -> str:
+        """记录与媒体未变化时指纹不变，用于跳过重复的自动备份。"""
+
+        def run() -> str:
+            with self._read() as db:
+                (count, latest) = db.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(recorded_at), '') FROM records"
+                ).fetchone()
+                (audit,) = db.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM audit_log"
+                ).fetchone()
+            return f"{count}|{latest}|{audit}"
+
+        return await self._run(run)
+
     async def group_records(self, group_id: str) -> list[QuoteRecord]:
-        """整群记录，仅用于低频管理操作（别名影响预览、导出）。"""
+        """整群记录，仅用于低频操作（统计排行、别名影响预览、导出）。"""
 
         def run() -> list[QuoteRecord]:
             with self._read() as db:
@@ -879,12 +1013,44 @@ class QuoteStorage:
 
     # 审计 -------------------------------------------------------------
 
-    async def audit_entries(self, limit: int = 200) -> list[dict[str, Any]]:
-        def run() -> list[dict[str, Any]]:
+    async def audit_entries(
+        self,
+        *,
+        group_id: str = "",
+        operator: str = "",
+        source: str = "",
+        page: int = 1,
+        page_size: int = 50,
+    ) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+        """按条件分页读取审计；返回当前页、筛选后总数与全部审计的来源计数。"""
+
+        def run() -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+            where: list[str] = []
+            params: list[Any] = []
+            if group_id:
+                where.append("instr(group_id, ?) > 0")
+                params.append(group_id)
+            if operator:
+                where.append("instr(lower(deleted_by), ?) > 0")
+                params.append(operator.lower())
+            if source:
+                where.append("source = ?")
+                params.append(source)
+            clause = f" WHERE {' AND '.join(where)}" if where else ""
             with self._read() as db:
+                (total,) = db.execute(
+                    f"SELECT COUNT(*) FROM audit_log{clause}", params
+                ).fetchone()
                 rows = db.execute(
-                    "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+                    f"SELECT * FROM audit_log{clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (*params, page_size, (page - 1) * page_size),
                 ).fetchall()
+                counts = {
+                    row["source"]: int(row["total"])
+                    for row in db.execute(
+                        "SELECT source, COUNT(*) AS total FROM audit_log GROUP BY source"
+                    )
+                }
             result = []
             for row in rows:
                 item = {
@@ -903,7 +1069,7 @@ class QuoteStorage:
                     item["removed_nodes"] = row["removed_nodes"]
                     item["record_deleted"] = bool(row["record_deleted"])
                 result.append(item)
-            return result
+            return result, int(total), counts
 
         return await self._run(run)
 

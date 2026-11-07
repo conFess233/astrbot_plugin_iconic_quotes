@@ -31,8 +31,30 @@ class Route:
     argument: str | None = None
 
 
-def call_input(event: Any) -> CallInput:
-    """返回调用正文与按出现顺序去重的 @ 目标。"""
+def _prefix_list(wake_prefixes: Any) -> list[str]:
+    if isinstance(wake_prefixes, str):
+        return [wake_prefixes]
+    if isinstance(wake_prefixes, (list, tuple, set)):
+        return [str(item) for item in wake_prefixes]
+    return ["/"]
+
+
+def call_input(event: Any, wake_prefixes: Any = ()) -> CallInput:
+    """返回调用正文与按出现顺序去重的 @ 目标。
+
+    传入 wake_prefixes 时去掉正文开头的唤醒前缀：指令过滤器已确认过前缀，
+    而这里读的是未经框架加工的原始消息，不去掉就无法匹配自定义前缀。
+    """
+    call = _parse_call(event)
+    for prefix in sorted(
+        filter(None, _prefix_list(wake_prefixes)), key=len, reverse=True
+    ):
+        if call.text.startswith(prefix):
+            return CallInput(call.text[len(prefix) :].lstrip(), call.targets)
+    return call
+
+
+def _parse_call(event: Any) -> CallInput:
     bot_id = str(event.get_self_id() or "")
     raw = getattr(event.message_obj, "raw_message", None)
     if isinstance(raw, dict) and isinstance(raw.get("message"), list):
@@ -88,15 +110,9 @@ def is_command_event(event: Any, wake_prefixes: Any) -> bool:
     raw = getattr(event.message_obj, "raw_message", None)
     if isinstance(raw, dict) and isinstance(raw.get("raw_message"), str):
         candidates.append(raw["raw_message"])
-    if isinstance(wake_prefixes, str):
-        prefixes = [wake_prefixes]
-    elif isinstance(wake_prefixes, (list, tuple, set)):
-        prefixes = list(wake_prefixes)
-    else:
-        prefixes = ["/"]
     return any(
-        prefix and candidate.strip().startswith(str(prefix))
-        for prefix in prefixes
+        prefix and candidate.strip().startswith(prefix)
+        for prefix in _prefix_list(wake_prefixes)
         for candidate in candidates
     )
 
@@ -109,15 +125,27 @@ def is_bot_message(event: Any) -> bool:
     return bool(sender.get("is_bot") or sender.get("is_robot"))
 
 
+RANK_WORDS = {"排行", "排行榜", "rank"}
+
+
+def _subcommand(call: CallInput, tail: str | None) -> Route | None:
+    """查询关键词后的统计子命令；普通关键词搜索返回 None。"""
+    argument = (tail or "").casefold()
+    if argument == "info":
+        return Route("info")
+    if argument in RANK_WORDS and not call.targets:
+        return Route("rank")
+    return None
+
+
 def route_query_command(call: CallInput, values: dict[str, Any]) -> Route | None:
-    """`/群典` 指令：info、help 或随机查询；正文不完整匹配时不接管。"""
+    """`/群典` 指令：统计、帮助或查询；正文不完整匹配时不接管。"""
     matched, tail = match_command_syntax(call.text, ["群典"])
     if not matched:
         return None
-    argument = tail or ""
-    if not call.targets and argument.casefold() == "info":
-        return Route("info")
-    if not call.targets and is_help_keyword(argument, values["help_keywords"]):
+    if route := _subcommand(call, tail):
+        return route
+    if not call.targets and is_help_keyword(tail, values["help_keywords"]):
         return Route("help")
     return Route("query", tail)
 
@@ -125,7 +153,7 @@ def route_query_command(call: CallInput, values: dict[str, Any]) -> Route | None
 def route_keyword(
     call: CallInput, values: dict[str, Any], *, has_source: bool
 ) -> Route | None:
-    """无前缀关键词：帮助 > 爆典 > 带来源的添加 > 查询 > 无来源的添加（给出用法）。"""
+    """无前缀关键词：帮助 > 统计 > 爆典 > 带来源的添加 > 查询 > 无来源的添加（给出用法）。"""
     if not call.text:
         return None
     add_match = values["add_keyword_enabled"] and call.text in values["add_keywords"]
@@ -142,6 +170,8 @@ def route_keyword(
         and is_help_keyword(query_tail, values["help_keywords"])
     ):
         return Route("help")
+    if query_match and (route := _subcommand(call, query_tail)):
+        return route
     if values["burst_keyword_enabled"] and burst_matched:
         return Route("burst", burst_tail)
     if add_match and has_source:

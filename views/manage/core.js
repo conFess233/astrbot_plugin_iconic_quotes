@@ -253,6 +253,13 @@ function bigRect(img) {
 }
 
 /** buttons：同一组缩略图按钮（含 img）；index：起始项。 */
+/** 缩略图有 loadFull 时换成原图；期间切换了图片或关闭灯箱则放弃。 */
+function upgradeLightbox(img, thumb, index) {
+  thumb.loadFull?.().then((url) => {
+    if (lightboxIndex === index && $("#lightbox").classList.contains("on")) img.src = url;
+  }).catch(() => {});
+}
+
 export function openLightbox(buttons, index) {
   lightboxItems = buttons;
   lightboxIndex = index;
@@ -265,6 +272,7 @@ export function openLightbox(buttons, index) {
   img.alt = $("img", thumb).alt;
   img.style.visibility = "visible";
   box.classList.add("on");
+  upgradeLightbox(img, thumb, index);
   box.setAttribute("aria-hidden", "false");
   box.inert = false;
   const grow = () => requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -295,6 +303,7 @@ function stepLightbox(delta) {
   const img = $("#lb-img");
   img.src = $("img", lightboxItems[lightboxIndex]).src;
   img.onload = () => placeImage(img, bigRect(img));
+  upgradeLightbox(img, lightboxItems[lightboxIndex], lightboxIndex);
   if (!reducedMotion()) {
     img.animate([{ opacity: 0, transform: `translateX(${delta * 16}px)` }, { opacity: 1, transform: "none" }],
       { duration: 200, easing: "cubic-bezier(.2,.8,.2,1)" });

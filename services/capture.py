@@ -94,6 +94,8 @@ class CaptureSession:
     ignored_segments: int = 0
     # 转发树内全部节点按消息 ID / 序号索引，节点间的回复优先在本地解析。
     local_messages: dict[str, LocalMessage] = field(default_factory=dict)
+    # 合并转发使用单独的图片上限。
+    is_forward: bool = False
 
     @property
     def new_bytes(self) -> int:
@@ -263,6 +265,21 @@ class QuoteCapture:
         record.content_hash = calculate_record_hash(record)
         return record
 
+    async def extract_message(
+        self, event: Any, message_id: str, session: CaptureSession
+    ) -> QuoteRecord:
+        """按消息 ID 收录，用于没有引用段的触发方式（表情回应投票）。"""
+        operator = _as_author(event.get_sender_id(), event.get_sender_name())
+        record = await self._from_reply(
+            event,
+            RawReply(message_id=message_id),
+            str(event.get_group_id()),
+            operator,
+            session,
+        )
+        record.content_hash = calculate_record_hash(record)
+        return record
+
     # 来源 -------------------------------------------------------------
 
     async def _from_reply(
@@ -360,6 +377,7 @@ class QuoteCapture:
         session: CaptureSession,
         source_message_id: str | None = None,
     ) -> QuoteRecord:
+        session.is_forward = True
         raw_nodes, forward_id = await self._load_forward(event, component)
         nodes, total_text = await self._capture_nodes(
             event,
@@ -712,7 +730,10 @@ class QuoteCapture:
     ) -> QuoteSegment:
         settings = session.settings
         session.images += 1
-        if session.images > settings["max_images_per_record"]:
+        limit_key = (
+            "max_images_per_forward" if session.is_forward else "max_images_per_record"
+        )
+        if session.images > settings[limit_key]:
             raise CaptureError(
                 "图片数量超过配置上限"
                 if label == "图片"

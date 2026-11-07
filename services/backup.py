@@ -12,6 +12,7 @@ v4 结构::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import uuid
@@ -34,6 +35,23 @@ BACKUP_VERSION = 4
 MAX_ENTRIES = 100_000
 MAX_ENTRY_BYTES = 100 * 1024 * 1024
 MAX_TOTAL_BYTES = 4 * 1024**3
+HASH_CHUNK_BYTES = 1024 * 1024
+HEADER_BYTES = 16
+MEDIA_PREFIXES = ("media/", "images/")
+AUTO_PREFIX = "auto-iconic-quotes-"
+MANUAL_PREFIX = "iconic-quotes-"
+# 手动导出的文件已经下载到管理员手里，服务器上只留最近几份兜底。
+MANUAL_KEEP = 3
+
+
+@dataclass(slots=True, frozen=True)
+class ArchiveMedia:
+    """压缩包内的一个媒体文件：只保留校验结果，内容写入时才读取。"""
+
+    member: str
+    size: int
+    digest: str
+    header: bytes
 
 
 @dataclass(slots=True)
@@ -41,7 +59,7 @@ class ImportPlan:
     """预检结果：待写入记录、待写入媒体与统计。"""
 
     records: list[QuoteRecord] = field(default_factory=list)
-    media: dict[str, bytes] = field(default_factory=dict)
+    media: dict[str, ArchiveMedia] = field(default_factory=dict)
     added: int = 0
     duplicates: int = 0
     conflicts: int = 0
@@ -70,6 +88,18 @@ def _safe_name(name: str) -> bool:
     )
 
 
+def _hash_member(archive: zipfile.ZipFile, name: str) -> tuple[str, bytes]:
+    """流式计算压缩包成员的 SHA-256，并取文件头用于识别格式。"""
+    digest = hashlib.sha256()
+    header = b""
+    with archive.open(name) as stream:
+        while chunk := stream.read(HASH_CHUNK_BYTES):
+            if not header:
+                header = chunk[:HEADER_BYTES]
+            digest.update(chunk)
+    return digest.hexdigest(), header
+
+
 class BackupService:
     """导出与导入；所有写入都通过 QuoteStorage 的单事务完成。"""
 
@@ -81,21 +111,51 @@ class BackupService:
 
     # 导出 -------------------------------------------------------------
 
-    async def export(self, settings: dict[str, Any]) -> Path:
+    async def export(self, settings: dict[str, Any], *, auto: bool = False) -> Path:
         async with self._lock:
             rows = await self.storage.export_rows()
             media = await self.storage.media_rows()
-            return await asyncio.to_thread(self._export_sync, rows, media, settings)
+            prefix = AUTO_PREFIX if auto else MANUAL_PREFIX
+            target = await asyncio.to_thread(
+                self._export_sync, rows, media, settings, prefix
+            )
+            if not auto:
+                await asyncio.to_thread(self._prune, MANUAL_PREFIX, MANUAL_KEEP)
+            return target
+
+    def _prune(self, prefix: str, keep: int) -> int:
+        """按文件名中的时间保留最新的 keep 个；删不掉（如正在下载）的留到下次。"""
+        files = sorted(self.backups_dir.glob(f"{prefix}*.zip"), reverse=True)
+        removed = 0
+        for path in files[keep:]:
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
+                removed += 1
+        return removed
+
+    def prune_auto(self, keep: int) -> int:
+        """只清理自动备份；手动导出的文件有自己的保留数量。"""
+        return self._prune(AUTO_PREFIX, keep)
+
+    def sweep(self) -> None:
+        """启动时清理：待确认的导入随进程结束已失效，手动导出超量的也一并删除。"""
+        if not self.backups_dir.is_dir():
+            return
+        for path in self.backups_dir.glob(".import-*.zip"):
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
+        self._prune(MANUAL_PREFIX, MANUAL_KEEP)
 
     def _export_sync(
         self,
         rows: list[tuple[str, str]],
         media: dict[str, dict[str, Any]],
         settings: dict[str, Any],
+        prefix: str = MANUAL_PREFIX,
     ) -> Path:
         self.backups_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        target = self.backups_dir / f"iconic-quotes-{stamp}-{uuid.uuid4().hex[:6]}.zip"
+        target = self.backups_dir / f"{prefix}{stamp}-{uuid.uuid4().hex[:6]}.zip"
         records_blob = (
             ("\n".join(payload for _, payload in rows) + "\n").encode() if rows else b""
         )
@@ -148,11 +208,9 @@ class BackupService:
             written: list[MediaInfo] = []
             infos: dict[str, MediaInfo] = {}
             try:
-                for data in plan.media.values():
-                    info, created = await asyncio.to_thread(self.media.write, data)
-                    infos[info.sha256] = info
-                    if created:
-                        written.append(info)
+                await asyncio.to_thread(
+                    self._write_media, archive, plan.media, infos, written
+                )
                 await self.storage.import_records(
                     plan.records,
                     infos.values(),
@@ -164,11 +222,28 @@ class BackupService:
                 raise
             return plan
 
+    def _write_media(
+        self,
+        archive: Path,
+        entries: dict[str, ArchiveMedia],
+        infos: dict[str, MediaInfo],
+        written: list[MediaInfo],
+    ) -> None:
+        """逐个读出并写入媒体，内存中同时最多只有一张图片。"""
+        with zipfile.ZipFile(archive) as source:
+            for sha256, entry in entries.items():
+                info, created = self.media.write(source.read(entry.member))
+                if created:
+                    written.append(info)
+                if info.sha256 != sha256:
+                    raise StorageError("记录图片哈希不匹配")
+                infos[sha256] = info
+
     async def _plan(
         self, archive: Path, settings: dict[str, Any], limits: dict[str, int]
     ) -> ImportPlan:
         try:
-            records, payloads, manifest_settings = await asyncio.to_thread(
+            records, archived, manifest_settings = await asyncio.to_thread(
                 self._read_archive, archive
             )
         except StorageError:
@@ -177,7 +252,7 @@ class BackupService:
             raise StorageError("备份文件损坏或格式无效") from exc
         plan = ImportPlan(settings=manifest_settings)
         max_image = settings["max_image_mb"] * 1024 * 1024
-        if any(len(data) > max_image for data in payloads.values()):
+        if any(entry.size > max_image for entry in archived.values()):
             raise StorageError("备份包含超过当前单张上限的图片")
         by_group: dict[str, list[QuoteRecord]] = {}
         for record in records:
@@ -207,8 +282,8 @@ class BackupService:
                     needed.setdefault(segment.sha256, segment.mime or "")
         known = await self.storage.media_rows(needed)
         for sha256, mime in needed.items():
-            data = payloads.get(sha256)
-            if data is None:
+            entry = archived.get(sha256)
+            if entry is None:
                 row = known.get(sha256)
                 if (
                     row is None
@@ -219,17 +294,17 @@ class BackupService:
                 ):
                     plan.missing_images += 1
                 continue
-            if hashlib.sha256(data).hexdigest() != sha256:
+            if entry.digest != sha256:
                 raise StorageError("记录图片哈希不匹配")
             try:
-                _, actual = identify_image(data)
+                _, actual = identify_image(entry.header)
             except ValueError as exc:
                 raise StorageError("备份包含无法识别的图片") from exc
             if mime and actual != mime:
                 raise StorageError("记录图片类型与登记不一致")
-            plan.media[sha256] = data
+            plan.media[sha256] = entry
             if sha256 not in known:
-                plan.image_bytes += len(data)
+                plan.image_bytes += entry.size
         usage = await self.storage.media_usage()
         if usage + plan.image_bytes > settings["max_media_mb"] * 1024 * 1024:
             raise StorageError("导入会超过全局媒体容量")
@@ -237,8 +312,11 @@ class BackupService:
 
     def _read_archive(
         self, archive_path: Path
-    ) -> tuple[list[QuoteRecord], dict[str, bytes], dict[str, Any]]:
-        """读取并校验 ZIP；返回记录、按 sha256 索引的媒体字节与可迁移配置。"""
+    ) -> tuple[list[QuoteRecord], dict[str, ArchiveMedia], dict[str, Any]]:
+        """读取并校验 ZIP；返回记录、按 sha256 索引的媒体条目与可迁移配置。
+
+        只有清单和记录文本进入内存，媒体流式校验，写入时才逐个读取。
+        """
         with zipfile.ZipFile(archive_path) as archive:
             infos = [info for info in archive.infolist() if not info.is_dir()]
             if len(infos) > MAX_ENTRIES:
@@ -271,11 +349,18 @@ class BackupService:
             if set(names) != {"manifest.json", *declared}:
                 raise StorageError("备份文件与清单不一致")
             payloads: dict[str, bytes] = {}
-            for name, expected in declared.items():
-                data = archive.read(name)
-                if hashlib.sha256(data).hexdigest() != expected:
+            members: dict[str, ArchiveMedia] = {}
+            for info in infos:
+                name = info.filename
+                if name == "manifest.json":
+                    continue
+                digest, header = _hash_member(archive, name)
+                if digest != declared[name]:
                     raise StorageError(f"备份文件哈希不匹配: {name}")
-                payloads[name] = data
+                if name.startswith(MEDIA_PREFIXES):
+                    members[name] = ArchiveMedia(name, info.file_size, digest, header)
+                else:
+                    payloads[name] = archive.read(name)
         version = manifest.get("schema_version")
         settings = (
             manifest.get("settings")
@@ -283,9 +368,9 @@ class BackupService:
             else {}
         )
         if version == BACKUP_VERSION:
-            records, media = self._v4(payloads)
+            records, media = self._v4(payloads, members)
         elif version in {1, 2, 3}:
-            records, media = self._legacy(payloads)
+            records, media = self._legacy(payloads, members)
         else:
             raise StorageError(
                 "备份由更高版本插件创建，请先升级插件"
@@ -295,10 +380,11 @@ class BackupService:
         return records, media, settings
 
     @staticmethod
-    def _v4(payloads: dict[str, bytes]) -> tuple[list[QuoteRecord], dict[str, bytes]]:
-        if any(
-            name != "records.jsonl" and not name.startswith("media/")
-            for name in payloads
+    def _v4(
+        payloads: dict[str, bytes], members: dict[str, ArchiveMedia]
+    ) -> tuple[list[QuoteRecord], dict[str, ArchiveMedia]]:
+        if any(name != "records.jsonl" for name in payloads) or any(
+            not name.startswith("media/") for name in members
         ):
             raise StorageError("备份清单包含不允许的路径")
         records: list[QuoteRecord] = []
@@ -317,21 +403,19 @@ class BackupService:
             seen.add(record.id)
             records.append(record)
         media = {
-            PurePosixPath(name).stem.lower(): data
-            for name, data in payloads.items()
-            if name.startswith("media/")
+            PurePosixPath(name).stem.lower(): entry for name, entry in members.items()
         }
         return records, media
 
     @staticmethod
     def _legacy(
-        payloads: dict[str, bytes],
-    ) -> tuple[list[QuoteRecord], dict[str, bytes]]:
+        payloads: dict[str, bytes], members: dict[str, ArchiveMedia]
+    ) -> tuple[list[QuoteRecord], dict[str, ArchiveMedia]]:
+        if any(not name.startswith("images/") for name in members):
+            raise StorageError("备份清单包含不允许的路径")
         records: list[QuoteRecord] = []
         image_paths: dict[str, str] = {}
         for name, data in sorted(payloads.items()):
-            if name.startswith("images/"):
-                continue
             if not (name.startswith("groups/") and name.endswith(".json")):
                 raise StorageError(f"备份清单包含不允许的路径: {name}")
             group_id = PurePosixPath(name).stem
@@ -350,8 +434,8 @@ class BackupService:
             records.extend(parsed.records)
             image_paths.update(parsed.image_paths)
         media = {
-            sha256: payloads[path]
+            sha256: members[path]
             for sha256, path in image_paths.items()
-            if path in payloads
+            if path in members
         }
         return records, media

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import tempfile
 from collections.abc import Awaitable, Callable
@@ -37,6 +38,14 @@ class T2IClient:
         self._html_render = html_render
         self.temp_dir = temp_dir
         self._http: aiohttp.ClientSession | None = None
+
+    def sweep(self) -> None:
+        """启动时删除上次运行残留的渲染文件；此时不会有渲染正在进行。"""
+        if not self.temp_dir.is_dir():
+            return
+        for path in self.temp_dir.glob("card-*.png"):
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
 
     async def close(self) -> None:
         if self._http is not None and not self._http.closed:

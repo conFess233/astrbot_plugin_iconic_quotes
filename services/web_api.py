@@ -42,6 +42,7 @@ IMPORT_TOKEN_SECONDS = 600
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
 MAX_PREVIEW_BYTES = 20 * 1024 * 1024
 MAX_PREVIEW_TEXT = 2000
+THUMBNAIL_PIXELS = 320
 PREVIEW_TEXT = "今晚谁再说一句“最后一把”，我就把网线拔了。"
 
 Handler = Callable[..., Awaitable[Any]]
@@ -205,14 +206,15 @@ class WebApi:
         raw_ids = payload.get("record_ids")
         if not isinstance(raw_ids, list) or not 1 <= len(raw_ids) <= 100:
             raise ApiError("每次必须选择 1 到 100 条记录")
-        deleted, orphans = await self.storage.delete_records(
-            group_id,
-            {str(value) for value in raw_ids},
-            deleted_by=f"dashboard:{request.username}",
-            source="page",
-            audit_limit=self.settings.global_settings()["audit_limit"],
-        )
-        await self.operations.delete_files(orphans)
+        async with self.operations.media_lock:
+            deleted, orphans = await self.storage.delete_records(
+                group_id,
+                {str(value) for value in raw_ids},
+                deleted_by=f"dashboard:{request.username}",
+                source="page",
+                audit_limit=self.settings.global_settings()["audit_limit"],
+            )
+            await self.operations.delete_files(orphans)
         return {"deleted": deleted}
 
     @endpoint
@@ -246,17 +248,18 @@ class WebApi:
             record.content_hash = calculate_record_hash(record)
             record.identity_incomplete = record.has_unknown_authors()
             updated = record
-        orphans = await self.storage.replace_record(
-            updated,
-            group_id=group_id,
-            record_id=record_id,
-            expected_hash=expected,
-            deleted_by=f"dashboard:{request.username}",
-            node_path=path,
-            removed_nodes=removed,
-            audit_limit=self.settings.global_settings()["audit_limit"],
-        )
-        await self.operations.delete_files(orphans)
+        async with self.operations.media_lock:
+            orphans = await self.storage.replace_record(
+                updated,
+                group_id=group_id,
+                record_id=record_id,
+                expected_hash=expected,
+                deleted_by=f"dashboard:{request.username}",
+                node_path=path,
+                removed_nodes=removed,
+                audit_limit=self.settings.global_settings()["audit_limit"],
+            )
+            await self.operations.delete_files(orphans)
         item = None
         if updated is not None:
             item = {
@@ -271,8 +274,23 @@ class WebApi:
 
     @endpoint
     async def audit(self) -> dict[str, Any]:
-        limit = min(1000, max(1, request.query.get("limit", 200, type=int)))
-        return {"items": await self.storage.audit_entries(limit)}
+        query = request.query
+        page = max(1, query.get("page", 1, type=int))
+        page_size = min(200, max(1, query.get("page_size", 50, type=int)))
+        items, total, counts = await self.storage.audit_entries(
+            group_id=str(query.get("group_id", "") or "").strip(),
+            operator=str(query.get("operator", "") or "").strip(),
+            source=str(query.get("source", "") or "").strip(),
+            page=page,
+            page_size=page_size,
+        )
+        return {
+            "items": items,
+            "total": total,
+            "counts": counts,
+            "page": page,
+            "page_size": page_size,
+        }
 
     # 配置 -------------------------------------------------------------
 
@@ -418,7 +436,10 @@ class WebApi:
         archive = Path(pending["path"])
         try:
             settings = self.settings.global_settings()
-            plan = await self.backups.commit(archive, settings, self._limits(settings))
+            async with self.operations.media_lock:
+                plan = await self.backups.commit(
+                    archive, settings, self._limits(settings)
+                )
             result = plan.summary()
             aliases = plan.settings.get("author_aliases", {}) if plan.settings else {}
             alias_count = sum(
@@ -456,14 +477,21 @@ class WebApi:
         row = (await self.storage.media_rows([sha256])).get(sha256)
         if row is None:
             raise ApiError("图片不存在", status_code=404)
-        if row["size"] > MAX_PREVIEW_BYTES:
+        thumb = str(request.query.get("thumb", "") or "") == "1"
+        if not thumb and row["size"] > MAX_PREVIEW_BYTES:
             raise ApiError("图片过大，无法在页面中预览")
         try:
-            return {
-                "data_url": await asyncio.to_thread(
-                    self.media.data_url, sha256, row["mime"]
+            if thumb:
+                url = await asyncio.to_thread(
+                    self.media.scaled_data_url,
+                    sha256,
+                    row["mime"],
+                    THUMBNAIL_PIXELS,
+                    THUMBNAIL_PIXELS,
                 )
-            }
+            else:
+                url = await asyncio.to_thread(self.media.data_url, sha256, row["mime"])
+            return {"data_url": url}
         except OSError as exc:
             raise ApiError("图片文件缺失", status_code=404) from exc
 
