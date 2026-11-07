@@ -17,6 +17,7 @@ from .services.backup import BackupService
 from .services.capture import QuoteCapture
 from .services.command_parser import (
     COMMAND_EVENT_KEY,
+    CallInput,
     call_input,
     capture_source_count,
     is_bot_message,
@@ -30,6 +31,7 @@ from .services.media import MediaStore
 from .services.members import MemberService
 from .services.operations import QuoteOperations
 from .services.permissions import PermissionService
+from .services.proactive import Scheduler, SessionRegistry
 from .services.renderer import CardRenderer
 from .services.sender import Sender
 from .services.settings import GROUP_DATA_KEYS, SettingsService
@@ -75,6 +77,18 @@ class IconicQuotesPlugin(Star):
             sender=Sender(self.builder),
             cards=self.cards,
         )
+        self.backups = BackupService(
+            self.storage, self.media, self.data_root / "backups"
+        )
+        self.sessions = SessionRegistry(self.storage)
+        self.scheduler = Scheduler(
+            context=context,
+            settings=self.settings,
+            storage=self.storage,
+            operations=self.operations,
+            backups=self.backups,
+            sessions=self.sessions,
+        )
         self.web = WebApi(
             config=config,
             settings=self.settings,
@@ -82,7 +96,7 @@ class IconicQuotesPlugin(Star):
             media=self.media,
             avatars=self.avatars,
             members=self.members,
-            backups=BackupService(self.storage, self.media, self.data_root / "backups"),
+            backups=self.backups,
             cards=self.cards,
             operations=self.operations,
             data_root=self.data_root,
@@ -109,6 +123,10 @@ class IconicQuotesPlugin(Star):
         await self._load_group_settings()
         await self.avatars.initialize()
         await self._sweep_orphan_media()
+        await asyncio.to_thread(self.backups.sweep)
+        await asyncio.to_thread(self.t2i.sweep)
+        await self.sessions.load()
+        self.scheduler.start()
         logger.info("群典：初始化完成")
 
     async def _load_group_settings(self) -> None:
@@ -154,6 +172,7 @@ class IconicQuotesPlugin(Star):
     async def terminate(self) -> None:
         """停用或重载时释放待确认状态、网络资源与数据库连接。"""
         self.operations.pending_deletions.clear()
+        await self.scheduler.stop()
         await self.web.close()
         await self.avatars.close()
         await self.t2i.close()
@@ -170,6 +189,10 @@ class IconicQuotesPlugin(Star):
         except Exception:  # noqa: BLE001 - 兼容不同 AstrBot 配置代理实现。
             return ["/"]
 
+    def _call(self, event: AstrMessageEvent) -> CallInput:
+        """指令处理器用：正文已去掉当前会话配置的唤醒前缀。"""
+        return call_input(event, self._wake_prefixes(event))
+
     def _values(self, event: AstrMessageEvent) -> dict[str, Any]:
         group_id = str(event.get_group_id() or "")
         return (
@@ -181,7 +204,7 @@ class IconicQuotesPlugin(Star):
     @filter.command("添加群典")
     async def add_quote(self, event: AstrMessageEvent):
         """收录当前消息引用的一条消息或合并转发。"""
-        if call_input(event).text not in {"添加群典", "/添加群典"}:
+        if self._call(event).text not in {"添加群典", "/添加群典"}:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
         await self.operations.run(
@@ -192,7 +215,7 @@ class IconicQuotesPlugin(Star):
     async def query_quote(self, event: AstrMessageEvent, argument: str = ""):
         """随机发送群典；参数 info 查看统计，help 查看帮助。"""
         # 框架可能把“@用户 + 普通文本”交给命令过滤器；只有正文完整匹配调用语法时才接管。
-        route = route_query_command(call_input(event), self._values(event))
+        route = route_query_command(self._call(event), self._values(event))
         if route is None:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
@@ -201,7 +224,7 @@ class IconicQuotesPlugin(Star):
     @filter.command("爆典")
     async def burst_quote(self, event: AstrMessageEvent, argument: str = ""):
         """分页获取当前群中指定成员参与的全部群典记录。"""
-        matched, page = match_command_syntax(call_input(event).text, ["爆典"])
+        matched, page = match_command_syntax(self._call(event).text, ["爆典"])
         if not matched:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
@@ -210,7 +233,7 @@ class IconicQuotesPlugin(Star):
     @filter.command("删除群典")
     async def delete_quote(self, event: AstrMessageEvent, keyword: str = ""):
         """预览正文包含指定字符串的记录，并创建删除确认。"""
-        matched, search = match_command_syntax(call_input(event).text, ["删除群典"])
+        matched, search = match_command_syntax(self._call(event).text, ["删除群典"])
         if not matched:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
@@ -226,7 +249,7 @@ class IconicQuotesPlugin(Star):
     @filter.command("确认删除")
     async def confirm_delete(self, event: AstrMessageEvent):
         """在 60 秒内确认当前用户最近一次删除预览。"""
-        if call_input(event).text not in {"确认删除", "/确认删除"}:
+        if self._call(event).text not in {"确认删除", "/确认删除"}:
             return
         event.set_extra(COMMAND_EVENT_KEY, True)
         await self.operations.run(
@@ -235,10 +258,14 @@ class IconicQuotesPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def keyword_listener(self, event: AstrMessageEvent):
-        """处理无前缀关键词调用与机器人戳一戳。"""
+        """处理无前缀关键词调用、机器人戳一戳与表情回应投票。"""
+        await self._note_session(event)
         raw = getattr(event.message_obj, "raw_message", None)
         if isinstance(raw, dict) and raw.get("post_type") == "notice":
-            await self._handle_poke(event, raw)
+            if raw.get("notice_type") == "group_msg_emoji_like":
+                await self._handle_reaction(event, raw)
+            else:
+                await self._handle_poke(event, raw)
             return
         if is_command_event(event, self._wake_prefixes(event)) or is_bot_message(event):
             return
@@ -261,13 +288,34 @@ class IconicQuotesPlugin(Star):
             "add": ops.add,
             "info": ops.info,
             "help": ops.help,
+            "rank": ops.rank,
             "query": lambda current, ctx: ops.query(current, ctx, argument),
             "burst": lambda current, ctx: ops.burst(current, ctx, argument),
         }
-        await ops.run(event, operation, actions[operation], trigger_source=source)
+        # 排行属于统计，共用统计权限。
+        permission = "info" if operation == "rank" else operation
+        await ops.run(event, permission, actions[operation], trigger_source=source)
+
+    async def _note_session(self, event: AstrMessageEvent) -> None:
+        """记住群会话供定时推送使用；失败不能影响消息处理。"""
+        try:
+            await self.sessions.note(event)
+        except Exception as exc:  # noqa: BLE001 - 这只是辅助信息。
+            logger.debug("群典：记录群会话失败，原因=%s", error_reason(exc))
+
+    async def _handle_reaction(self, event: AstrMessageEvent, raw: dict) -> None:
+        """NapCat 的群表情回应通知：机器人自己的回应不计票。"""
+        if (
+            event.get_platform_name() != "aiocqhttp"
+            or not event.get_group_id()
+            or not raw.get("user_id")
+            or str(raw["user_id"]) == str(event.get_self_id())
+        ):
+            return
+        await self.operations.reaction(event, raw)
 
     async def _handle_poke(self, event: AstrMessageEvent, raw: dict) -> None:
-        """只消费当前群成员戳机器人的通知，复用查询权限和全局冷却。"""
+        """只消费当前群成员戳机器人的通知，复用查询权限和群冷却。"""
         if (
             event.get_platform_name() != "aiocqhttp"
             or raw.get("notice_type") != "notify"

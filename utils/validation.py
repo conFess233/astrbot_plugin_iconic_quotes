@@ -55,6 +55,12 @@ def match_command_syntax(
     return False, None
 
 
+def parse_record_id(value: str | None) -> str | None:
+    """识别 ``#abcd1234`` 形式的记录 ID 前缀（4 到 32 位十六进制），返回小写前缀。"""
+    match = re.fullmatch(r"#([0-9a-fA-F]{4,32})", (value or "").strip())
+    return match.group(1).lower() if match else None
+
+
 def parse_command_segments(
     segments: Iterable[dict], bot_id: str
 ) -> tuple[str, list[str]]:

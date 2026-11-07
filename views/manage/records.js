@@ -18,7 +18,11 @@ const state = {
   loaded: false,
   error: "",
 };
-const mediaCache = new Map();
+// 图片以 data URL 缓存，占内存较多：列表只用缩略图，原图只留最近查看的几张。
+const THUMB_CACHE_LIMIT = 300;
+const ORIGINAL_CACHE_LIMIT = 12;
+const thumbCache = new Map();
+const originalCache = new Map();
 const avatarCache = new Map();
 const PALETTE = ["#4a5bd4", "#2c8f62", "#c77a1f", "#6a6d77", "#cf4040", "#7a5bd4"];
 
@@ -83,12 +87,24 @@ export async function loadRecords({ animate = false } = {}) {
   }
 }
 
-function mediaUrl(sha256) {
-  if (!mediaCache.has(sha256)) {
-    mediaCache.set(sha256, bridge.apiGet("media-data", { sha256 }).then((result) => result.data_url));
+function cachedMedia(cache, limit, sha256, params) {
+  if (cache.has(sha256)) {
+    // 重新插入，使 Map 的顺序保持为最近使用在后。
+    const hit = cache.get(sha256);
+    cache.delete(sha256);
+    cache.set(sha256, hit);
+    return hit;
   }
-  return mediaCache.get(sha256);
+  const request = bridge.apiGet("media-data", params).then((result) => result.data_url);
+  // 失败不进缓存，文件恢复后可以重新加载。
+  request.catch(() => cache.delete(sha256));
+  cache.set(sha256, request);
+  while (cache.size > limit) cache.delete(cache.keys().next().value);
+  return request;
 }
+
+const thumbUrl = (sha256) => cachedMedia(thumbCache, THUMB_CACHE_LIMIT, sha256, { sha256, thumb: "1" });
+const originalUrl = (sha256) => cachedMedia(originalCache, ORIGINAL_CACHE_LIMIT, sha256, { sha256 });
 
 function avatarUrl(userId) {
   if (!avatarCache.has(userId)) {
@@ -346,7 +362,9 @@ function setWide(wide) {
 function thumb(segment, index) {
   const image = el("img", { alt: `图片 ${index + 1}`, loading: "lazy" });
   const button = el("button.thumb", { type: "button", "aria-label": `查看图片 ${index + 1}`, dataset: { thumb: String(index) } }, image);
-  mediaUrl(segment.sha256).then((url) => { image.src = url; }).catch(() => {
+  // 灯箱先显示缩略图，再换成原图。
+  button.loadFull = () => originalUrl(segment.sha256);
+  thumbUrl(segment.sha256).then((url) => { image.src = url; }).catch(() => {
     button.classList.add("missing");
     button.disabled = true;
     button.replaceChildren(el("span", { text: "图片缺失" }));

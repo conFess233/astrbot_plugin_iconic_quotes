@@ -14,11 +14,18 @@ class PermissionService:
         self.members = members
 
     @staticmethod
-    def list_allows(settings: dict[str, Any], group_id: str, user_id: str) -> bool:
-        """名单优先级为黑名单高于白名单。"""
+    def group_allows(settings: dict[str, Any], group_id: str) -> bool:
+        """群名单判定；定时推送没有操作者，只看这一项。"""
         if group_id in settings["group_blacklist"]:
             return False
-        if settings["group_whitelist"] and group_id not in settings["group_whitelist"]:
+        return (
+            not settings["group_whitelist"] or group_id in settings["group_whitelist"]
+        )
+
+    @classmethod
+    def list_allows(cls, settings: dict[str, Any], group_id: str, user_id: str) -> bool:
+        """名单优先级为黑名单高于白名单。"""
+        if not cls.group_allows(settings, group_id):
             return False
         if user_id in settings["user_blacklist"]:
             return False

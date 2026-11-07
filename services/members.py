@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import copy
 import time
 from collections import OrderedDict
@@ -237,6 +239,28 @@ class MemberService:
             record.identity_incomplete = record_incomplete > 0
             incomplete += record_incomplete
         return IdentityResolution(resolved, incomplete, lookup_failed)
+
+    async def resolve_in_place(
+        self,
+        event: Any,
+        group_id: str,
+        records: list[QuoteRecord],
+        settings: dict[str, Any],
+    ) -> None:
+        """整群统计用：直接纠正刚从数据库读出的副本，在线程中执行以免阻塞事件循环。"""
+        manual = self.alias_map(group_id, settings)
+        directory: Directory | None = None
+        with contextlib.suppress(Exception):  # OneBot 实现的异常类型不统一。
+            directory = await self.directory(event, group_id)
+
+        def run() -> None:
+            for record in records:
+                for node in record.iter_nodes():
+                    self._resolve_author(node.author, manual, directory)
+                for reply in record.iter_replies():
+                    self._resolve_author(reply.author, manual, directory)
+
+        await asyncio.to_thread(run)
 
     @staticmethod
     def _resolve_author(

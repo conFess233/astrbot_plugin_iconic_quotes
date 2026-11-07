@@ -6,7 +6,9 @@ const STEPS = ["上传", "预检", "确认影响", "写入"];
 const SOURCES = { command: "群聊指令", page: "管理页", page_node: "管理页 · 节点" };
 const history = [];
 const importState = { file: null, inspection: null, step: 0 };
-const auditState = { items: [], loaded: false, error: "" };
+const AUDIT_PAGE_SIZE = 50;
+const auditState = { items: [], total: 0, counts: {}, page: 1, loaded: false, error: "" };
+let auditTimer = 0;
 let refreshAll = async () => {};
 
 function log(message, ok = true) {
@@ -239,8 +241,7 @@ export const runExport = () => $("#export").click();
 // ── 审计 ─────────────────────────────────────
 
 function renderAuditSide() {
-  const counts = {};
-  auditState.items.forEach((item) => { counts[item.source] = (counts[item.source] || 0) + 1; });
+  const counts = auditState.counts;
   $("#audit-side").replaceChildren(el("div.side-body", {}, el("h3", { text: "删除来源" }),
     el("dl.kv", {}, Object.entries(SOURCES).flatMap(([key, label]) => [el("dt", { text: label }), el("dd", { text: `${counts[key] || 0} 条` })])),
     el("p.muted", { text: "审计只保存记录 ID 与内容哈希，不保存被删正文；保留条数由“删除审计保留条数”控制。" })));
@@ -248,20 +249,17 @@ function renderAuditSide() {
 
 function renderAudit() {
   renderAuditSide();
-  const group = $("#audit-group").value.trim();
-  const operator = $("#audit-operator").value.trim().toLowerCase();
-  const source = $("#audit-source").value;
-  const rows = auditState.items.filter((item) =>
-    (!group || item.group_id.includes(group))
-    && (!operator || String(item.deleted_by).toLowerCase().includes(operator))
-    && (!source || item.source === source));
+  const rows = auditState.items;
   const body = $("#audit-rows");
   const cards = $("#audit-cards");
+  const filtered = Boolean($("#audit-group").value.trim() || $("#audit-operator").value.trim() || $("#audit-source").value);
   let empty = null;
   if (auditState.error) empty = `加载失败：${auditState.error}`;
-  else if (!auditState.items.length) empty = "还没有删除记录。";
-  else if (!rows.length) empty = "没有符合筛选条件的审计记录。";
-  $("#audit-total").textContent = `${rows.length} 条`;
+  else if (!rows.length) empty = filtered ? "没有符合筛选条件的审计记录。" : "还没有删除记录。";
+  $("#audit-total").textContent = `${auditState.total} 条`;
+  $("#audit-page").textContent = `第 ${auditState.page} 页`;
+  $("#audit-prev").disabled = auditState.page <= 1;
+  $("#audit-next").disabled = auditState.page * AUDIT_PAGE_SIZE >= auditState.total;
   if (empty) {
     body.replaceChildren(el("tr.empty-row", {}, el("td", { colspan: "6" }, el("div.empty", { text: empty }))));
     cards.replaceChildren(el("div.card.empty", { text: empty }));
@@ -289,10 +287,20 @@ export async function loadAudit() {
       ...Array.from({ length: 6 }, () => el("td", {}, el("span.sk"))))));
   }
   try {
-    const data = await bridge.apiGet("audit", { limit: 1000 });
+    const data = await bridge.apiGet("audit", {
+      group_id: $("#audit-group").value.trim(),
+      operator: $("#audit-operator").value.trim(),
+      source: $("#audit-source").value,
+      page: auditState.page,
+      page_size: AUDIT_PAGE_SIZE,
+    });
     auditState.items = data.items || [];
+    auditState.total = data.total || 0;
+    auditState.counts = data.counts || {};
     auditState.error = "";
   } catch (error) {
+    auditState.items = [];
+    auditState.total = 0;
     auditState.error = error.message;
   }
   auditState.loaded = true;
@@ -300,9 +308,18 @@ export async function loadAudit() {
 }
 
 export function initAudit() {
+  // 筛选在服务端完成：输入停顿后再请求，并回到第一页。
   for (const id of ["#audit-group", "#audit-operator", "#audit-source"]) {
-    $(id).addEventListener("input", renderAudit);
+    $(id).addEventListener("input", () => {
+      clearTimeout(auditTimer);
+      auditTimer = setTimeout(() => {
+        auditState.page = 1;
+        loadAudit();
+      }, 250);
+    });
   }
+  $("#audit-prev").addEventListener("click", () => { auditState.page -= 1; loadAudit(); });
+  $("#audit-next").addEventListener("click", () => { auditState.page += 1; loadAudit(); });
   $("#audit-refresh").addEventListener("click", (event) => busy(event.currentTarget, "刷新中", loadAudit));
   hydrate($("#view-audit"));
 }

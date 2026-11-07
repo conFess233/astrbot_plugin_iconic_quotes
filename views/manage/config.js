@@ -20,12 +20,28 @@ const SECTIONS = [
     { key: "send_mode", label: "单条发送方式", type: "select", options: [["text", "文字"], ["card", "图片卡片"]], hint: "含表情、贴纸或回复的记录始终按原消息发送。" },
     { key: "aggregate_multiple", label: "多条聚合为合并转发", type: "boolean" },
     { key: "forward_hint_nodes", label: "合并转发中插入提示", type: "boolean", hint: "开头加入“群典存档回放”与“引用丢失提示”节点；爆典的标题与页码始终保留。" },
+    { key: "anti_repeat_window", label: "随机避开最近发送的条数", type: "number", min: 0, max: 1000, hint: "0 表示纯随机；避开数量不超过候选记录的一半。" },
     { key: "allow_bot_authors", label: "允许收录 Bot 消息", type: "boolean" },
   ] },
   { id: "poke", title: "戳一戳", description: "群成员戳机器人时随机发送群典。", fields: [
-    { key: "poke_enabled", label: "启用戳一戳群典", type: "boolean", hint: "沿用查询权限、名单与全局冷却。" },
+    { key: "poke_enabled", label: "启用戳一戳群典", type: "boolean", hint: "沿用查询权限、名单与群冷却，冷却中不回复。" },
     { key: "poke_send_count", label: "戳一戳发送条数", type: "number", min: 1, max: 10 },
     { key: "poke_send_mode", label: "戳一戳发送方式", type: "select", options: [["text", "正常"], ["card", "图片"]] },
+  ] },
+  { id: "reaction", title: "表情投票", description: "一条消息收到足够多成员的表情回应后自动收录。", fields: [
+    { key: "reaction_capture_enabled", label: "启用表情回应投票收录", type: "boolean", hint: "需要 OneBot 实现上报 group_msg_emoji_like 通知（如 NapCat）；投票者需要有添加权限。" },
+    { key: "reaction_capture_threshold", label: "所需人数", type: "number", min: 1, max: 100, hint: "同一人回应多个表情只算一票；票数保存在内存中，重启后重新累计。" },
+    { key: "reaction_capture_emoji_ids", label: "参与投票的表情 ID", type: "list", hint: "每行一个；留空表示任意表情都算票。" },
+  ] },
+  { id: "schedule", title: "定时任务", description: "定时推送与自动备份，时间按服务器时区；只向机器人收到过消息的群推送。", fields: [
+    { key: "daily_quote_enabled", label: "启用每日一典", type: "boolean" },
+    { key: "daily_quote_time", label: "每日一典发送时间", type: "text", hint: "HH:MM，24 小时制；错过 30 分钟后当天不再补发。" },
+    { key: "on_this_day_enabled", label: "启用那年今日", type: "boolean", hint: "发送往年同月同日收录的群典；当天没有时不发送。" },
+    { key: "on_this_day_time", label: "那年今日发送时间", type: "text", hint: "HH:MM，24 小时制；错过 30 分钟后当天不再补发。" },
+    { key: "on_this_day_count", label: "那年今日最多发送条数", type: "number", min: 1, max: 10 },
+    { key: "auto_backup_enabled", label: "启用自动备份", type: "boolean", hint: "写入插件数据目录的 backups/；数据没有变化时跳过。每份都包含全部图片，请留意磁盘空间。" },
+    { key: "auto_backup_interval_hours", label: "自动备份间隔（小时）", type: "number", min: 1, max: 720 },
+    { key: "auto_backup_keep", label: "自动备份保留份数", type: "number", min: 1, max: 100, hint: "只清理自动备份，手动导出的文件不受影响。" },
   ] },
   { id: "help", title: "帮助消息", description: "主动帮助与参数错误后附带的用法。", fields: [
     { key: "help_enabled", label: "启用帮助功能", type: "boolean", hint: "关闭后不发送主动帮助，也不附带用法。" },
@@ -43,7 +59,8 @@ const SECTIONS = [
     { key: "max_records_per_group", label: "单群记录上限", type: "number", min: 1, max: 100000 },
     { key: "max_media_mb", label: "媒体容量上限（MB）", type: "number", min: 1, max: 102400, hint: "群典图片与头像缓存合计；不足时只淘汰头像。" },
     { key: "max_image_mb", label: "单图上限（MB）", type: "number", min: 1, max: 100 },
-    { key: "max_images_per_record", label: "单条图片上限", type: "number", min: 1, max: 100 },
+    { key: "max_images_per_record", label: "单条普通消息图片上限", type: "number", min: 1, max: 100 },
+    { key: "max_images_per_forward", label: "单个合并转发图片上限", type: "number", min: 1, max: 500, hint: "按整棵转发树累计，贴纸也计入。" },
     { key: "max_forward_nodes", label: "转发节点上限", type: "number", min: 1, max: 200 },
     { key: "max_text_chars", label: "单条文字上限", type: "number", min: 1, max: 100000 },
     { key: "max_forward_text_chars", label: "转发累计文字上限", type: "number", min: 1, max: 1000000 },
@@ -66,7 +83,7 @@ const SECTIONS = [
     { key: "group_whitelist", label: "群白名单", type: "list" },
     { key: "user_blacklist", label: "用户黑名单", type: "list" },
     { key: "user_whitelist", label: "用户白名单", type: "list" },
-    { key: "excluded_author_ids", label: "禁止被收录的 QQ", type: "list", hint: "同样作用于回复快照与转发节点。" },
+    { key: "excluded_author_ids", label: "禁止被收录的 QQ", type: "list", hint: "同样作用于回复快照与转发节点；已有记录保留但不再发送，移出名单后恢复。" },
   ] },
   { id: "aliases", title: "作者别名", description: "只纠正合并转发节点与回复快照的作者，不改写存档；保存前预览影响范围。", fields: [
     { key: "author_aliases", label: "别名表", type: "aliases", hint: "同一群内一个别名只能绑定一个 QQ。" },
@@ -79,13 +96,13 @@ const SECTIONS = [
     { key: "card_width", label: "卡片宽度（px）", type: "number", min: 480, max: 3000 },
     { key: "card_auto_height", label: "高度随内容变化", type: "boolean", hint: "关闭后卡片不低于最小高度。" },
     { key: "card_min_height", label: "最小高度（px）", type: "number", min: 240, max: 3000 },
-    { key: "card_max_height", label: "最大高度（px）", type: "number", min: 480, max: 6000 },
+    { key: "card_max_height", label: "最大高度（px）", type: "number", min: 480, max: 6000, hint: "超过时自动分页；内容不会被裁切。" },
     { key: "card_custom_css", label: "自定义 CSS", type: "textarea", hint: "追加在默认样式之后；不允许 @import、url() 等外部资源。" },
     { key: "localize_avatars", label: "本地缓存头像", type: "boolean", hint: "只用于卡片与后台；合并转发头像仍由 QQ 解析。" },
     { key: "avatar_cache_ttl_days", label: "头像缓存有效天数", type: "number", min: 0, max: 3650, hint: "0 表示不自动刷新。" },
   ] },
-  { id: "cooldown", title: "冷却与重试", description: "全局冷却与发送失败重试。", fields: [
-    { key: "global_cooldown_ms", label: "全局冷却（毫秒）", type: "number", min: 0, max: 60000 },
+  { id: "cooldown", title: "冷却与重试", description: "每群冷却与发送失败重试。", fields: [
+    { key: "global_cooldown_ms", label: "每群冷却（毫秒）", type: "number", min: 0, max: 60000 },
     { key: "cooldown_message", label: "冷却提示", type: "text" },
     { key: "send_retry_count", label: "发送重试次数", type: "number", min: 0, max: 5 },
     { key: "send_retry_delay_ms", label: "重试间隔（毫秒）", type: "number", min: 100, max: 10000 },
@@ -108,6 +125,9 @@ const OVERRIDE_KEYS = [
   "max_records_per_group", "add_roles", "query_roles", "burst_roles", "info_roles", "delete_roles",
   "user_blacklist", "user_whitelist", "excluded_author_ids",
   "nested_forward_fallback_message", "nested_forward_unknown_message",
+  "anti_repeat_window", "daily_quote_enabled", "daily_quote_time",
+  "on_this_day_enabled", "on_this_day_time", "on_this_day_count",
+  "reaction_capture_enabled", "reaction_capture_threshold", "reaction_capture_emoji_ids",
 ];
 
 const state = {

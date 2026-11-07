@@ -173,7 +173,14 @@
               <label class="field">来源<select id="audit-source" class="input"><option value="">全部来源</option><option value="command">群聊指令</option><option value="page">管理页</option><option value="page_node">管理页 · 节点</option></select></label>
             </div>
             <section class="card table-card">
-              <div class="table-tools"><div><strong id="audit-total">0 条</strong><span>按删除时间从新到旧</span></div></div>
+              <div class="table-tools">
+                <div><strong id="audit-total">0 条</strong><span>按删除时间从新到旧</span></div>
+                <div class="pager">
+                  <button id="audit-prev" class="icon-btn" type="button" aria-label="上一页" data-i="left"></button>
+                  <span id="audit-page">第 1 页</span>
+                  <button id="audit-next" class="icon-btn" type="button" aria-label="下一页" data-i="right"></button>
+                </div>
+              </div>
               <div class="table-scroll">
                 <table>
                   <thead><tr><th>删除时间</th><th>群号</th><th>记录</th><th>操作者</th><th>来源</th><th>范围</th></tr></thead>

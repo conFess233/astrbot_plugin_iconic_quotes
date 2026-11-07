@@ -3,7 +3,7 @@
     "description": "启用戳一戳群典",
     "type": "bool",
     "default": false,
-    "hint": "仅群成员戳机器人时随机发送当前群的记录，沿用查询权限、名单与全局冷却；支持群级覆盖。"
+    "hint": "仅群成员戳机器人时随机发送当前群的记录，沿用查询权限、名单与群冷却，冷却中不回复；支持群级覆盖。"
   },
   "poke_send_count": {
     "description": "戳一戳发送条数",
@@ -14,7 +14,10 @@
   "poke_send_mode": {
     "description": "戳一戳发送方式",
     "type": "string",
-    "options": ["text", "card"],
+    "options": [
+      "text",
+      "card"
+    ],
     "default": "text",
     "hint": "text：正常发送，沿用合并转发配置；card：逐条图片卡片，聊天记录保持合并转发，卡片失败发送原消息。"
   },
@@ -32,7 +35,9 @@
   "add_keywords": {
     "description": "添加关键词",
     "type": "list",
-    "default": ["添加群典"],
+    "default": [
+      "添加群典"
+    ],
     "hint": "去除首尾空白后完整匹配。"
   },
   "query_keyword_enabled": {
@@ -43,7 +48,9 @@
   "query_keywords": {
     "description": "查询关键词",
     "type": "list",
-    "default": ["群典"],
+    "default": [
+      "群典"
+    ],
     "hint": "去除首尾空白后完整匹配。"
   },
   "max_query_keyword_chars": {
@@ -61,7 +68,9 @@
   "burst_keywords": {
     "description": "爆典关键词",
     "type": "list",
-    "default": ["爆典"],
+    "default": [
+      "爆典"
+    ],
     "hint": "用法：爆典 @某人 [页码]；去除首尾空白后完整匹配语法。"
   },
   "burst_page_size": {
@@ -74,8 +83,16 @@
     "description": "爆典记录时间显示",
     "type": "string",
     "default": "text",
-    "options": ["text", "native", "none"],
-    "labels": ["独立文字节点", "原生时间（实验）", "不显示"],
+    "options": [
+      "text",
+      "native",
+      "none"
+    ],
+    "labels": [
+      "独立文字节点",
+      "原生时间（实验）",
+      "不显示"
+    ],
     "hint": "原生时间依赖 OneBot 实现，平台忽略时不会显示。"
   },
   "help_enabled": {
@@ -87,21 +104,30 @@
   "help_send_mode": {
     "description": "帮助发送方式",
     "type": "string",
-    "options": ["card", "text"],
-    "labels": ["图片卡片", "文字"],
+    "options": [
+      "card",
+      "text"
+    ],
+    "labels": [
+      "图片卡片",
+      "文字"
+    ],
     "default": "card",
     "hint": "主动帮助（/群典 help）的发送方式；卡片使用与群典卡片相同的主题与文转图服务，渲染失败时改为文字。参数错误后附带的用法始终为文字。支持群级覆盖。"
   },
   "help_keywords": {
     "description": "帮助子关键词",
     "type": "list",
-    "default": ["help", "帮助"],
+    "default": [
+      "help",
+      "帮助"
+    ],
     "hint": "用于 /群典 <帮助关键词> 和 群典 <帮助关键词>，精确匹配。"
   },
   "help_overview_template": {
     "description": "总帮助模板",
     "type": "text",
-    "default": "群典帮助\n添加：引用消息或携带合并转发后发送 /添加群典；关键词：{add_keywords}\n查询：/群典、/群典 @某人、/群典 @某人 <关键词>；关键词：{query_keywords}\n爆典：/爆典 @某人 [页码]；关键词：{burst_keywords}\n统计：/群典 info\n删除：/删除群典 <关键词>，随后发送 /确认删除\n帮助：/群典 help",
+    "default": "群典帮助\n添加：引用消息或携带合并转发后发送 /添加群典；关键词：{add_keywords}\n查询：/群典、/群典 <关键词>、/群典 #记录ID、/群典 @某人、/群典 @某人 <关键词>；关键词：{query_keywords}\n爆典：/爆典 @某人 [页码]；关键词：{burst_keywords}\n统计：/群典 info、/群典 info @某人、/群典 排行\n删除：/删除群典 <关键词或 #记录ID>，随后发送 /确认删除\n帮助：/群典 help",
     "hint": "留空时由各操作用法自动组合；支持帮助占位符。"
   },
   "help_add_template": {
@@ -113,7 +139,7 @@
   "help_query_template": {
     "description": "查询用法",
     "type": "text",
-    "default": "/群典、/群典 @某人，或 /群典 @某人 <关键词>；关键词：{query_keywords}",
+    "default": "/群典、/群典 <关键词>、/群典 #记录ID、/群典 @某人，或 /群典 @某人 <关键词>；关键词：{query_keywords}",
     "hint": "留空可关闭查询失败后的用法提示。"
   },
   "help_burst_template": {
@@ -125,12 +151,12 @@
   "help_info_template": {
     "description": "统计用法",
     "type": "text",
-    "default": "/群典 info"
+    "default": "/群典 info、/群典 info @某人、/群典 排行"
   },
   "help_delete_template": {
     "description": "删除用法",
     "type": "text",
-    "default": "/删除群典 <关键词>，预览后发送 /确认删除",
+    "default": "/删除群典 <关键词或 #记录ID>，预览后发送 /确认删除",
     "hint": "留空可关闭删除失败后的用法提示。"
   },
   "help_help_template": {
@@ -154,13 +180,25 @@
     "description": "普通群典发送方式",
     "type": "string",
     "default": "text",
-    "options": ["text", "card"],
-    "labels": ["文字", "图片卡片"]
+    "options": [
+      "text",
+      "card"
+    ],
+    "labels": [
+      "文字",
+      "图片卡片"
+    ]
   },
   "aggregate_multiple": {
     "description": "多条群典聚合为合并转发",
     "type": "bool",
     "default": true
+  },
+  "anti_repeat_window": {
+    "description": "随机抽取避开最近发送的条数",
+    "type": "int",
+    "default": 50,
+    "hint": "范围 0 到 1000，0 表示纯随机；避开数量不超过候选记录的一半。支持群级覆盖。"
   },
   "forward_hint_nodes": {
     "description": "合并转发中插入提示节点",
@@ -190,9 +228,15 @@
     "default": 10
   },
   "max_images_per_record": {
-    "description": "单条记录最多图片数",
+    "description": "单条普通消息最多图片数",
     "type": "int",
     "default": 9
+  },
+  "max_images_per_forward": {
+    "description": "单个合并转发最多图片数",
+    "type": "int",
+    "default": 50,
+    "hint": "范围 1 到 500；按整棵转发树累计，贴纸也计入。"
   },
   "max_forward_nodes": {
     "description": "合并转发最大节点数",
@@ -224,44 +268,128 @@
   "add_roles": {
     "description": "添加权限",
     "type": "list",
-    "default": ["everyone"],
-    "options": ["bot_admin", "owner", "admin", "member", "everyone"],
-    "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
+    "default": [
+      "everyone"
+    ],
+    "options": [
+      "bot_admin",
+      "owner",
+      "admin",
+      "member",
+      "everyone"
+    ],
+    "labels": [
+      "Bot 管理员",
+      "群主",
+      "群管理员",
+      "群成员",
+      "所有人"
+    ]
   },
   "query_roles": {
     "description": "查询权限",
     "type": "list",
-    "default": ["everyone"],
-    "options": ["bot_admin", "owner", "admin", "member", "everyone"],
-    "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
+    "default": [
+      "everyone"
+    ],
+    "options": [
+      "bot_admin",
+      "owner",
+      "admin",
+      "member",
+      "everyone"
+    ],
+    "labels": [
+      "Bot 管理员",
+      "群主",
+      "群管理员",
+      "群成员",
+      "所有人"
+    ]
   },
   "burst_roles": {
     "description": "爆典权限",
     "type": "list",
-    "default": ["member"],
-    "options": ["bot_admin", "owner", "admin", "member", "everyone"],
-    "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
+    "default": [
+      "member"
+    ],
+    "options": [
+      "bot_admin",
+      "owner",
+      "admin",
+      "member",
+      "everyone"
+    ],
+    "labels": [
+      "Bot 管理员",
+      "群主",
+      "群管理员",
+      "群成员",
+      "所有人"
+    ]
   },
   "info_roles": {
     "description": "统计权限",
     "type": "list",
-    "default": ["everyone"],
-    "options": ["bot_admin", "owner", "admin", "member", "everyone"],
-    "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
+    "default": [
+      "everyone"
+    ],
+    "options": [
+      "bot_admin",
+      "owner",
+      "admin",
+      "member",
+      "everyone"
+    ],
+    "labels": [
+      "Bot 管理员",
+      "群主",
+      "群管理员",
+      "群成员",
+      "所有人"
+    ]
   },
   "delete_roles": {
     "description": "删除权限",
     "type": "list",
-    "default": ["bot_admin"],
-    "options": ["bot_admin", "owner", "admin", "member", "everyone"],
-    "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
+    "default": [
+      "bot_admin"
+    ],
+    "options": [
+      "bot_admin",
+      "owner",
+      "admin",
+      "member",
+      "everyone"
+    ],
+    "labels": [
+      "Bot 管理员",
+      "群主",
+      "群管理员",
+      "群成员",
+      "所有人"
+    ]
   },
   "help_roles": {
     "description": "帮助权限",
     "type": "list",
-    "default": ["everyone"],
-    "options": ["bot_admin", "owner", "admin", "member", "everyone"],
-    "labels": ["Bot 管理员", "群主", "群管理员", "群成员", "所有人"]
+    "default": [
+      "everyone"
+    ],
+    "options": [
+      "bot_admin",
+      "owner",
+      "admin",
+      "member",
+      "everyone"
+    ],
+    "labels": [
+      "Bot 管理员",
+      "群主",
+      "群管理员",
+      "群成员",
+      "所有人"
+    ]
   },
   "group_blacklist": {
     "description": "群黑名单",
@@ -286,7 +414,8 @@
   "excluded_author_ids": {
     "description": "禁止收录用户",
     "type": "list",
-    "default": []
+    "default": [],
+    "hint": "这些用户的消息不能被收录；他们已有的记录保留但不再发送，移出名单后恢复。"
   },
   "group_overrides": {
     "description": "旧版群级覆盖（2.0 起保存在数据库，请在管理页编辑）",
@@ -301,7 +430,7 @@
     "invisible": true
   },
   "global_cooldown_ms": {
-    "description": "全局冷却毫秒",
+    "description": "每群冷却毫秒",
     "type": "int",
     "default": 1000
   },
@@ -361,15 +490,29 @@
   "card_theme": {
     "description": "卡片主题",
     "type": "string",
-    "options": ["light", "dark"],
-    "labels": ["纸面", "墨色"],
+    "options": [
+      "light",
+      "dark"
+    ],
+    "labels": [
+      "纸面",
+      "墨色"
+    ],
     "default": "light"
   },
   "card_scale": {
     "description": "卡片清晰度",
     "type": "string",
-    "options": ["normal", "high", "ultra"],
-    "labels": ["标准", "高清", "超清"],
+    "options": [
+      "normal",
+      "high",
+      "ultra"
+    ],
+    "labels": [
+      "标准",
+      "高清",
+      "超清"
+    ],
     "default": "high",
     "hint": "对应文转图服务的设备像素比 1.0 / 1.3 / 1.8；越高越清晰，图片越大。"
   },
@@ -386,7 +529,8 @@
   "card_max_height": {
     "description": "卡片最大高度",
     "type": "int",
-    "default": 2400
+    "default": 2400,
+    "hint": "超过时自动分页；只是分页依据，内容不会被裁切。"
   },
   "card_custom_css": {
     "description": "卡片自定义 CSS",
@@ -413,5 +557,71 @@
     "type": "int",
     "default": 7,
     "hint": "范围 0 到 3650；设为 0 表示永久有效。"
+  },
+  "daily_quote_enabled": {
+    "description": "启用每日一典",
+    "type": "bool",
+    "default": false,
+    "hint": "每天定时向群里发送一条随机群典；只对机器人收到过消息的群生效。支持群级覆盖。"
+  },
+  "daily_quote_time": {
+    "description": "每日一典发送时间",
+    "type": "string",
+    "default": "09:00",
+    "hint": "HH:MM，24 小时制，按服务器时区；错过 30 分钟后当天不再补发。"
+  },
+  "on_this_day_enabled": {
+    "description": "启用那年今日",
+    "type": "bool",
+    "default": false,
+    "hint": "发送往年同月同日收录的群典；当天没有时不发送。支持群级覆盖。"
+  },
+  "on_this_day_time": {
+    "description": "那年今日发送时间",
+    "type": "string",
+    "default": "09:30",
+    "hint": "HH:MM，24 小时制，按服务器时区；错过 30 分钟后当天不再补发。"
+  },
+  "on_this_day_count": {
+    "description": "那年今日最多发送条数",
+    "type": "int",
+    "default": 3,
+    "hint": "范围 1 到 10。"
+  },
+  "auto_backup_enabled": {
+    "description": "启用自动备份",
+    "type": "bool",
+    "default": false,
+    "hint": "定期把完整备份写入插件数据目录的 backups/；数据没有变化时跳过。每份都包含全部图片，请留意磁盘空间。"
+  },
+  "auto_backup_interval_hours": {
+    "description": "自动备份间隔（小时）",
+    "type": "int",
+    "default": 24,
+    "hint": "范围 1 到 720。"
+  },
+  "auto_backup_keep": {
+    "description": "自动备份保留份数",
+    "type": "int",
+    "default": 7,
+    "hint": "范围 1 到 100；只清理自动备份，手动导出的文件不受影响。"
+  },
+  "reaction_capture_enabled": {
+    "description": "启用表情回应投票收录",
+    "type": "bool",
+    "default": false,
+    "hint": "一条消息收到足够多成员的表情回应后自动收录。需要 OneBot 实现上报 group_msg_emoji_like 通知（如 NapCat）。投票者需要有添加权限。支持群级覆盖。"
+  },
+  "reaction_capture_threshold": {
+    "description": "投票收录所需人数",
+    "type": "int",
+    "default": 5,
+    "hint": "范围 1 到 100；同一人回应多个表情只算一票。票数保存在内存中，重启后重新累计。"
+  },
+  "reaction_capture_emoji_ids": {
+    "description": "参与投票的表情 ID",
+    "type": "list",
+    "default": [],
+    "hint": "留空表示任意表情都算票。"
   }
 }

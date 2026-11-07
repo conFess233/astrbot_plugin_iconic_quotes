@@ -66,6 +66,15 @@ GROUP_OVERRIDE_KEYS = {
     "excluded_author_ids",
     "nested_forward_fallback_message",
     "nested_forward_unknown_message",
+    "anti_repeat_window",
+    "daily_quote_enabled",
+    "daily_quote_time",
+    "on_this_day_enabled",
+    "on_this_day_time",
+    "on_this_day_count",
+    "reaction_capture_enabled",
+    "reaction_capture_threshold",
+    "reaction_capture_emoji_ids",
 }
 
 
@@ -90,21 +99,23 @@ DEFAULTS: dict[str, Any] = {
     "help_overview_template": (
         "群典帮助\n"
         "添加：引用消息或携带合并转发后发送 /添加群典；关键词：{add_keywords}\n"
-        "查询：/群典、/群典 @某人、/群典 @某人 <关键词>；关键词：{query_keywords}\n"
+        "查询：/群典、/群典 <关键词>、/群典 #记录ID、/群典 @某人、/群典 @某人 <关键词>；"
+        "关键词：{query_keywords}\n"
         "爆典：/爆典 @某人 [页码]；关键词：{burst_keywords}\n"
-        "统计：/群典 info\n"
-        "删除：/删除群典 <关键词>，随后发送 /确认删除\n"
+        "统计：/群典 info、/群典 info @某人、/群典 排行\n"
+        "删除：/删除群典 <关键词或 #记录ID>，随后发送 /确认删除\n"
         "帮助：/群典 help"
     ),
     "help_add_template": (
         "引用一条消息或携带一个合并转发后发送 /添加群典；关键词：{add_keywords}"
     ),
     "help_query_template": (
-        "/群典、/群典 @某人，或 /群典 @某人 <关键词>；关键词：{query_keywords}"
+        "/群典、/群典 <关键词>、/群典 #记录ID、/群典 @某人，或 /群典 @某人 <关键词>；"
+        "关键词：{query_keywords}"
     ),
     "help_burst_template": "/爆典 @某人 [页码]；关键词：{burst_keywords}",
-    "help_info_template": "/群典 info",
-    "help_delete_template": "/删除群典 <关键词>，预览后发送 /确认删除",
+    "help_info_template": "/群典 info、/群典 info @某人、/群典 排行",
+    "help_delete_template": "/删除群典 <关键词或 #记录ID>，预览后发送 /确认删除",
     "help_help_template": "/群典 help",
     "max_reply_depth": 3,
     "max_nested_forward_depth": 3,
@@ -112,6 +123,8 @@ DEFAULTS: dict[str, Any] = {
     "max_media_mb": 2048,
     "max_image_mb": 10,
     "max_images_per_record": 9,
+    # 合并转发按整棵转发树累计，单独计数，避免普通图片上限挡住长聊天记录。
+    "max_images_per_forward": 50,
     "max_forward_nodes": 100,
     "max_text_chars": 5000,
     "max_forward_text_chars": 50000,
@@ -153,6 +166,19 @@ DEFAULTS: dict[str, Any] = {
     "card_t2i_timeout_s": 30,
     "localize_avatars": False,
     "avatar_cache_ttl_days": 7,
+    # 随机抽取时尽量避开最近发送过的记录数；0 表示纯随机。
+    "anti_repeat_window": 50,
+    "daily_quote_enabled": False,
+    "daily_quote_time": "09:00",
+    "on_this_day_enabled": False,
+    "on_this_day_time": "09:30",
+    "on_this_day_count": 3,
+    "auto_backup_enabled": False,
+    "auto_backup_interval_hours": 24,
+    "auto_backup_keep": 7,
+    "reaction_capture_enabled": False,
+    "reaction_capture_threshold": 5,
+    "reaction_capture_emoji_ids": [],
 }
 
 
@@ -317,6 +343,7 @@ class SettingsService:
             "max_media_mb": (1, 102_400),
             "max_image_mb": (1, 100),
             "max_images_per_record": (1, 100),
+            "max_images_per_forward": (1, 500),
             "max_forward_nodes": (1, 200),
             "max_text_chars": (1, 100_000),
             "max_forward_text_chars": (1, 1_000_000),
@@ -335,6 +362,11 @@ class SettingsService:
             "card_max_height": (480, 6000),
             "card_t2i_timeout_s": (5, 120),
             "avatar_cache_ttl_days": (0, 3650),
+            "anti_repeat_window": (0, 1000),
+            "on_this_day_count": (1, 10),
+            "auto_backup_interval_hours": (1, 720),
+            "auto_backup_keep": (1, 100),
+            "reaction_capture_threshold": (1, 100),
         }
         for key, (minimum, maximum) in integer_ranges.items():
             try:
@@ -378,14 +410,24 @@ class SettingsService:
             "retry_on_ambiguous_failure",
             "card_auto_height",
             "localize_avatars",
+            "daily_quote_enabled",
+            "on_this_day_enabled",
+            "auto_backup_enabled",
+            "reaction_capture_enabled",
         ):
             if not isinstance(result.get(key), bool):
                 raise TypeError(f"{key} 必须是布尔值")
+        for key in ("daily_quote_time", "on_this_day_time"):
+            value = str(result.get(key) or "").strip()
+            if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", value):
+                raise ValueError(f"{key} 必须是 HH:MM 格式的 24 小时制时间")
+            result[key] = value
         for key in (
             "add_keywords",
             "query_keywords",
             "burst_keywords",
             "help_keywords",
+            "reaction_capture_emoji_ids",
         ):
             raw = result.get(key)
             if not isinstance(raw, list):
